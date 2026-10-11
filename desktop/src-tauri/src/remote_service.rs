@@ -1134,7 +1134,7 @@ impl RemoteServiceClient {
         workspace: String,
         work_id: String,
     ) -> Result<RemoteWorkSnapshot> {
-        let value = self
+        match self
             .call_tool(
                 "ptah_get_work",
                 json!({
@@ -1143,8 +1143,253 @@ impl RemoteServiceClient {
                     "work_id": work_id,
                 }),
             )
+            .await
+        {
+            Ok(value) => serde_json::from_value(value).context("decode remote durable work item"),
+            Err(error)
+                if error
+                    .to_string()
+                    .contains("MCP remote error: capacity_exhausted") =>
+            {
+                self.read_work_through_detail(session_id, &workspace, &work_id)
+                    .await
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Assemble one authorized snapshot from `ptah_get_work_detail` after
+    /// `ptah_get_work` refuses the 2 MiB ceiling. Scalar sections are read
+    /// once. Collections follow `nextOffset` until `complete`. A page that
+    /// does not advance, a revision that changes mid-read, or a single
+    /// element that still does not fit is a refusal, not a truncated item.
+    async fn read_work_through_detail(
+        &mut self,
+        session_id: Uuid,
+        workspace: &str,
+        work_id: &str,
+    ) -> Result<RemoteWorkSnapshot> {
+        let summary = self
+            .read_complete_detail(session_id, workspace, work_id, "summary")
             .await?;
-        serde_json::from_value(value).context("decode remote durable work item")
+        let objective = self
+            .read_complete_detail(session_id, workspace, work_id, "objective")
+            .await?;
+        let progress = self
+            .read_complete_detail(session_id, workspace, work_id, "progress")
+            .await?;
+        let policy = self
+            .read_complete_detail(session_id, workspace, work_id, "policy")
+            .await?;
+        let revision = summary.revision;
+        for page in [&objective, &progress, &policy] {
+            if page.revision != revision || page.work_id != work_id {
+                bail!("work detail revision changed during the read");
+            }
+        }
+        let dependencies = self
+            .collect_detail_array(
+                session_id,
+                workspace,
+                work_id,
+                "dependencies",
+                "dependencies",
+                revision,
+            )
+            .await?;
+        let (result_meta, evidence, artifacts) = self
+            .collect_detail_result(session_id, workspace, work_id, revision)
+            .await?;
+        let attempt_values = self
+            .collect_detail_array(
+                session_id, workspace, work_id, "attempts", "attempts", revision,
+            )
+            .await?;
+        let result = assemble_detail_result(&result_meta, evidence, artifacts)?;
+        let work = serde_json::from_value(json!({
+            "schemaVersion": summary.body["schemaVersion"],
+            "workId": summary.body["workId"],
+            "kind": summary.body["kind"],
+            "objective": objective.body["objective"],
+            "sessionId": summary.body["sessionId"],
+            "workspace": summary.body["workspace"],
+            "createdBy": summary.body["createdBy"],
+            "assignedAgentId": summary.body["assignedAgentId"],
+            "priority": summary.body["priority"],
+            "deadline": summary.body["deadline"],
+            "parentWorkId": summary.body["parentWorkId"],
+            "dependencies": dependencies,
+            "policy": policy.body["policy"],
+            "state": summary.body["state"],
+            "revision": summary.body["revision"],
+            "attemptCount": summary.body["attemptCount"],
+            "progress": progress.body["progress"],
+            "result": result,
+            "isContainer": summary.body["isContainer"],
+            "approval": summary.body["approval"],
+            "sourceRoutineId": summary.body["sourceRoutineId"],
+            "sourceActivationId": summary.body["sourceActivationId"],
+            "sourceManagerPlanId": summary.body["sourceManagerPlanId"],
+            "sourceManagerStepId": summary.body["sourceManagerStepId"],
+            "assignmentStatus": summary.body["assignmentStatus"],
+            "blockedReason": summary.body["blockedReason"],
+            "blockProvenance": summary.body["blockProvenance"],
+            "lastDecisionId": summary.body["lastDecisionId"],
+            "createdAt": summary.body["createdAt"],
+            "updatedAt": summary.body["updatedAt"],
+        }))
+        .context("decode remote work detail snapshot")?;
+        let attempts = serde_json::from_value(Value::Array(attempt_values))
+            .context("decode remote work detail attempts")?;
+        Ok(RemoteWorkSnapshot { work, attempts })
+    }
+
+    async fn read_complete_detail(
+        &mut self,
+        session_id: Uuid,
+        workspace: &str,
+        work_id: &str,
+        section: &str,
+    ) -> Result<grokptah_agent_bridge::orchestration::WorkDetailPageV1> {
+        let page = self
+            .read_detail_page(session_id, workspace, work_id, section, 0, 1)
+            .await?;
+        if page.work_id != work_id || !page.complete {
+            bail!("work detail section {section} was not a complete page");
+        }
+        Ok(page)
+    }
+
+    async fn collect_detail_array(
+        &mut self,
+        session_id: Uuid,
+        workspace: &str,
+        work_id: &str,
+        section: &str,
+        field: &str,
+        revision: u64,
+    ) -> Result<Vec<Value>> {
+        let mut offset = 0usize;
+        let mut collected = Vec::new();
+        for _ in 0..1024 {
+            let page = self
+                .read_detail_page(
+                    session_id,
+                    workspace,
+                    work_id,
+                    section,
+                    offset,
+                    grokptah_agent_bridge::orchestration::MAX_WORK_DETAIL_LIMIT,
+                )
+                .await?;
+            if page.work_id != work_id || page.revision != revision {
+                bail!("work detail revision changed during the read");
+            }
+            let batch = page
+                .body
+                .get(field)
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            if page.complete {
+                collected.extend(batch);
+                return Ok(collected);
+            }
+            if batch.is_empty() {
+                bail!("work detail page did not include data");
+            }
+            let next = page
+                .next_offset
+                .filter(|next| *next > offset)
+                .ok_or_else(|| anyhow!("work detail page did not advance"))?;
+            collected.extend(batch);
+            offset = next;
+        }
+        bail!("work detail page walk did not finish")
+    }
+
+    async fn collect_detail_result(
+        &mut self,
+        session_id: Uuid,
+        workspace: &str,
+        work_id: &str,
+        revision: u64,
+    ) -> Result<(Value, Vec<Value>, Vec<Value>)> {
+        let mut offset = 0usize;
+        let mut evidence = Vec::new();
+        let mut artifacts = Vec::new();
+        let mut meta = Value::Null;
+        for _ in 0..1024 {
+            let page = self
+                .read_detail_page(
+                    session_id,
+                    workspace,
+                    work_id,
+                    "result",
+                    offset,
+                    grokptah_agent_bridge::orchestration::MAX_WORK_DETAIL_LIMIT,
+                )
+                .await?;
+            if page.work_id != work_id || page.revision != revision {
+                bail!("work detail revision changed during the read");
+            }
+            if meta.is_null() {
+                meta = page.body.clone();
+            } else if page.body.get("summary") != meta.get("summary")
+                || page.body.get("completedAt") != meta.get("completedAt")
+            {
+                bail!("work detail result metadata changed during the read");
+            }
+            let batch_evidence = page.body["evidence"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default();
+            let batch_artifacts = page.body["artifacts"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default();
+            if page.complete {
+                evidence.extend(batch_evidence);
+                artifacts.extend(batch_artifacts);
+                return Ok((meta, evidence, artifacts));
+            }
+            if batch_evidence.is_empty() && batch_artifacts.is_empty() {
+                bail!("work detail page did not include data");
+            }
+            let next = page
+                .next_offset
+                .filter(|next| *next > offset)
+                .ok_or_else(|| anyhow!("work detail page did not advance"))?;
+            evidence.extend(batch_evidence);
+            artifacts.extend(batch_artifacts);
+            offset = next;
+        }
+        bail!("work detail page walk did not finish")
+    }
+
+    async fn read_detail_page(
+        &mut self,
+        session_id: Uuid,
+        workspace: &str,
+        work_id: &str,
+        section: &str,
+        offset: usize,
+        limit: usize,
+    ) -> Result<grokptah_agent_bridge::orchestration::WorkDetailPageV1> {
+        let value = self
+            .call_tool(
+                "ptah_get_work_detail",
+                json!({
+                    "session_id": session_id,
+                    "workspace": workspace,
+                    "work_id": work_id,
+                    "section": section,
+                    "offset": offset,
+                    "limit": limit,
+                }),
+            )
+            .await?;
+        serde_json::from_value(value).context("decode remote work detail page")
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1784,6 +2029,31 @@ fn normalize_base_url(value: &str) -> Result<String> {
     Ok(value.trim().trim_end_matches('/').to_string())
 }
 
+fn assemble_detail_result(
+    meta: &Value,
+    evidence: Vec<Value>,
+    artifacts: Vec<Value>,
+) -> Result<Value> {
+    let completed_at = meta.get("completedAt").cloned().unwrap_or(Value::Null);
+    let summary = meta.get("summary").cloned().unwrap_or(Value::Null);
+    if completed_at.is_null() {
+        if summary.is_null() && evidence.is_empty() && artifacts.is_empty() {
+            return Ok(Value::Null);
+        }
+        bail!("work detail result omitted its completion time");
+    }
+    Ok(json!({
+        "summary": summary,
+        "evidence": evidence,
+        "artifacts": artifacts,
+        "failure": meta.get("failure").cloned().unwrap_or(Value::Null),
+        "cancellationReason": meta.get("cancellationReason").cloned().unwrap_or(Value::Null),
+        "completedAt": completed_at,
+        "verification": meta.get("verification").cloned().unwrap_or(Value::Null),
+        "candidateVerification": meta.get("candidateVerification").cloned().unwrap_or(Value::Null),
+    }))
+}
+
 /// Reconnect only for transport failures, retryable HTTP statuses, or a
 /// server-side MCP session that disappeared during a restart. Application
 /// errors such as an invalid request or a terminal run must be returned
@@ -1803,10 +2073,19 @@ fn should_reconnect_remote_error(error: &anyhow::Error) -> bool {
         || message.starts_with("unexpected argument ")
         || message.starts_with("unknown tool ")
         || message.starts_with("MCP client not initialized")
+        || stable_work_read_refusal(&message)
     {
         return false;
     }
     true
+}
+
+/// Page and detail refusals are stable. Reconnecting would only repeat them.
+/// A stale MCP session is a different remote error and still reconnects.
+fn stable_work_read_refusal(message: &str) -> bool {
+    message.contains("MCP remote error: capacity_exhausted")
+        || message.contains("MCP remote error: restart_required")
+        || message.contains("MCP remote error: cursor_expired")
 }
 
 fn is_loopback_host(host: &str) -> bool {
@@ -1849,7 +2128,9 @@ mod tests {
         should_reconnect_remote_error, RemoteServiceClient, RemoteServiceState,
     };
     use grokptah_agent_bridge::orchestration::{
-        CoordinatorAgentView, CoordinatorResumePlanView, WorkItem, WorkPolicy,
+        canonical_workspace, safe_id_filename, CoordinatorAgentView, CoordinatorResumePlanView,
+        WorkApproval, WorkArtifactRef, WorkAttempt, WorkDependency, WorkItem, WorkPolicy,
+        WorkProgress, WorkResult, WorkState, MAX_WORK_ARTIFACTS, MAX_WORK_ARTIFACT_BYTES,
     };
 
     #[test]
@@ -1980,6 +2261,12 @@ mod tests {
         )));
         assert!(!should_reconnect_remote_error(&anyhow::anyhow!(
             "MCP error: invalid request"
+        )));
+        assert!(!should_reconnect_remote_error(&anyhow::anyhow!(
+            "MCP remote error: capacity_exhausted"
+        )));
+        assert!(!should_reconnect_remote_error(&anyhow::anyhow!(
+            "MCP remote error: restart_required"
         )));
     }
 
@@ -2302,6 +2589,220 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(fresh.items[0].work_id, "page-c");
+        assert!(server.stop_and_wait().await.is_clean());
+        set_grokptah_home_override(None);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn remote_client_reads_oversized_work_through_detail() {
+        let _guard = home_override_serial();
+        let previous_offline = std::env::var_os("GROKPTAH_AGENT_OFFLINE");
+        struct OfflineRestore(Option<std::ffi::OsString>);
+        impl Drop for OfflineRestore {
+            fn drop(&mut self) {
+                // SAFETY: the enclosing test holds the process-wide home mutex.
+                unsafe {
+                    match self.0.take() {
+                        Some(value) => std::env::set_var("GROKPTAH_AGENT_OFFLINE", value),
+                        None => std::env::remove_var("GROKPTAH_AGENT_OFFLINE"),
+                    }
+                }
+            }
+        }
+        let _offline = OfflineRestore(previous_offline);
+        // SAFETY: this test holds the process-wide home mutex for its whole body.
+        unsafe { std::env::set_var("GROKPTAH_AGENT_OFFLINE", "1") };
+        let home = tempdir().unwrap();
+        set_grokptah_home_override(Some(home.path().join(".grokptah")));
+        let workspace = tempdir().unwrap();
+        let host = AgentHost::create(HostConfig {
+            always_approve: true,
+            ..HostConfig::default()
+        })
+        .expect("acquire the GrokPtah instance lock");
+        let store = OrchStore::open(home.path().join("orch")).unwrap();
+        let orch = OrchestrationService::new(
+            host.clone(),
+            host.event_bus(),
+            store.clone(),
+            OrchestrationConfig {
+                bearer_token: "desktop-remote-token".into(),
+                allowlist: WorkspaceAllowlist::new([workspace.path().to_path_buf()]),
+                max_concurrent_runs: 2,
+                bounds: RunBounds::default(),
+            },
+        );
+        let server = start_control_server(orch, 0).await.unwrap();
+        let base_url = format!("http://{}", server.addr);
+        host.start().unwrap();
+        let mut client = RemoteServiceClient::connect(base_url, "desktop-remote-token".into())
+            .await
+            .unwrap();
+        let session = client
+            .create_session(
+                workspace.path().display().to_string(),
+                Some("detail lane".into()),
+            )
+            .await
+            .unwrap();
+        let created = client
+            .create_work(
+                session.session_id,
+                session.workspace.clone(),
+                "remote".into(),
+                "small objective".into(),
+                0,
+                false,
+                "detail-small".into(),
+            )
+            .await
+            .unwrap();
+        client.called_tools.clear();
+        let small = client
+            .get_work(
+                session.session_id,
+                session.workspace.clone(),
+                created.work_id.clone(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(small.work.objective, "small objective");
+        assert_eq!(small.work.revision, created.revision);
+        assert_eq!(client.called_tools, vec!["ptah_get_work".to_string()]);
+
+        let canonical = canonical_workspace(workspace.path())
+            .unwrap()
+            .display()
+            .to_string();
+        let now = chrono::DateTime::parse_from_rfc3339("2026-06-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let heavy = "\"".repeat(MAX_WORK_ARTIFACT_BYTES);
+        let mut item = WorkItem::new_at(
+            "remote",
+            "say \"hello\" 𝄞",
+            session.session_id,
+            &canonical,
+            "operator-remote",
+            WorkPolicy {
+                requires_approval: true,
+                ..WorkPolicy::default()
+            },
+            now,
+        )
+        .unwrap();
+        item.work_id = "fat-item".into();
+        item.revision = 4;
+        item.assigned_agent_id = Some("agent-1".into());
+        item.attempt_count = 1;
+        item.state = WorkState::Succeeded;
+        item.priority = 3;
+        item.dependencies = vec![WorkDependency {
+            work_id: "dep-1".into(),
+            required_state: WorkState::Succeeded,
+        }];
+        item.approval = Some(WorkApproval {
+            reviewer_id: "reviewer-1".into(),
+            note: Some("ship it".into()),
+            approved_at: now,
+            candidate_digest: None,
+            target_revision: None,
+            apply_bundle_digest: None,
+        });
+        item.progress = Some(WorkProgress {
+            summary: "halfway".into(),
+            percent: Some(40),
+            updated_at: now,
+        });
+        item.result = Some(WorkResult {
+            summary: "visible result".into(),
+            evidence: vec![heavy.clone(); MAX_WORK_ARTIFACTS],
+            artifacts: (0..MAX_WORK_ARTIFACTS)
+                .map(|index| WorkArtifactRef {
+                    artifact_id: format!("a{index:04}"),
+                    kind: "log".into(),
+                    label: heavy.clone(),
+                    digest: None,
+                    retained_until: None,
+                })
+                .collect(),
+            failure: None,
+            cancellation_reason: Some("not cancelled".into()),
+            completed_at: now,
+            verification: None,
+            candidate_verification: None,
+        });
+        store.save_work_item_unchecked(&item).unwrap();
+        let attempt = WorkAttempt::new("fat-item", 1, "worker-1", "LEASE_NEEDLE_DO_NOT_LEAK");
+        let attempt_name = safe_id_filename(&attempt.attempt_id).unwrap();
+        let attempt_dir = store.root().join("work-attempts");
+        std::fs::create_dir_all(&attempt_dir).unwrap();
+        std::fs::write(
+            attempt_dir.join(format!("{attempt_name}.json")),
+            serde_json::to_vec(&attempt).unwrap(),
+        )
+        .unwrap();
+
+        client.called_tools.clear();
+        let snapshot = client
+            .get_work(
+                session.session_id,
+                session.workspace.clone(),
+                "fat-item".into(),
+            )
+            .await
+            .expect("oversized work is readable through detail pages");
+        assert_eq!(
+            client.called_tools.first().map(String::as_str),
+            Some("ptah_get_work")
+        );
+        assert!(
+            client
+                .called_tools
+                .iter()
+                .any(|tool| tool == "ptah_get_work_detail"),
+            "{:?}",
+            client.called_tools
+        );
+        assert_eq!(snapshot.work.work_id, "fat-item");
+        assert_eq!(snapshot.work.objective, "say \"hello\" 𝄞");
+        assert_eq!(snapshot.work.created_by, "operator-remote");
+        assert_eq!(snapshot.work.assigned_agent_id.as_deref(), Some("agent-1"));
+        assert_eq!(snapshot.work.revision, 4);
+        assert!(snapshot.work.policy.requires_approval);
+        assert_eq!(
+            snapshot
+                .work
+                .approval
+                .as_ref()
+                .map(|approval| approval.reviewer_id.as_str()),
+            Some("reviewer-1")
+        );
+        assert_eq!(
+            snapshot
+                .work
+                .progress
+                .as_ref()
+                .and_then(|progress| progress.percent),
+            Some(40)
+        );
+        assert_eq!(snapshot.work.dependencies[0].work_id, "dep-1");
+        let result = snapshot.work.result.as_ref().expect("result");
+        assert_eq!(result.summary, "visible result");
+        assert_eq!(result.evidence.len(), MAX_WORK_ARTIFACTS);
+        assert_eq!(result.artifacts.len(), MAX_WORK_ARTIFACTS);
+        assert_eq!(result.evidence[0], heavy);
+        assert_eq!(result.artifacts[0].label, heavy);
+        assert_eq!(result.cancellation_reason.as_deref(), Some("not cancelled"));
+        assert_eq!(snapshot.attempts.len(), 1);
+        assert_eq!(snapshot.attempts[0].claimant_id, "worker-1");
+        assert_eq!(snapshot.attempts[0].attempt_number, 1);
+        let rendered = serde_json::to_string(&snapshot).unwrap();
+        assert!(
+            !rendered.contains("LEASE_NEEDLE_DO_NOT_LEAK"),
+            "lease leaked"
+        );
         assert!(server.stop_and_wait().await.is_clean());
         set_grokptah_home_override(None);
     }

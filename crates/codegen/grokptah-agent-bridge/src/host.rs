@@ -2011,7 +2011,10 @@ impl AgentHostHandle {
             chrono::Utc::now(),
             WORK_PAGE_TRANSPORT_CEILING_BYTES,
         )
-        .map_err(|error| anyhow!(error.message))
+        // Display is `{code}: {message}`. The Work Board distinguishes
+        // `restart_required` and `cursor_expired` from a generic failure, so
+        // the code has to survive this boundary.
+        .map_err(|error| anyhow!(error.to_string()))
     }
 
     /// Read one local Work Item together with its redacted attempt history.
@@ -12433,6 +12436,120 @@ mod tests {
             host,
             session.id,
         )
+    }
+
+    #[test]
+    fn list_work_page_for_session_preserves_restart_and_expiry_codes() {
+        let _home = {
+            let lock = home_override_serial();
+            let tmp = tempfile::tempdir().expect("test home");
+            let home = tmp.path().join(".grokptah");
+            std::fs::create_dir_all(home.join("sessions")).expect("sessions directory");
+            set_grokptah_home_override(Some(home));
+            TestHome {
+                _tmp: tmp,
+                _lock: lock,
+            }
+        };
+        let workspace = tempfile::tempdir().expect("workspace");
+        let host = AgentHost::create(HostConfig {
+            always_approve: true,
+            ..HostConfig::default()
+        })
+        .expect("acquire the GrokPtah instance lock");
+        host.start().expect("start host");
+        host.set_project_cwd(workspace.path()).expect("project cwd");
+        let session = host
+            .session_new_kind(SessionKind::Build)
+            .expect("build lane");
+        let claimed = crate::orchestration::canonical_workspace(workspace.path())
+            .expect("canonical workspace")
+            .display()
+            .to_string();
+        let created_at = chrono::DateTime::parse_from_rfc3339("2026-05-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let mut low = WorkItem::new_at(
+            "local",
+            "low",
+            session.id,
+            &claimed,
+            "operator",
+            WorkPolicy::default(),
+            created_at,
+        )
+        .unwrap();
+        low.work_id = "local-a".into();
+        low.priority = 0;
+        let mut high = WorkItem::new_at(
+            "local",
+            "high",
+            session.id,
+            &claimed,
+            "operator",
+            WorkPolicy::default(),
+            created_at,
+        )
+        .unwrap();
+        high.work_id = "local-b".into();
+        high.priority = 1;
+        let store = host.ensure_orchestration_store().unwrap();
+        store.save_work_item_unchecked(&low).unwrap();
+        store.save_work_item_unchecked(&high).unwrap();
+
+        let page = host
+            .list_work_page_for_session(session.id, workspace.path(), 1, None)
+            .unwrap();
+        assert_eq!(page.items[0].work_id, "local-b");
+        assert!(!page.complete);
+        let continuation = page.continuation.expect("partial page continuation");
+
+        let mut changed = store.load_work_item("local-a").unwrap().unwrap();
+        changed.priority = 9;
+        changed.bump_at(created_at);
+        store.save_work_item_unchecked(&changed).unwrap();
+        let restarted = host
+            .list_work_page_for_session(session.id, workspace.path(), 1, Some(continuation))
+            .expect_err("a changed lane must require a restart")
+            .to_string();
+        assert!(restarted.contains("restart_required"), "{restarted}");
+        assert!(restarted.contains("the work lane changed"), "{restarted}");
+        assert!(!restarted.contains(&claimed), "{restarted}");
+
+        let lane = store.scoped_work_items(session.id, &claimed).unwrap();
+        let reader = WorkPageReader {
+            owner_id: LOCAL_DESKTOP_ORIGIN_ID.to_string(),
+            token_id: LOCAL_DESKTOP_ORIGIN_ID.to_string(),
+            session_id: session.id,
+            workspace_digest: crate::orchestration::workspace_digest(&claimed),
+        };
+        let expired = crate::orchestration::issue_cursor_for_tests(
+            &store.page_mac_key(),
+            &reader,
+            &WorkPageFilter::default(),
+            WorkPageKind::List,
+            &crate::orchestration::lane_digest(&lane),
+            created_at,
+            &lane[0],
+            chrono::Utc::now(),
+            chrono::Utc::now() - chrono::Duration::seconds(30),
+        )
+        .unwrap();
+        let expired_error = host
+            .list_work_page_for_session(session.id, workspace.path(), 1, Some(expired))
+            .expect_err("an expired continuation must be refused")
+            .to_string();
+        assert!(expired_error.contains("cursor_expired"), "{expired_error}");
+        assert!(
+            expired_error.contains("work page continuation expired"),
+            "{expired_error}"
+        );
+        assert!(!expired_error.contains(&claimed), "{expired_error}");
+
+        let fresh = host
+            .list_work_page_for_session(session.id, workspace.path(), 1, None)
+            .unwrap();
+        assert_eq!(fresh.items[0].work_id, "local-a");
     }
 
     fn usage_test_run(run_id: &str, max_total_tokens: Option<u64>) -> RunRecord {

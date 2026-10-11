@@ -15,6 +15,12 @@
 //! Continuations are opaque HMAC tokens. The MAC key is host-owned. The
 //! token body carries lane coordinates and digests, never a workspace path,
 //! lease, credential, or the MAC key.
+//!
+//! The detail `summary` section is the authorized identity projection: the
+//! non-bulky operator fields a trusted desktop reconstructs, plus collection
+//! counts. Objective text, progress, policy, dependencies, result bodies, and
+//! attempt records stay in their own sections. Leases stay out of every
+//! section. Graph nodes stay redacted.
 
 use std::collections::BTreeMap;
 
@@ -875,6 +881,24 @@ fn base64url_decode(text: &str) -> Result<Vec<u8>, ()> {
     Ok(out)
 }
 
+fn detail_result_body(
+    item: &WorkItem,
+    evidence: &[String],
+    artifacts: &[super::workload::WorkArtifactRef],
+) -> Value {
+    let result = item.result.as_ref();
+    json!({
+        "summary": result.map(|result| result.summary.clone()),
+        "failure": result.and_then(|result| result.failure.clone()),
+        "cancellationReason": result.and_then(|result| result.cancellation_reason.clone()),
+        "completedAt": result.map(|result| result.completed_at),
+        "verification": result.and_then(|result| result.verification.clone()),
+        "candidateVerification": result.and_then(|result| result.candidate_verification.clone()),
+        "evidence": evidence,
+        "artifacts": artifacts,
+    })
+}
+
 /// Bounded section of one authorized work item. Collections page by offset.
 /// A section that cannot fit even one element returns `capacity_exhausted`
 /// rather than a truncated element.
@@ -895,6 +919,7 @@ pub fn project_work_detail(
     let (body, next_offset, complete) = match section {
         WorkDetailSection::Summary => (
             json!({
+                "schemaVersion": item.schema_version,
                 "workId": item.work_id,
                 "kind": item.kind,
                 "state": item.state,
@@ -907,6 +932,24 @@ pub fn project_work_detail(
                 "artifactCount": item.result.as_ref().map(|result| result.artifacts.len()).unwrap_or(0),
                 "attemptRecordCount": attempts_json.len(),
                 "dependencyCount": item.dependencies.len(),
+                "sessionId": item.session_id,
+                "workspace": item.workspace,
+                "createdBy": item.created_by,
+                "assignedAgentId": item.assigned_agent_id,
+                "deadline": item.deadline,
+                "parentWorkId": item.parent_work_id,
+                "isContainer": item.is_container,
+                "approval": item.approval,
+                "assignmentStatus": item.assignment_status,
+                "blockedReason": item.blocked_reason,
+                "blockProvenance": item.block_provenance,
+                "lastDecisionId": item.last_decision_id,
+                "createdAt": item.created_at,
+                "updatedAt": item.updated_at,
+                "sourceRoutineId": item.source_routine_id,
+                "sourceActivationId": item.source_activation_id,
+                "sourceManagerPlanId": item.source_manager_plan_id,
+                "sourceManagerStepId": item.source_manager_step_id,
             }),
             None,
             true,
@@ -969,12 +1012,7 @@ pub fn project_work_detail(
                     offset,
                     complete: index == total,
                     next_offset: (index != total).then_some(index),
-                    body: json!({
-                        "summary": item.result.as_ref().map(|result| result.summary.clone()),
-                        "failure": item.result.as_ref().and_then(|result| result.failure.clone()),
-                        "evidence": taken_evidence,
-                        "artifacts": taken_artifacts,
-                    }),
+                    body: detail_result_body(item, &taken_evidence, &taken_artifacts),
                 };
                 if tools_call_response_len(&json!(trial)) > max_response_bytes {
                     if count == 1 {
@@ -994,12 +1032,7 @@ pub fn project_work_detail(
             }
             let complete = index >= total;
             (
-                json!({
-                    "summary": item.result.as_ref().map(|result| result.summary.clone()),
-                    "failure": item.result.as_ref().and_then(|result| result.failure.clone()),
-                    "evidence": taken_evidence,
-                    "artifacts": taken_artifacts,
-                }),
+                detail_result_body(item, &taken_evidence, &taken_artifacts),
                 (!complete).then_some(index),
                 complete,
             )
@@ -1164,6 +1197,55 @@ mod tests {
         seen.sort();
         seen.dedup();
         assert_eq!(seen.len(), 4);
+    }
+
+    #[test]
+    fn detail_summary_keeps_operator_identity_out_of_the_result_body() {
+        use crate::orchestration::workload::{WorkApproval, WorkResult};
+        let mut item = item("id", 1, "2026-01-01T00:00:00Z");
+        item.created_by = "operator-remote".into();
+        item.assigned_agent_id = Some("agent-1".into());
+        item.approval = Some(WorkApproval {
+            reviewer_id: "reviewer-1".into(),
+            note: None,
+            approved_at: item.created_at,
+            candidate_digest: None,
+            target_revision: None,
+            apply_bundle_digest: None,
+        });
+        item.result = Some(WorkResult {
+            summary: "visible result".into(),
+            evidence: vec!["one".into()],
+            artifacts: Vec::new(),
+            failure: None,
+            cancellation_reason: Some("not cancelled".into()),
+            completed_at: item.created_at,
+            verification: None,
+            candidate_verification: None,
+        });
+        let summary = project_work_detail(
+            &item,
+            &[],
+            WorkDetailSection::Summary,
+            0,
+            1,
+            2 * 1024 * 1024,
+        )
+        .unwrap();
+        assert_eq!(summary.body["createdBy"], "operator-remote");
+        assert_eq!(summary.body["assignedAgentId"], "agent-1");
+        assert_eq!(summary.body["approval"]["reviewerId"], "reviewer-1");
+        assert!(summary.body.get("objective").is_none());
+        assert!(summary.body["objectiveBytes"].as_u64().unwrap() > 0);
+        let result =
+            project_work_detail(&item, &[], WorkDetailSection::Result, 0, 1, 2 * 1024 * 1024)
+                .unwrap();
+        assert_eq!(result.body["summary"], "visible result");
+        assert_eq!(result.body["cancellationReason"], "not cancelled");
+        assert!(result.body["completedAt"].is_string());
+        let rendered = result.body.to_string();
+        assert!(!rendered.contains("operator-remote"));
+        assert!(!rendered.contains(&item.workspace));
     }
 
     #[test]

@@ -63,7 +63,12 @@ when the JSON-RPC body would exceed the 2 MiB MCP ceiling. They do not
 truncate a lane or report a partial page as complete. A continuation is an
 opaque host MAC bound to the lane digest. A changed lane returns
 `restart_required`. An item that does not fit `ptah_get_work` is read through
-`ptah_get_work_detail`. See `docs/WORKLOAD_RELIABILITY_V1.md`.
+`ptah_get_work_detail`. The remote Work Board follows that detail contract
+when get-by-id returns `capacity_exhausted`, and does not truncate an element
+that still does not fit. The embedded list error keeps the
+`restart_required` and `cursor_expired` codes so the board can tell an expired
+or changed continuation from a generic failure. See
+`docs/WORKLOAD_RELIABILITY_V1.md`.
 
 Assignment mutations that emit a `WorkDecision` use a durable `work-intents/`
 commit marker. Lifecycle mutations, including managed finalization and queued

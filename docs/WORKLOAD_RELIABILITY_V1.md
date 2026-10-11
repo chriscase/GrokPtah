@@ -21,6 +21,8 @@ Result: exit 0, the one test passed in 201.78s. Both `ptah_list_work` and `ptah_
 - Default page limit 50, maximum 200. Preferred envelope 256 KiB. A single entry may use the 2 MiB hard ceiling. A nonterminal page has at least one entry and a strictly later continuation.
 - List pages project `WorkListEntryV1`. Graph nodes stay the existing redacted `WorkGraphNode`. Detail sections page collections without cutting an element in half.
 - Embedded Desktop reader identity is the existing `local-desktop` origin. Service cursors bind `AuthContext` owner and token ids, so a rotated bearer does not continue a page.
+- Embedded `list_work_page_for_session` returns the orchestration error display, which includes `restart_required` or `cursor_expired`. The Work Board matches those codes.
+- Detail `summary` carries the non-bulky operator identity (session, workspace, creator, assignment, approval, timestamps, assignment status). Objective, progress, policy, dependencies, results, and attempts stay in their sections. A remote get that returns `capacity_exhausted` is assembled from those sections. A single element that still does not fit stays `capacity_exhausted`.
 
 ## Acceptance matrix
 
