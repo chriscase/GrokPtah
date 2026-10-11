@@ -1,14 +1,15 @@
 use chrono::Utc;
 use grokptah_agent_bridge::orchestration::{
-    assemble_managed_run_input, intersect_run_bounds, managed_execution_eligible,
+    assemble_managed_run_input, intersect_run_bounds, managed_execution_eligible, safe_id_filename,
     select_relevant_managed_messages, AssignmentStatus, AttemptState, IdempotencyClaim,
     IdempotencyScope, ManagedExecutionBudgetProfile, ManagedExecutionIntent,
     ManagedExecutionPolicy, ManagedExecutorKind, ManagedFinalizationOutcome,
-    ManagedFinalizationStage, ManagedIntentState, ManagedRetryCause, ManagedWorkMode, MessageKind,
-    OrchErrorCode, OrchStore, RunBounds, RunExecutionMode, RunRecord, RunState, WorkItem,
-    WorkMessage, WorkPolicy, WorkProgress, WorkResult, WorkState, MANAGED_EXECUTION_SCHEMA_VERSION,
+    ManagedFinalizationRecord, ManagedFinalizationStage, ManagedIntentState, ManagedRetryCause,
+    ManagedWorkMode, MessageKind, OrchErrorCode, OrchStore, RunBounds, RunExecutionMode, RunRecord,
+    RunState, WorkItem, WorkMessage, WorkPolicy, WorkProgress, WorkRequestBinding, WorkResult,
+    WorkState, MANAGED_EXECUTION_SCHEMA_VERSION, MANAGED_FINALIZATION_SCHEMA_VERSION,
 };
-use grokptah_agent_bridge::{AgentRecord, AgentState};
+use grokptah_agent_bridge::{AgentRecord, AgentState, DurableWriteFault, DURABLE_WRITE_FAULT};
 use tempfile::tempdir;
 use uuid::Uuid;
 
@@ -1679,7 +1680,7 @@ fn crash_close_stage(stage: ManagedFinalizationStage) {
             .unwrap()
             .unwrap();
         match stage {
-            ManagedFinalizationStage::BeforeJournal => {
+            ManagedFinalizationStage::BeforeJournal | ManagedFinalizationStage::AfterIntent => {
                 assert_eq!(loaded.state, ManagedIntentState::Admitted);
                 assert!(store
                     .load_work_attempt(&claim.attempt.attempt_id)
@@ -1933,4 +1934,648 @@ fn seal_queued_managed_work_converges_after_store_reload() {
         store.load_work_item(&work_id).unwrap().unwrap().state,
         WorkState::Failed
     );
+}
+
+fn json_files(dir: &std::path::Path) -> usize {
+    let mut count = 0usize;
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|value| value.to_str()) == Some("json") {
+            count += 1;
+        }
+    }
+    count
+}
+
+fn effect_counts(root: &std::path::Path) -> (usize, usize) {
+    (
+        json_files(&root.join("verified-changes")),
+        json_files(&root.join("runs")),
+    )
+}
+
+fn crash_child(
+    root: &std::path::Path,
+    stage: &str,
+    op: &str,
+    extra: &[(&str, &str)],
+) -> std::process::Output {
+    let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+    command
+        .arg("--exact")
+        .arg("workload_reliability_crash_child")
+        .arg("--test-threads=1")
+        .env("GROKPTAH_CRASH_STAGE", stage)
+        .env("GROKPTAH_CRASH_OP", op)
+        .env("GROKPTAH_CRASH_STORE", root)
+        .env_remove("GROKPTAH_CRASH_CHILD_ACTIVE");
+    for (key, value) in extra {
+        command.env(key, value);
+    }
+    command.output().expect("spawn crash child")
+}
+
+fn reopen_twice(root: &std::path::Path) {
+    for _ in 0..2 {
+        let store = OrchStore::open(root).unwrap();
+        assert!(store.ledger_admission_closed().is_none());
+        drop(store);
+    }
+}
+
+#[test]
+fn workload_reliability_crash_child() {
+    let Ok(op) = std::env::var("GROKPTAH_CRASH_OP") else {
+        return;
+    };
+    let root = std::env::var("GROKPTAH_CRASH_STORE").unwrap();
+    let store = OrchStore::open(&root).unwrap();
+    let session = Uuid::parse_str(&std::env::var("GROKPTAH_CRASH_SESSION").unwrap()).unwrap();
+    let workspace = std::env::var("GROKPTAH_CRASH_WORKSPACE").unwrap();
+    let scope = IdempotencyScope::new(
+        "owner-reliability",
+        session,
+        std::path::Path::new(&workspace),
+    )
+    .unwrap();
+    let request_id = std::env::var("GROKPTAH_CRASH_REQUEST").unwrap();
+    let tool = std::env::var("GROKPTAH_CRASH_TOOL").unwrap();
+    let shape = std::env::var("GROKPTAH_CRASH_SHAPE").unwrap();
+    store
+        .claim_idempotency(&scope, &tool, &request_id, "payload-reliability")
+        .unwrap();
+    store.arm_work_request(WorkRequestBinding::bound(
+        &scope,
+        &workspace,
+        &request_id,
+        &tool,
+        "payload-reliability",
+        &shape,
+    ));
+    match op.as_str() {
+        "managed_close" => {
+            let intent_id = std::env::var("GROKPTAH_CRASH_INTENT").unwrap();
+            store
+                .close_managed_attempt(
+                    &intent_id,
+                    false,
+                    ManagedRetryCause::Interrupted,
+                    "interrupted",
+                    Utc::now(),
+                )
+                .unwrap();
+        }
+        "offer" => {
+            let work_id = std::env::var("GROKPTAH_CRASH_WORK").unwrap();
+            store
+                .offer_work(
+                    &work_id,
+                    "worker-a",
+                    "operator",
+                    None,
+                    "offer",
+                    None,
+                    Utc::now(),
+                )
+                .unwrap();
+        }
+        "fail" => {
+            let work_id = std::env::var("GROKPTAH_CRASH_WORK").unwrap();
+            let attempt_id = std::env::var("GROKPTAH_CRASH_ATTEMPT").unwrap();
+            let token = std::env::var("GROKPTAH_CRASH_TOKEN").unwrap();
+            store
+                .fail_work(
+                    &work_id,
+                    &attempt_id,
+                    &token,
+                    WorkResult {
+                        summary: "worker failed".into(),
+                        evidence: Vec::new(),
+                        artifacts: Vec::new(),
+                        failure: Some("boom".into()),
+                        cancellation_reason: None,
+                        completed_at: Utc::now(),
+                        verification: None,
+                        candidate_verification: None,
+                    },
+                )
+                .unwrap();
+        }
+        "seal" => {
+            let work_id = std::env::var("GROKPTAH_CRASH_WORK").unwrap();
+            store
+                .seal_queued_managed_work(&work_id, "lane sealed", Utc::now())
+                .unwrap();
+        }
+        other => panic!("unknown crash op {other}"),
+    }
+    panic!("crash stage did not terminate the process");
+}
+
+fn prepare_workspace() -> (tempfile::TempDir, Uuid, String) {
+    let home = tempdir().unwrap();
+    let session = Uuid::new_v4();
+    let workspace = home.path().join("workspace");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let workspace = workspace.display().to_string();
+    (home, session, workspace)
+}
+
+fn replay_is_complete(
+    root: &std::path::Path,
+    session: Uuid,
+    workspace: &str,
+    tool: &str,
+    request_id: &str,
+) {
+    let store = OrchStore::open(root).unwrap();
+    assert!(store.ledger_admission_closed().is_none());
+    let scope = IdempotencyScope::new(
+        "owner-reliability",
+        session,
+        std::path::Path::new(workspace),
+    )
+    .unwrap();
+    match store
+        .claim_idempotency(&scope, tool, request_id, "payload-reliability")
+        .unwrap()
+    {
+        IdempotencyClaim::Replay(Ok(body)) => {
+            assert!(body.get("work").is_some(), "replay omitted the sealed work");
+        }
+        other => panic!("recovered request did not replay a completed receipt: {other:?}"),
+    }
+}
+
+#[test]
+fn process_crash_offer_commits_one_decision_and_replays() {
+    let (home, session, workspace) = prepare_workspace();
+    let root = home.path().to_path_buf();
+    let work_id = {
+        let store = OrchStore::open(&root).unwrap();
+        store
+            .save_agent(&agent("worker-a", &workspace, session))
+            .unwrap();
+        let mut item = accepted_work(session, &workspace, "worker-a");
+        item.assignment_status = AssignmentStatus::Unassigned;
+        item.assigned_agent_id = None;
+        store.save_work_item(&item).unwrap();
+        item.work_id
+    };
+    let before = effect_counts(&root);
+    let output = crash_child(
+        &root,
+        "mutation_after_intent",
+        "offer",
+        &[
+            ("GROKPTAH_CRASH_SESSION", &session.to_string()),
+            ("GROKPTAH_CRASH_WORKSPACE", &workspace),
+            ("GROKPTAH_CRASH_REQUEST", "req-offer"),
+            ("GROKPTAH_CRASH_TOOL", "ptah_offer_work"),
+            ("GROKPTAH_CRASH_SHAPE", "decision"),
+            ("GROKPTAH_CRASH_WORK", &work_id),
+        ],
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(86),
+        "stderr {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let store = OrchStore::open(&root).unwrap();
+    let item = store.load_work_item(&work_id).unwrap().unwrap();
+    assert_eq!(item.assignment_status, AssignmentStatus::Offered);
+    assert_eq!(store.list_work_decisions(&work_id).unwrap().len(), 1);
+    drop(store);
+    replay_is_complete(&root, session, &workspace, "ptah_offer_work", "req-offer");
+    reopen_twice(&root);
+    let store = OrchStore::open(&root).unwrap();
+    assert_eq!(store.list_work_decisions(&work_id).unwrap().len(), 1);
+    assert_eq!(
+        store
+            .load_work_item(&work_id)
+            .unwrap()
+            .unwrap()
+            .assignment_status,
+        AssignmentStatus::Offered
+    );
+    assert_eq!(effect_counts(&root), before);
+    assert_eq!(before, (0, 0));
+}
+
+#[test]
+fn process_crash_fail_commits_one_attempt_and_replays() {
+    let (home, session, workspace) = prepare_workspace();
+    let root = home.path().to_path_buf();
+    let (work_id, attempt_id, token) = {
+        let store = OrchStore::open(&root).unwrap();
+        let mut item = accepted_work(session, &workspace, "worker-a");
+        item.policy.retry.retry_failed = false;
+        store.save_work_item(&item).unwrap();
+        let claim = store
+            .claim_work_with_lease_secret(&item.work_id, "worker-a", None, "secret")
+            .unwrap();
+        (item.work_id, claim.attempt.attempt_id, claim.lease_token)
+    };
+    let before = effect_counts(&root);
+    let output = crash_child(
+        &root,
+        "lifecycle_after_intent",
+        "fail",
+        &[
+            ("GROKPTAH_CRASH_SESSION", &session.to_string()),
+            ("GROKPTAH_CRASH_WORKSPACE", &workspace),
+            ("GROKPTAH_CRASH_REQUEST", "req-fail"),
+            ("GROKPTAH_CRASH_TOOL", "ptah_fail_work"),
+            ("GROKPTAH_CRASH_SHAPE", "work_attempt"),
+            ("GROKPTAH_CRASH_WORK", &work_id),
+            ("GROKPTAH_CRASH_ATTEMPT", &attempt_id),
+            ("GROKPTAH_CRASH_TOKEN", &token),
+        ],
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(86),
+        "stderr {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let store = OrchStore::open(&root).unwrap();
+    assert_eq!(
+        store.load_work_item(&work_id).unwrap().unwrap().state,
+        WorkState::Failed
+    );
+    assert_eq!(
+        store.load_work_attempt(&attempt_id).unwrap().unwrap().state,
+        AttemptState::Failed
+    );
+    assert!(store.claim_work(&work_id, "worker-b", None).is_err());
+    drop(store);
+    replay_is_complete(&root, session, &workspace, "ptah_fail_work", "req-fail");
+    reopen_twice(&root);
+    let store = OrchStore::open(&root).unwrap();
+    assert_eq!(
+        store.load_work_item(&work_id).unwrap().unwrap().state,
+        WorkState::Failed
+    );
+    assert_eq!(store.list_work_attempts(Some(&work_id)).unwrap().len(), 1);
+    assert_eq!(effect_counts(&root), before);
+}
+
+#[test]
+fn process_crash_managed_finalization_after_intent_and_journal() {
+    let (home, session, workspace) = prepare_workspace();
+    let root = home.path().to_path_buf();
+    let (work_id, intent_id, attempt_id) = {
+        let store = OrchStore::open(&root).unwrap();
+        store
+            .save_agent(&agent("worker-a", &workspace, session))
+            .unwrap();
+        enable_managed(&store, "worker-a", false);
+        let item = accepted_work(session, &workspace, "worker-a");
+        store.save_work_item(&item).unwrap();
+        let claim = store
+            .claim_work_with_lease_secret(&item.work_id, "worker-a", None, "secret")
+            .unwrap();
+        let mut intent =
+            claiming_intent(&item, Some(claim.attempt.attempt_id.clone()), None, session);
+        intent.state = ManagedIntentState::Admitted;
+        store.save_managed_intent(&intent).unwrap();
+        (item.work_id, intent.intent_id, claim.attempt.attempt_id)
+    };
+    let before = effect_counts(&root);
+    let output = crash_child(
+        &root,
+        "managed_finalization_after_intent",
+        "managed_close",
+        &[
+            ("GROKPTAH_CRASH_SESSION", &session.to_string()),
+            ("GROKPTAH_CRASH_WORKSPACE", &workspace),
+            ("GROKPTAH_CRASH_REQUEST", "req-close"),
+            ("GROKPTAH_CRASH_TOOL", "ptah_close_managed"),
+            ("GROKPTAH_CRASH_SHAPE", "work_scope"),
+            ("GROKPTAH_CRASH_INTENT", &intent_id),
+        ],
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(86),
+        "stderr {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(root
+        .join("work-lifecycle-intents")
+        .read_dir()
+        .unwrap()
+        .next()
+        .is_some());
+    assert_eq!(json_files(&root.join("managed-finalization")), 0);
+    let store = OrchStore::open(&root).unwrap();
+    assert_eq!(
+        store.load_work_item(&work_id).unwrap().unwrap().state,
+        WorkState::Failed
+    );
+    assert_eq!(
+        store
+            .load_managed_intent(&intent_id)
+            .unwrap()
+            .unwrap()
+            .state,
+        ManagedIntentState::Finalized
+    );
+    assert!(!store
+        .load_work_attempt(&attempt_id)
+        .unwrap()
+        .unwrap()
+        .state
+        .is_active());
+    drop(store);
+    let store = OrchStore::open(&root).unwrap();
+    store
+        .close_managed_attempt(
+            &intent_id,
+            false,
+            ManagedRetryCause::Interrupted,
+            "interrupted",
+            Utc::now(),
+        )
+        .unwrap();
+    assert_eq!(
+        store
+            .load_managed_intent(&intent_id)
+            .unwrap()
+            .unwrap()
+            .state,
+        ManagedIntentState::Finalized
+    );
+    drop(store);
+    reopen_twice(&root);
+    replay_is_complete(
+        &root,
+        session,
+        &workspace,
+        "ptah_close_managed",
+        "req-close",
+    );
+    assert_eq!(effect_counts(&root), before);
+    assert_eq!(before, (0, 0));
+}
+
+#[test]
+fn process_crash_managed_finalization_after_journal_keeps_review() {
+    let (home, session, workspace) = prepare_workspace();
+    let root = home.path().to_path_buf();
+    let (work_id, intent_id) = {
+        let store = OrchStore::open(&root).unwrap();
+        store
+            .save_agent(&agent("worker-a", &workspace, session))
+            .unwrap();
+        enable_managed(&store, "worker-a", false);
+        let mut item = accepted_work(session, &workspace, "worker-a");
+        item.policy.requires_approval = true;
+        store.save_work_item(&item).unwrap();
+        let claim = store
+            .claim_work_with_lease_secret(&item.work_id, "worker-a", None, "secret")
+            .unwrap();
+        let mut current = store.load_work_item(&item.work_id).unwrap().unwrap();
+        current.state = WorkState::AwaitingApproval;
+        store.save_work_item(&current).unwrap();
+        let mut intent =
+            claiming_intent(&item, Some(claim.attempt.attempt_id.clone()), None, session);
+        intent.state = ManagedIntentState::Admitted;
+        store.save_managed_intent(&intent).unwrap();
+        (item.work_id, intent.intent_id)
+    };
+    let before = effect_counts(&root);
+    let output = crash_child(
+        &root,
+        "managed_finalization_after_journal",
+        "managed_close",
+        &[
+            ("GROKPTAH_CRASH_SESSION", &session.to_string()),
+            ("GROKPTAH_CRASH_WORKSPACE", &workspace),
+            ("GROKPTAH_CRASH_REQUEST", "req-review"),
+            ("GROKPTAH_CRASH_TOOL", "ptah_close_managed"),
+            ("GROKPTAH_CRASH_SHAPE", "work_scope"),
+            ("GROKPTAH_CRASH_INTENT", &intent_id),
+        ],
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(86),
+        "stderr {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(json_files(&root.join("managed-finalization")) >= 1);
+    let store = OrchStore::open(&root).unwrap();
+    assert_eq!(
+        store.load_work_item(&work_id).unwrap().unwrap().state,
+        WorkState::AwaitingApproval
+    );
+    assert!(store.claim_work(&work_id, "worker-b", None).is_err());
+    drop(store);
+    reopen_twice(&root);
+    assert_eq!(
+        OrchStore::open(&root)
+            .unwrap()
+            .load_work_item(&work_id)
+            .unwrap()
+            .unwrap()
+            .state,
+        WorkState::AwaitingApproval
+    );
+    assert_eq!(effect_counts(&root), before);
+}
+
+#[test]
+fn process_crash_seal_queued_managed_work_commits_once() {
+    let (home, session, workspace) = prepare_workspace();
+    let root = home.path().to_path_buf();
+    let work_id = {
+        let store = OrchStore::open(&root).unwrap();
+        let item = accepted_work(session, &workspace, "worker-a");
+        store.save_work_item(&item).unwrap();
+        item.work_id
+    };
+    let before = effect_counts(&root);
+    let output = crash_child(
+        &root,
+        "lifecycle_after_attempts",
+        "seal",
+        &[
+            ("GROKPTAH_CRASH_SESSION", &session.to_string()),
+            ("GROKPTAH_CRASH_WORKSPACE", &workspace),
+            ("GROKPTAH_CRASH_REQUEST", "req-seal"),
+            ("GROKPTAH_CRASH_TOOL", "ptah_seal_queued"),
+            ("GROKPTAH_CRASH_SHAPE", "work_scope"),
+            ("GROKPTAH_CRASH_WORK", &work_id),
+        ],
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(86),
+        "stderr {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let store = OrchStore::open(&root).unwrap();
+    assert_eq!(
+        store.load_work_item(&work_id).unwrap().unwrap().state,
+        WorkState::Failed
+    );
+    drop(store);
+    let store = OrchStore::open(&root).unwrap();
+    let sealed = store
+        .seal_queued_managed_work(&work_id, "lane sealed", Utc::now())
+        .unwrap()
+        .unwrap();
+    assert_eq!(sealed.state, WorkState::Failed);
+    drop(store);
+    replay_is_complete(&root, session, &workspace, "ptah_seal_queued", "req-seal");
+    reopen_twice(&root);
+    assert_eq!(effect_counts(&root), before);
+    assert_eq!(
+        OrchStore::open(&root)
+            .unwrap()
+            .load_work_item(&work_id)
+            .unwrap()
+            .unwrap()
+            .state,
+        WorkState::Failed
+    );
+}
+
+#[test]
+fn legacy_journal_without_envelope_is_quarantined() {
+    let (home, session, workspace) = prepare_workspace();
+    let root = home.path().to_path_buf();
+    let (work_id, intent_id) = {
+        let store = OrchStore::open(&root).unwrap();
+        store
+            .save_agent(&agent("worker-a", &workspace, session))
+            .unwrap();
+        enable_managed(&store, "worker-a", false);
+        let item = accepted_work(session, &workspace, "worker-a");
+        store.save_work_item(&item).unwrap();
+        let claim = store
+            .claim_work_with_lease_secret(&item.work_id, "worker-a", None, "secret")
+            .unwrap();
+        let mut intent =
+            claiming_intent(&item, Some(claim.attempt.attempt_id.clone()), None, session);
+        intent.state = ManagedIntentState::Admitted;
+        store.save_managed_intent(&intent).unwrap();
+        let mut current = store.load_work_item(&item.work_id).unwrap().unwrap();
+        current.priority = 7;
+        store.save_work_item(&current).unwrap();
+        (item.work_id.clone(), intent.intent_id.clone())
+    };
+    let record = ManagedFinalizationRecord {
+        schema_version: MANAGED_FINALIZATION_SCHEMA_VERSION,
+        intent_id: intent_id.clone(),
+        work_id: work_id.clone(),
+        attempt_id: None,
+        outcome: ManagedFinalizationOutcome::Failed,
+        attempt_state: AttemptState::Expired,
+        work_state: WorkState::Failed,
+        reason: "legacy journal".into(),
+        result: None,
+        created_at: Utc::now(),
+    };
+    let journal = root
+        .join("managed-finalization")
+        .join(format!("{}.json", safe_id_filename(&intent_id).unwrap()));
+    std::fs::write(&journal, serde_json::to_vec_pretty(&record).unwrap()).unwrap();
+    let store = OrchStore::open(&root).unwrap();
+    let item = store.load_work_item(&work_id).unwrap().unwrap();
+    assert_eq!(item.priority, 7);
+    assert_ne!(item.state, WorkState::Failed);
+    assert!(!journal.exists());
+    let quarantined = std::fs::read_dir(root.join("managed-finalization-quarantine"))
+        .unwrap()
+        .count();
+    assert!(quarantined >= 1);
+    let marker = std::fs::read_to_string(root.join("ledger-reconciliation.json")).unwrap();
+    assert!(marker.contains("unbound_managed_finalization"));
+    assert!(!marker.contains(&root.display().to_string()));
+    assert_eq!(
+        store.ledger_admission_closed().as_deref(),
+        Some("ledger reconciliation is required")
+    );
+    let refused = store.claim_work(&work_id, "worker-b", None).unwrap_err();
+    assert_eq!(refused.code, OrchErrorCode::Conflict);
+    assert_eq!(refused.message, "ledger reconciliation is required");
+    assert!(!refused.message.contains(&workspace));
+}
+
+#[test]
+fn same_process_item_write_failure_closes_admission_until_reopen() {
+    let _guard = FaultReset;
+    let (home, session, workspace) = prepare_workspace();
+    let root = home.path().to_path_buf();
+    let (work_id, attempt_id, token) = {
+        let store = OrchStore::open(&root).unwrap();
+        let mut item = accepted_work(session, &workspace, "worker-a");
+        item.policy.retry.retry_failed = false;
+        store.save_work_item(&item).unwrap();
+        let claim = store
+            .claim_work_with_lease_secret(&item.work_id, "worker-a", None, "secret")
+            .unwrap();
+        (item.work_id, claim.attempt.attempt_id, claim.lease_token)
+    };
+    let store = OrchStore::open(&root).unwrap();
+    *DURABLE_WRITE_FAULT
+        .lock()
+        .unwrap_or_else(|error| error.into_inner()) = Some(DurableWriteFault {
+        needle: "work-items",
+        skips_remaining: 0,
+    });
+    let failed = store.fail_work(
+        &work_id,
+        &attempt_id,
+        &token,
+        WorkResult {
+            summary: "worker failed".into(),
+            evidence: Vec::new(),
+            artifacts: Vec::new(),
+            failure: Some("boom".into()),
+            cancellation_reason: None,
+            completed_at: Utc::now(),
+            verification: None,
+            candidate_verification: None,
+        },
+    );
+    assert!(failed.is_err());
+    assert_eq!(
+        store.ledger_admission_closed().as_deref(),
+        Some("ledger admission is closed until the store is reopened")
+    );
+    let refused = store
+        .claim_work("other-work", "worker-b", None)
+        .unwrap_err();
+    assert_eq!(
+        refused.message,
+        "ledger admission is closed until the store is reopened"
+    );
+    assert!(!refused.message.contains(&workspace));
+    drop(store);
+    *DURABLE_WRITE_FAULT
+        .lock()
+        .unwrap_or_else(|error| error.into_inner()) = None;
+    let reopened = OrchStore::open(&root).unwrap();
+    assert!(reopened.ledger_admission_closed().is_none());
+    assert_eq!(
+        reopened.load_work_item(&work_id).unwrap().unwrap().state,
+        WorkState::Failed
+    );
+}
+
+struct FaultReset;
+
+impl Drop for FaultReset {
+    fn drop(&mut self) {
+        *DURABLE_WRITE_FAULT
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = None;
+    }
 }
