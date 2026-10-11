@@ -649,3 +649,80 @@ async fn the_control_plane_maps_scope_overflow_to_capacity_exhausted() {
         MAX_GRAPH_SCOPE_ITEMS + 1
     );
 }
+
+/// A legal 4096-item lane stays admitted. The unpaged tools refuse with
+/// `capacity_exhausted` instead of truncating or exceeding the MCP body.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::await_holding_lock)]
+async fn legal_ceiling_list_and_graph_exceed_the_mcp_body_ceiling() {
+    let mut env = ProcessEnvGuard::new();
+    let home = tempdir().unwrap();
+    set_grokptah_home_override(Some(home.path().join(".grokptah")));
+    env.set("GROKPTAH_AGENT_OFFLINE", "1");
+    let workspace = tempdir().unwrap();
+    let host = AgentHost::create(HostConfig {
+        always_approve: true,
+        ..HostConfig::default()
+    })
+    .expect("acquire the GrokPtah instance lock");
+    host.start().unwrap();
+
+    let mine = host.session_new_kind(SessionKind::Build).unwrap();
+    host.session_set_cwd(mine.id, workspace.path()).unwrap();
+    let workspace_text = workspace.path().display().to_string();
+    let objective = "x".repeat(512);
+    // Open first so the ledger directories exist. Planting before open is a
+    // harness miss, not the capacity defect under test.
+    let store = OrchStore::open(home.path().join("orchestration")).unwrap();
+
+    for index in 0..MAX_GRAPH_SCOPE_ITEMS {
+        let mut item = WorkItem::new(
+            "test",
+            &objective,
+            mine.id,
+            &workspace_text,
+            "operator",
+            WorkPolicy::default(),
+        )
+        .unwrap();
+        item.work_id = format!("cap-{index:04}");
+        std::fs::write(
+            home.path()
+                .join("orchestration")
+                .join("work-items")
+                .join(format!("{}.json", safe_id_filename(&item.work_id).unwrap())),
+            serde_json::to_vec_pretty(&item).unwrap(),
+        )
+        .unwrap();
+    }
+
+    let orch = OrchestrationService::new(
+        host.clone(),
+        host.event_bus(),
+        store,
+        OrchestrationConfig {
+            bearer_token: "work-graph-token-520".into(),
+            allowlist: WorkspaceAllowlist::new([workspace.path().to_path_buf()]),
+            max_concurrent_runs: 2,
+            bounds: RunBounds::default(),
+        },
+    );
+    let server = start_control_server(orch, 0).await.unwrap();
+    let mut client =
+        McpControlClient::new(format!("http://{}", server.addr), "work-graph-token-520");
+    client.initialize().await.unwrap();
+    for tool in ["ptah_list_work", "ptah_get_work_graph"] {
+        let error = client
+            .call_tool(
+                tool,
+                json!({ "session_id": mine.id, "workspace": workspace_text }),
+            )
+            .await
+            .expect_err("a legal ceiling lane must not fit the unpaged MCP body")
+            .to_string();
+        assert_eq!(
+            error, "MCP remote error: capacity_exhausted",
+            "{tool} -> {error}"
+        );
+    }
+}

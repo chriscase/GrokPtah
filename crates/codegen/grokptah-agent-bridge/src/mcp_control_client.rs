@@ -704,8 +704,10 @@ fn append_bounded_response_chunk(bytes: &mut Vec<u8>, chunk: &[u8]) -> anyhow::R
 fn normalize_remote_error_code(value: &str) -> Option<String> {
     match value {
         "unauthenticated" | "forbidden_scope" | "workspace_mismatch" | "session_busy"
-        | "capacity_exhausted" | "stale_version" | "cursor_expired" | "internal" | "timeout"
-        | "invalid_request" | "unsupported" | "conflict" => Some(value.to_owned()),
+        | "capacity_exhausted" | "stale_version" | "cursor_expired" | "restart_required"
+        | "internal" | "timeout" | "invalid_request" | "unsupported" | "conflict" => {
+            Some(value.to_owned())
+        }
         _ => None,
     }
 }

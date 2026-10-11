@@ -64,6 +64,11 @@ use super::workload::{
     WorkAttempt, WorkAttemptView, WorkDecision, WorkDependency, WorkItem, WorkPolicy, WorkProgress,
     WorkResult, WorkRetryPolicy, WorkState,
 };
+use super::{
+    project_work_detail, select_work_graph_page, select_work_list_page, workspace_digest,
+    WorkDetailSection, WorkPageFilter, WorkPageKind, WorkPageQuery, WorkPageReader,
+    DEFAULT_WORK_DETAIL_LIMIT, DEFAULT_WORK_PAGE_LIMIT, WORK_PAGE_TRANSPORT_CEILING_BYTES,
+};
 
 /// Admission is deliberately bounded so an untrusted coordinator cannot turn
 /// queued submissions into an unbounded in-memory prompt store.
@@ -465,6 +470,20 @@ impl Drop for IdempotencyLease {
 }
 
 impl OrchestrationService {
+    fn arm_work_request(&self, lease: &IdempotencyLease, workspace_display: &str, shape: &str) {
+        self.store
+            .arm_work_request(super::store::WorkRequestBinding {
+                request_id: lease.request_id.clone(),
+                owner_id: lease.scope.owner_id.clone(),
+                tool: lease.tool.clone(),
+                session_id: lease.scope.session_id,
+                workspace_digest: lease.scope.workspace_digest.clone(),
+                workspace_display: workspace_display.to_string(),
+                payload_hash: lease.payload_hash.clone(),
+                shape: shape.to_string(),
+            });
+    }
+
     pub fn new(
         host: AgentHostHandle,
         bus: EventBus,
@@ -4315,6 +4334,133 @@ impl OrchestrationService {
         self.workload_value(item, true)
     }
 
+    fn work_page_reader(
+        &self,
+        auth: &AuthContext,
+        session_id: Uuid,
+        claimed: &Path,
+    ) -> Result<WorkPageReader, OrchError> {
+        let canonical = canonical_workspace(claimed)?;
+        Ok(WorkPageReader {
+            owner_id: auth.owner_id.clone(),
+            token_id: auth.token_id.clone(),
+            session_id,
+            workspace_digest: workspace_digest(&canonical.display().to_string()),
+        })
+    }
+
+    fn scoped_ordered_work(
+        &self,
+        session_id: Uuid,
+        claimed: &Path,
+    ) -> Result<Vec<WorkItem>, OrchError> {
+        self.store
+            .scoped_work_items(session_id, &claimed.display().to_string())
+            .map_err(Self::map_work_ledger_error)
+    }
+
+    /// One bounded page of the authorized lane. Reads do not claim or dispatch.
+    pub fn list_work_page_scoped(
+        &self,
+        auth: &AuthContext,
+        session_id: Uuid,
+        workspace: &Path,
+        limit: Option<usize>,
+        cursor: Option<String>,
+        states: &[WorkState],
+    ) -> Result<serde_json::Value, OrchError> {
+        let claimed = self.authorize_work_read_scope(session_id, workspace)?;
+        let reader = self.work_page_reader(auth, session_id, &claimed)?;
+        let lane = self.scoped_ordered_work(session_id, &claimed)?;
+        let page = select_work_list_page(
+            &lane,
+            &WorkPageQuery {
+                limit: limit.unwrap_or(DEFAULT_WORK_PAGE_LIMIT),
+                cursor,
+                filter: WorkPageFilter::from_states(states.iter().copied()),
+                kind: WorkPageKind::List,
+            },
+            &reader,
+            &self.store.page_mac_key(),
+            Utc::now(),
+            WORK_PAGE_TRANSPORT_CEILING_BYTES,
+        )?;
+        serde_json::to_value(page)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))
+    }
+
+    /// One bounded page of the redacted lane graph at the continuation's
+    /// sealed admission instant.
+    pub fn get_work_graph_page_scoped(
+        &self,
+        auth: &AuthContext,
+        session_id: Uuid,
+        workspace: &Path,
+        limit: Option<usize>,
+        cursor: Option<String>,
+        states: &[WorkState],
+    ) -> Result<serde_json::Value, OrchError> {
+        let claimed = self.authorize_work_read_scope(session_id, workspace)?;
+        let reader = self.work_page_reader(auth, session_id, &claimed)?;
+        let lane = self.scoped_ordered_work(session_id, &claimed)?;
+        let workspace_text = claimed.display().to_string();
+        let scope = GraphScope {
+            session_id,
+            workspace: &workspace_text,
+        };
+        let page = select_work_graph_page(
+            &lane,
+            scope,
+            &WorkPageQuery {
+                limit: limit.unwrap_or(DEFAULT_WORK_PAGE_LIMIT),
+                cursor,
+                filter: WorkPageFilter::from_states(states.iter().copied()),
+                kind: WorkPageKind::Graph,
+            },
+            &reader,
+            &self.store.page_mac_key(),
+            Utc::now(),
+            WORK_PAGE_TRANSPORT_CEILING_BYTES,
+        )?;
+        serde_json::to_value(page)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))
+    }
+
+    /// One bounded section of an authorized work item. Offset past the end is
+    /// refused. A single element that does not fit is `capacity_exhausted`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn get_work_detail_scoped(
+        &self,
+        _auth: &AuthContext,
+        session_id: Uuid,
+        workspace: &Path,
+        work_id: &str,
+        section: WorkDetailSection,
+        offset: usize,
+        limit: Option<usize>,
+    ) -> Result<serde_json::Value, OrchError> {
+        let (item, _) = self.load_work_scoped(session_id, workspace, work_id, true)?;
+        let attempts = self
+            .store
+            .list_work_attempts(Some(&item.work_id))
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        let attempts_json = attempts
+            .iter()
+            .map(|attempt| serde_json::to_value(WorkAttemptView::from(attempt)))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        let page = project_work_detail(
+            &item,
+            &attempts_json,
+            section,
+            offset,
+            limit.unwrap_or(DEFAULT_WORK_DETAIL_LIMIT),
+            WORK_PAGE_TRANSPORT_CEILING_BYTES,
+        )?;
+        serde_json::to_value(page)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))
+    }
+
     pub fn list_operation_receipts_scoped(
         &self,
         auth: &AuthContext,
@@ -5353,16 +5499,17 @@ impl OrchestrationService {
         if let Err(error) = self.load_work_scoped(session_id, &claimed, work_id, false) {
             return Err(self.fail_claim(&mut lease, None, session_id, &claimed, error));
         }
-        let (item, attempt) =
-            match self
-                .store
-                .report_work_progress(work_id, attempt_id, lease_token, progress)
-            {
-                Ok(value) => value,
-                Err(error) => {
-                    return Err(self.fail_claim(&mut lease, None, session_id, &claimed, error))
-                }
-            };
+        self.arm_work_request(&lease, &claimed.display().to_string(), "work_attempt");
+        let progress_result =
+            self.store
+                .report_work_progress(work_id, attempt_id, lease_token, progress);
+        self.store.disarm_work_request();
+        let (item, attempt) = match progress_result {
+            Ok(value) => value,
+            Err(error) => {
+                return Err(self.fail_claim(&mut lease, None, session_id, &claimed, error))
+            }
+        };
         let response = json!({"work": item, "attempt": WorkAttemptView::from(&attempt)});
         lease
             .complete(Some(work_id.to_string()), response.clone())
@@ -5485,7 +5632,10 @@ impl OrchestrationService {
         if let Err(error) = self.load_work_scoped(session_id, &claimed, work_id, false) {
             return Err(self.fail_claim(&mut lease, None, session_id, &claimed, error));
         }
-        let (item, attempt) = match operation(&self.store) {
+        self.arm_work_request(&lease, &claimed.display().to_string(), "work_attempt");
+        let attempt_result = operation(&self.store);
+        self.store.disarm_work_request();
+        let (item, attempt) = match attempt_result {
             Ok(value) => value,
             Err(error) => {
                 return Err(self.fail_claim(&mut lease, None, session_id, &claimed, error))
@@ -5535,16 +5685,17 @@ impl OrchestrationService {
         if let Err(error) = self.load_work_scoped(session_id, &claimed, work_id, false) {
             return Err(self.fail_claim(&mut lease, None, session_id, &claimed, error));
         }
-        let (item, attempts) =
-            match self
-                .store
-                .cancel_work_checked(work_id, &reason, expected_revision)
-            {
-                Ok(value) => value,
-                Err(error) => {
-                    return Err(self.fail_claim(&mut lease, None, session_id, &claimed, error))
-                }
-            };
+        self.arm_work_request(&lease, &claimed.display().to_string(), "work_attempts");
+        let cancel_result = self
+            .store
+            .cancel_work_checked(work_id, &reason, expected_revision);
+        self.store.disarm_work_request();
+        let (item, attempts) = match cancel_result {
+            Ok(value) => value,
+            Err(error) => {
+                return Err(self.fail_claim(&mut lease, None, session_id, &claimed, error))
+            }
+        };
         for intent in self
             .store
             .list_managed_intents()?
@@ -5812,7 +5963,8 @@ impl OrchestrationService {
             }
         };
         let manager_id = actors.manager.as_ref().map(|agent| agent.agent_id.clone());
-        let (item, decision) = match self.store.offer_work(
+        self.arm_work_request(&lease, &claimed.display().to_string(), "decision");
+        let offer_result = self.store.offer_work(
             work_id,
             &actors.worker.agent_id,
             &auth.token_id,
@@ -5820,7 +5972,9 @@ impl OrchestrationService {
             &reason,
             expected_revision,
             Utc::now(),
-        ) {
+        );
+        self.store.disarm_work_request();
+        let (item, decision) = match offer_result {
             Ok(value) => value,
             Err(error) => {
                 return Err(self.fail_claim(&mut lease, None, session_id, &claimed, error))
@@ -6830,7 +6984,10 @@ impl OrchestrationService {
         if let Err(error) = self.load_work_scoped(session_id, &claimed, work_id, false) {
             return Err(self.fail_claim(&mut lease, None, session_id, &claimed, error));
         }
-        let item = match operation(&self.store) {
+        self.arm_work_request(&lease, &claimed.display().to_string(), "work_scope");
+        let item_result = operation(&self.store);
+        self.store.disarm_work_request();
+        let item = match item_result {
             Ok(item) => item,
             Err(error) => {
                 if error
@@ -6912,14 +7069,17 @@ impl OrchestrationService {
         {
             return Err(self.fail_claim(&mut lease, None, session_id, &claimed, error));
         }
-        let (item, decision) = match operation(
+        self.arm_work_request(&lease, &claimed.display().to_string(), "decision_scope");
+        let identity_result = operation(
             &self.store,
             agent_id,
             &auth.token_id,
             &reason,
             expected_revision,
             Utc::now(),
-        ) {
+        );
+        self.store.disarm_work_request();
+        let (item, decision) = match identity_result {
             Ok(value) => value,
             Err(error) => {
                 return Err(self.fail_claim(&mut lease, None, session_id, &claimed, error))
@@ -7368,6 +7528,7 @@ impl OrchestrationService {
                 "managerSupervisorError": manager_supervisor_error,
                 "managerSupervisor": manager_supervisor,
                 "nativeExecutorError": self.native_executor.lock().last_error.clone().map(|error| self.bus.redact_text(&error, 500)),
+                "ledgerAdmissionClosed": self.store.ledger_admission_closed().map(|error| self.bus.redact_text(&error, 500)),
                 "nativeExecutor": self.native_executor.lock().clone(),
             },
         }))

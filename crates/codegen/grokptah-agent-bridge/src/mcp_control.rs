@@ -31,13 +31,18 @@ use tokio::sync::Semaphore;
 use uuid::Uuid;
 
 use crate::host::AgentHostHandle;
+use crate::mcp_control_client::MAX_MCP_RESPONSE_BODY_BYTES;
 use crate::orchestration::{
-    AuthContext, ChangeRecord, ManagerStepSpec, MessageKind, MissedRunPolicy, OrchError,
-    OrchErrorCode, OrchestrationConfig, OrchestrationService, PublicEventKindV1, PublicEventV1,
-    RoutineConcurrencyPolicy, RoutineLifecycle, RoutineRetryPolicy, RoutineTrigger,
-    RunExecutionMode, WorkArtifactRef, WorkDependency, WorkPolicy, WorkResult, WorkTemplate,
-    WorkerHostKind, WorkspaceAllowlist, CONTROL_TOOLS, FORBIDDEN_TOOLS,
+    tools_call_response_len, AuthContext, ChangeRecord, ManagerStepSpec, MessageKind,
+    MissedRunPolicy, OrchError, OrchErrorCode, OrchestrationConfig, OrchestrationService,
+    PublicEventKindV1, PublicEventV1, RoutineConcurrencyPolicy, RoutineLifecycle,
+    RoutineRetryPolicy, RoutineTrigger, RunExecutionMode, WorkArtifactRef, WorkDependency,
+    WorkDetailSection, WorkPolicy, WorkResult, WorkState, WorkTemplate, WorkerHostKind,
+    WorkspaceAllowlist, CONTROL_TOOLS, FORBIDDEN_TOOLS, MAX_WORK_CURSOR_CHARS,
+    MAX_WORK_DETAIL_LIMIT, MAX_WORK_PAGE_LIMIT, WORK_PAGE_TRANSPORT_CEILING_BYTES,
 };
+
+const _: () = assert!(MAX_MCP_RESPONSE_BODY_BYTES == WORK_PAGE_TRANSPORT_CEILING_BYTES);
 use crate::{EventReceiver, JournalPage, SessionUpdate};
 
 /// Max concurrent in-flight MCP requests (post-auth).
@@ -747,6 +752,7 @@ const READINESS_BLOCKING_HEALTH_KEYS: &[&str] = &[
     "managerSupervisorError",
     "nativeExecutorError",
     "serviceError",
+    "ledgerAdmissionClosed",
 ];
 
 /// The readiness verdict for a capacity payload: ready only when no
@@ -1570,6 +1576,32 @@ struct WorkArgs {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct WorkPageArgs {
+    session_id: Uuid,
+    workspace: PathBuf,
+    #[serde(default)]
+    limit: Option<usize>,
+    #[serde(default)]
+    cursor: Option<String>,
+    #[serde(default)]
+    states: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkDetailArgs {
+    session_id: Uuid,
+    workspace: PathBuf,
+    work_id: String,
+    section: String,
+    #[serde(default)]
+    offset: usize,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ClaimWorkArgs {
     request_id: String,
     session_id: Uuid,
@@ -2241,6 +2273,56 @@ fn handle_initialize(
     ))
 }
 
+fn reject_oversized_legacy(body: Value, paged_tool: &str) -> Result<Value, OrchError> {
+    if tools_call_response_len(&body) <= MAX_MCP_RESPONSE_BODY_BYTES {
+        return Ok(body);
+    }
+    Err(OrchError::with_data(
+        OrchErrorCode::CapacityExhausted,
+        format!("this response does not fit the MCP body ceiling; call {paged_tool}"),
+        json!({ "pagedTool": paged_tool }),
+    ))
+}
+
+fn bound_page_cursor(cursor: Option<&str>) -> Result<(), OrchError> {
+    if cursor.is_some_and(|cursor| cursor.len() > MAX_WORK_CURSOR_CHARS || cursor.contains('\0')) {
+        return Err(OrchError::new(
+            OrchErrorCode::InvalidRequest,
+            "work page continuation is not valid",
+        ));
+    }
+    Ok(())
+}
+
+fn parse_work_state_filter(states: &[String]) -> Result<Vec<WorkState>, OrchError> {
+    states
+        .iter()
+        .map(|state| {
+            if state.len() > 64 {
+                return Err(OrchError::new(
+                    OrchErrorCode::InvalidRequest,
+                    "work state filter is not valid",
+                ));
+            }
+            serde_json::from_value(Value::String(state.clone())).map_err(|_| {
+                OrchError::new(
+                    OrchErrorCode::InvalidRequest,
+                    "work state filter is not valid",
+                )
+            })
+        })
+        .collect()
+}
+
+fn parse_work_detail_section(section: &str) -> Result<WorkDetailSection, OrchError> {
+    serde_json::from_value(Value::String(section.to_string())).map_err(|_| {
+        OrchError::new(
+            OrchErrorCode::InvalidRequest,
+            "work detail section is not valid",
+        )
+    })
+}
+
 fn status_for(e: &OrchError) -> StatusCode {
     match e.code {
         OrchErrorCode::Unauthenticated => StatusCode::UNAUTHORIZED,
@@ -2249,7 +2331,9 @@ fn status_for(e: &OrchError) -> StatusCode {
         OrchErrorCode::StaleVersion | OrchErrorCode::Conflict => StatusCode::CONFLICT,
         OrchErrorCode::Unsupported => StatusCode::METHOD_NOT_ALLOWED,
         OrchErrorCode::CursorExpired => StatusCode::GONE,
-        OrchErrorCode::SessionBusy | OrchErrorCode::CapacityExhausted => StatusCode::CONFLICT,
+        OrchErrorCode::SessionBusy
+        | OrchErrorCode::CapacityExhausted
+        | OrchErrorCode::RestartRequired => StatusCode::CONFLICT,
         OrchErrorCode::Timeout => StatusCode::GATEWAY_TIMEOUT,
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     }
@@ -2453,6 +2537,30 @@ fn tool_input_schema(name: &str) -> Value {
                 "workspace": workspace
             }
         }),
+        "ptah_list_work_page" => json!({
+            "type": "object",
+            "required": ["session_id", "workspace"],
+            "additionalProperties": false,
+            "properties": {
+                "session_id": session,
+                "workspace": workspace,
+                "limit": {"type": "integer", "minimum": 1, "maximum": MAX_WORK_PAGE_LIMIT},
+                "cursor": {"type": "string", "minLength": 1, "maxLength": MAX_WORK_CURSOR_CHARS},
+                "states": {"type": "array", "maxItems": 16, "items": {"type": "string", "minLength": 1, "maxLength": 64}}
+            }
+        }),
+        "ptah_get_work_graph_page" => json!({
+            "type": "object",
+            "required": ["session_id", "workspace"],
+            "additionalProperties": false,
+            "properties": {
+                "session_id": session,
+                "workspace": workspace,
+                "limit": {"type": "integer", "minimum": 1, "maximum": MAX_WORK_PAGE_LIMIT},
+                "cursor": {"type": "string", "minLength": 1, "maxLength": MAX_WORK_CURSOR_CHARS},
+                "states": {"type": "array", "maxItems": 16, "items": {"type": "string", "minLength": 1, "maxLength": 64}}
+            }
+        }),
         "ptah_get_work" => json!({
             "type": "object",
             "required": ["session_id", "workspace", "work_id"],
@@ -2461,6 +2569,19 @@ fn tool_input_schema(name: &str) -> Value {
                 "session_id": session,
                 "workspace": workspace,
                 "work_id": run_id
+            }
+        }),
+        "ptah_get_work_detail" => json!({
+            "type": "object",
+            "required": ["session_id", "workspace", "work_id", "section"],
+            "additionalProperties": false,
+            "properties": {
+                "session_id": session,
+                "workspace": workspace,
+                "work_id": run_id,
+                "section": {"type": "string", "enum": ["summary", "objective", "progress", "result", "attempts", "policy", "dependencies"]},
+                "offset": {"type": "integer", "minimum": 0},
+                "limit": {"type": "integer", "minimum": 1, "maximum": MAX_WORK_DETAIL_LIMIT}
             }
         }),
         "ptah_create_work" => json!({
@@ -3371,16 +3492,60 @@ async fn dispatch_tool(
         }
         "ptah_list_work" => {
             let args: WorkScopeArgs = parse_value(args)?;
-            orch.list_work_scoped(auth, args.session_id, &args.workspace)
+            let body = orch.list_work_scoped(auth, args.session_id, &args.workspace)?;
+            reject_oversized_legacy(body, "ptah_list_work_page")
+        }
+        "ptah_list_work_page" => {
+            let args: WorkPageArgs = parse_value(args)?;
+            let states = parse_work_state_filter(&args.states)?;
+            bound_page_cursor(args.cursor.as_deref())?;
+            orch.list_work_page_scoped(
+                auth,
+                args.session_id,
+                &args.workspace,
+                args.limit,
+                args.cursor,
+                &states,
+            )
         }
         "ptah_get_work_graph" => {
             let args: WorkScopeArgs = parse_value(args)?;
-            orch.get_work_graph_scoped(auth, args.session_id, &args.workspace)
+            let body = orch.get_work_graph_scoped(auth, args.session_id, &args.workspace)?;
+            reject_oversized_legacy(body, "ptah_get_work_graph_page")
+        }
+        "ptah_get_work_graph_page" => {
+            let args: WorkPageArgs = parse_value(args)?;
+            let states = parse_work_state_filter(&args.states)?;
+            bound_page_cursor(args.cursor.as_deref())?;
+            orch.get_work_graph_page_scoped(
+                auth,
+                args.session_id,
+                &args.workspace,
+                args.limit,
+                args.cursor,
+                &states,
+            )
         }
         "ptah_get_work" => {
             let args: WorkArgs = parse_value(args)?;
             require_nonempty(&args.work_id, "work_id")?;
-            orch.get_work_scoped(auth, args.session_id, &args.workspace, &args.work_id)
+            let body =
+                orch.get_work_scoped(auth, args.session_id, &args.workspace, &args.work_id)?;
+            reject_oversized_legacy(body, "ptah_get_work_detail")
+        }
+        "ptah_get_work_detail" => {
+            let args: WorkDetailArgs = parse_value(args)?;
+            require_nonempty(&args.work_id, "work_id")?;
+            let section = parse_work_detail_section(&args.section)?;
+            orch.get_work_detail_scoped(
+                auth,
+                args.session_id,
+                &args.workspace,
+                &args.work_id,
+                section,
+                args.offset,
+                args.limit,
+            )
         }
         "ptah_create_work" => {
             let args: CreateWorkArgs = parse_value(args)?;

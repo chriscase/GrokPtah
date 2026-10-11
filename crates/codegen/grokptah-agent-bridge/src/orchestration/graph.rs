@@ -601,9 +601,21 @@ pub fn project_scoped_graph(
         .cloned()
         .collect();
     order_work(&mut lane);
+    // One visibility pass. Resolving each node by scanning the lane again
+    // canonicalizes the workspace once per pair, which a legal 4096-item lane
+    // cannot afford when the request path and the stored path differ by a
+    // symlink. Items outside the lane were already dropped.
+    let visible: BTreeMap<&str, WorkState> = lane
+        .iter()
+        .map(|item| (item.work_id.as_str(), item.state))
+        .collect();
     lane.iter()
         .map(|item| {
-            let states = resolve_dependency_states(&lane, item, scope);
+            let mut states = DependencyStates::new();
+            for dependency in &item.dependencies {
+                let resolved = visible.get(dependency.work_id.as_str()).copied();
+                states.insert(dependency.work_id.clone(), resolved);
+            }
             let mut dependencies: Vec<String> = Vec::new();
             let mut unresolved = 0usize;
             for dependency in &item.dependencies {

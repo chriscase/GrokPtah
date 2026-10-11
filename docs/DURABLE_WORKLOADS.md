@@ -54,25 +54,27 @@ One lane may hold at most 4096 work items (`MAX_GRAPH_SCOPE_ITEMS`). New
 items — including dependency-free creates — are refused once the lane is at
 the ceiling; an update of an existing item at the ceiling still lands.
 Oversized lanes refuse bounded store reads. Public create maps the ceiling to
-`capacity_exhausted` rather than `internal`. Public list/graph pagination over
-the full legal range remains open in issue #520; callers must not interpret a
-transport-size refusal as an empty or complete lane.
+`capacity_exhausted` rather than `internal`.
 
-Assignment mutations that emit a `WorkDecision` (block, unblock, offer,
-accept, decline, reassign, reprioritize, request-review, and managed execution
-authorization) now use a durable `work-intents/` commit marker. The marker
-binds the decision ID, work ID, expected revision, prior and resulting item
-digests, and decision digest. Reopening the ledger replays a pair after either
-the decision or item write was interrupted, and refuses an unexpected prior
-revision or conflicting receipt rather than guessing. The marker is removed
-only after both validated records agree. Service request-id idempotency still
-guards the outer request, while this marker protects the paired store write.
+Public list and graph reads are versioned pages (`ptah_list_work_page`,
+`ptah_get_work_graph_page`) selected by the shared runtime. The legacy unpaged
+tools stay, and they refuse `capacity_exhausted` — naming the paged tool —
+when the JSON-RPC body would exceed the 2 MiB MCP ceiling. They do not
+truncate a lane or report a partial page as complete. A continuation is an
+opaque host MAC bound to the lane digest. A changed lane returns
+`restart_required`. An item that does not fit `ptah_get_work` is read through
+`ptah_get_work_detail`. See `docs/WORKLOAD_RELIABILITY_V1.md`.
 
-This closes the crash gap for the decision-producing assignment family only.
-The legacy `assign_work` convenience path and independent lifecycle mutations
-such as cancel/retry/approval remain separate durable transitions and are not
-claimed as covered by this marker; issue #521 stays open until every required
-mutation path has equivalent intent/recovery coverage.
+Assignment mutations that emit a `WorkDecision` use a durable `work-intents/`
+commit marker. Lifecycle mutations, including managed finalization and queued
+sealing, use `work-lifecycle-intents/`. Managed finalization persists that
+envelope before the journal. Recovery adopts the envelope. A journal with no
+envelope is quarantined, and the store reports `ledger reconciliation is
+required` instead of minting an outcome from later disk. A persistence failure
+after a durable intent closes admission in that process until reopen recovers
+the intent. Service request receipts armed at the mutation are completed from
+the sealed successor, so a replay is not left pending. Issue #521's broader
+epic is not claimed complete by this contract.
 
 ## Service reconciliation
 

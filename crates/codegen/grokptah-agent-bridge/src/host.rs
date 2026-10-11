@@ -51,8 +51,9 @@ use crate::orchestration::{
     ContinuationTestInput, MissedRunPolicy, OrchStore, PromotionState, RoutineConcurrencyPolicy,
     RoutineLifecycle, RoutineRecord, RoutineRetryPolicy, RoutineSnapshot, RoutineTrigger,
     RunAggregates, RunBounds, RunExecution, RunExecutionMode, RunPurpose, RunRecord, RunState,
-    RunStopCause, WorkAttemptView, WorkItem, WorkItemSnapshot, WorkPolicy, WorkTemplate,
-    DEFAULT_AGENT_TOOL_IDS, LOCAL_DESKTOP_ORIGIN_ID,
+    RunStopCause, WorkAttemptView, WorkItem, WorkItemSnapshot, WorkListPageV1, WorkPageFilter,
+    WorkPageKind, WorkPageQuery, WorkPageReader, WorkPolicy, WorkTemplate, DEFAULT_AGENT_TOOL_IDS,
+    LOCAL_DESKTOP_ORIGIN_ID, WORK_PAGE_TRANSPORT_CEILING_BYTES,
 };
 use crate::permission::{
     evaluate_tool_gate, PendingPermissionView, PermissionDecision, PermissionRequest, ToolGate,
@@ -1961,6 +1962,56 @@ impl AgentHostHandle {
             .collect::<Vec<_>>();
         items.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
         Ok(items)
+    }
+
+    /// One page of a local Build lane in the shared work-page order.
+    ///
+    /// The reader identity is the local desktop origin. It is not a service
+    /// bearer, so a service continuation cannot be replayed here.
+    pub fn list_work_page_for_session(
+        &self,
+        session_id: Uuid,
+        workspace: &std::path::Path,
+        limit: usize,
+        cursor: Option<String>,
+    ) -> Result<WorkListPageV1> {
+        let session = self.session_inspect(session_id)?;
+        if session.kind != SessionKind::Build {
+            bail!("only Build Lanes can own durable Work Items");
+        }
+        if session.cwd.trim().is_empty() {
+            bail!("Build Lane has no workspace");
+        }
+        if !crate::orchestration::workspaces_match(&session.cwd, &workspace.display().to_string()) {
+            bail!("workspace does not match the Build Lane");
+        }
+        let store = self.ensure_orchestration_store()?;
+        let canonical = crate::orchestration::canonical_workspace(workspace)
+            .map_err(|_| anyhow!("workspace is not available"))?;
+        let claimed = canonical.display().to_string();
+        let lane = store
+            .scoped_work_items(session_id, &claimed)
+            .map_err(|error| anyhow!(error.to_string()))?;
+        let reader = WorkPageReader {
+            owner_id: LOCAL_DESKTOP_ORIGIN_ID.to_string(),
+            token_id: LOCAL_DESKTOP_ORIGIN_ID.to_string(),
+            session_id,
+            workspace_digest: crate::orchestration::workspace_digest(&claimed),
+        };
+        crate::orchestration::select_work_list_page(
+            &lane,
+            &WorkPageQuery {
+                limit,
+                cursor,
+                filter: WorkPageFilter::default(),
+                kind: WorkPageKind::List,
+            },
+            &reader,
+            &store.page_mac_key(),
+            chrono::Utc::now(),
+            WORK_PAGE_TRANSPORT_CEILING_BYTES,
+        )
+        .map_err(|error| anyhow!(error.message))
     }
 
     /// Read one local Work Item together with its redacted attempt history.
