@@ -113,6 +113,15 @@ function attempt(heartbeat: string, runId: string): DurableWorkAttempt {
   };
 }
 
+function namedSnapshot(
+  workId: string,
+  objective: string,
+  state: RemoteWorkSnapshot["work"]["state"],
+): RemoteWorkSnapshot {
+  const base = snapshotFor(1, state);
+  return { ...base, work: { ...base.work, workId, objective, state } };
+}
+
 function snapshotFor(
   revision: number,
   state: RemoteWorkSnapshot["work"]["state"],
@@ -459,61 +468,125 @@ describe("production Work Board detail refresh", () => {
     expect(screen.getByRole("button", { name: /^beyond-page-one/, pressed: true })).toBeInTheDocument();
   });
 
-  it("drops a late detail after the selection, scope, disconnect, or view goes away", async () => {
-    const late = deferred<RemoteWorkSnapshot | null>();
-    let hold = false;
-    const listFor = (ids: string[]) =>
-      vi.fn(async () => ({
-        items: ids.map((id) => entry(id, 1, "running")),
-        complete: true,
-        continuation: null,
-      }));
-    const get = vi.fn(() => (hold ? late.promise : Promise.resolve(snapshotFor(1, "running"))));
+  it("holds a pre-change detail read across removal, an empty list, selection, disconnect, and unmount", async () => {
+    const staleObjective = "stale-work-a-objective";
+    const held: Array<ReturnType<typeof deferred<RemoteWorkSnapshot | null>>> = [];
+    let holdNext = false;
+    const lane = scope({
+      remote: true,
+      remoteConnected: true,
+      remoteLanePresent: true,
+      sessionId: "lane-remote",
+    });
+    let rows = [entry("work-a", 1, "running"), entry("work-b", 1, "running")];
+    const list = vi.fn(async () => ({
+      items: rows,
+      complete: true,
+      continuation: null,
+    }));
+    const get = vi.fn((_scope: WorkBoardScope, workId: string) => {
+      if (holdNext) {
+        holdNext = false;
+        const slot = deferred<RemoteWorkSnapshot | null>();
+        held.push(slot);
+        return slot.promise;
+      }
+      return Promise.resolve(namedSnapshot(workId, `live-${workId}`, "running"));
+    });
     const api: { current: ReturnType<typeof useWorkBoardPoll> | null } = { current: null };
     const { rerender, unmount } = render(
-      <WiredBoard api={api} client={{ list: listFor(["work-a", "work-b"]), get }} scope={scope()} />,
+      <WiredBoard api={api} client={{ list, get }} scope={lane} />,
     );
     await flush();
-    hold = true;
+    expect(screen.getByRole("heading", { name: "live-work-a" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Approve completion" })).toBeNull();
+
+    holdNext = true;
+    const pendingDetail = api.current?.refreshDetail("work-a");
+    await flush();
+    expect(held).toHaveLength(1);
+
     fireEvent.click(screen.getByRole("button", { name: /^work-b/ }));
     await flush();
-    late.resolve(snapshotFor(9, "succeeded"));
+    held[0].resolve(namedSnapshot("work-a", staleObjective, "awaiting_approval"));
+    await pendingDetail;
     await flush();
-    expect(screen.queryByRole("heading", { name: "objective-rev-9" })).toBeNull();
     expect(screen.getByRole("button", { name: /^work-b/, pressed: true })).toBeInTheDocument();
+    expect(screen.queryByRole("heading", { name: staleObjective })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Approve completion" })).toBeNull();
+    expect(screen.getByRole("heading", { name: "live-work-b" })).toBeInTheDocument();
 
-    rerender(
-      <WiredBoard
-        api={api}
-        client={{ list: listFor(["lane-b-item"]), get: async () => snapshotFor(1, "queued") }}
-        scope={scope({ sessionId: "lane-b" })}
-      />,
-    );
+    holdNext = true;
+    const pendingRemoval = api.current?.refreshDetail("work-b");
     await flush();
-    expect(screen.queryByRole("heading", { name: "objective-rev-9" })).toBeNull();
-    expect(screen.getByRole("button", { name: /^lane-b-item/ })).toBeInTheDocument();
-
-    rerender(
-      <WiredBoard
-        api={api}
-        client={{ list: listFor(["work-a"]), get: async () => snapshotFor(1, "running") }}
-        scope={scope({ remote: true, remoteConnected: false, remoteLanePresent: true, sessionId: "lane-remote" })}
-      />,
-    );
+    rows = [entry("work-b", 1, "running")];
+    const removal = api.current?.restart();
     await flush();
-    expect(screen.getByText(/disconnected/i)).toBeInTheDocument();
+    held.at(-1)?.resolve(namedSnapshot("work-b", staleObjective, "awaiting_approval"));
+    await pendingRemoval;
+    await removal;
+    await flush();
+    expect(screen.queryByRole("button", { name: /^work-a/ })).toBeNull();
+    expect(screen.queryByRole("heading", { name: staleObjective })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Approve completion" })).toBeNull();
+    expect(screen.getByRole("heading", { name: "live-work-b" })).toBeInTheDocument();
 
-    rerender(
-      <WiredBoard
-        api={api}
-        client={{ list: listFor(["work-a"]), get: async () => snapshotFor(1, "running") }}
-        scope={scope({ sessionId: null, workspace: null })}
-      />,
-    );
+    holdNext = true;
+    const pendingEmpty = api.current?.refreshDetail("work-b");
+    await flush();
+    rows = [];
+    const emptied = api.current?.restart();
+    await flush();
+    held.at(-1)?.resolve(namedSnapshot("work-b", staleObjective, "awaiting_approval"));
+    await pendingEmpty;
+    await emptied;
     await flush();
     expect(screen.getByText("No durable Work Items in this Lane")).toBeInTheDocument();
-    expect(screen.queryByRole("heading", { name: "objective-rev-9" })).toBeNull();
+    expect(screen.queryByRole("heading", { name: staleObjective })).toBeNull();
+    expect(screen.queryByRole("heading", { name: "live-work-b" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Approve completion" })).toBeNull();
+
+    rows = [entry("work-a", 1, "running")];
+    rerender(<WiredBoard api={api} client={{ list, get }} scope={lane} />);
+    await flush();
+    holdNext = true;
+    const pendingDisconnect = api.current?.refreshDetail("work-a");
+    await flush();
+    rerender(
+      <WiredBoard
+        api={api}
+        client={{ list, get }}
+        scope={scope({
+          remote: true,
+          remoteConnected: false,
+          remoteLanePresent: true,
+          sessionId: "lane-remote",
+        })}
+      />,
+    );
+    await flush();
+    held.at(-1)?.resolve(namedSnapshot("work-a", staleObjective, "awaiting_approval"));
+    await pendingDisconnect;
+    await flush();
+    expect(screen.getByText(/disconnected/i)).toBeInTheDocument();
+    expect(screen.queryByRole("heading", { name: staleObjective })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Approve completion" })).toBeNull();
+
+    rerender(<WiredBoard api={api} client={{ list, get }} scope={lane} />);
+    await flush();
+    expect(screen.queryByRole("heading", { name: staleObjective })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Approve completion" })).toBeNull();
+    expect(screen.getByRole("button", { name: /^work-a/ })).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: /work-a/ }).textContent).not.toBe(staleObjective);
+
+    holdNext = true;
+    const pendingUnmount = api.current?.refreshDetail("work-a");
+    await flush();
     unmount();
+    held.at(-1)?.resolve(namedSnapshot("work-a", staleObjective, "awaiting_approval"));
+    await pendingUnmount;
+    expect(screen.queryByRole("heading", { name: staleObjective })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Approve completion" })).toBeNull();
   });
 
   it("retries a failed detail read without dropping another loaded page", async () => {
