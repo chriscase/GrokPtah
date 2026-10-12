@@ -1022,8 +1022,7 @@ export default function App() {
         throw new Error("The remote service is disconnected");
       }
       await action(sessionId, lane.cwd, remote);
-      const next = await workBoard.restart();
-      if (next.selectedWorkId) await workBoard.refreshDetail(next.selectedWorkId);
+      await workBoard.restart();
     },
     [
       activeLane,
@@ -1031,7 +1030,6 @@ export default function App() {
       executionTarget,
       remoteServiceStatus.connected,
       selectedRemoteLane,
-      workBoard.refreshDetail,
       workBoard.restart,
     ],
   );
@@ -1110,8 +1108,7 @@ export default function App() {
       await action(sessionId, lane.cwd, remote);
       await refreshRoutines();
       if (selectedRoutineId) await refreshRoutineItem(selectedRoutineId);
-      const next = await workBoard.restart();
-      if (next.selectedWorkId) await workBoard.refreshDetail(next.selectedWorkId);
+      await workBoard.restart();
     },
     [
       activeLane,
@@ -1122,7 +1119,6 @@ export default function App() {
       remoteServiceStatus.connected,
       selectedRemoteLane,
       selectedRoutineId,
-      workBoard.refreshDetail,
       workBoard.restart,
     ],
   );
@@ -4396,6 +4392,11 @@ export default function App() {
             error={workError}
             traversalStatus={workTraversal}
             pagesHeld={workBoard.view.freshness === "held"}
+            detailStatus={workBoard.view.detailStatus}
+            detailError={workBoard.view.detailError}
+            onRetryDetail={() => {
+              if (selectedWorkId) void workBoard.refreshDetail(selectedWorkId);
+            }}
             onLoadMore={() => void workBoard.loadMore()}
             onRetryTraversal={() => void workBoard.restart()}
             mutationsEnabled={Boolean(

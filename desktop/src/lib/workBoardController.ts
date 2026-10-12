@@ -26,6 +26,9 @@ export interface WorkBoardPage {
   fence?: string | null;
 }
 
+/** Whether the selected snapshot is safe to drive detail actions. */
+export type WorkDetailStatus = "current" | "loading" | "error";
+
 export interface WorkBoardView {
   items: DurableWorkItem[];
   selectedWorkId: string | null;
@@ -35,6 +38,9 @@ export interface WorkBoardView {
   traversal: WorkTraversalStatus;
   continuation: string | null;
   freshness: "polling" | "held" | "refresh-required";
+  /** `loading` and `error` must not let an older snapshot drive actions. */
+  detailStatus: WorkDetailStatus;
+  detailError: string | null;
 }
 
 type ListKind = "observe" | "restart" | "loadMore";
@@ -71,14 +77,18 @@ function emptyView(): WorkBoardView {
     traversal: "complete",
     continuation: null,
     freshness: "polling",
+    detailStatus: "current",
+    detailError: null,
   };
 }
 
 /**
  * Operation-local Work Board traversal.
  * Background observation does not bump the list generation and does not replace
- * a held continuation. An explicit restart does. One list request may run, and
- * one follow-up may wait, so a slow response cannot discard every later poll.
+ * a held continuation. An explicit restart does, and it also reloads the
+ * selected detail. One list request may run, and one follow-up may wait.
+ * Detail reads keep the in-flight response plus one newer read; anything
+ * older is dropped when it lands.
  */
 export class WorkBoardController {
   private view: WorkBoardView = emptyView();
@@ -90,6 +100,9 @@ export class WorkBoardController {
   private inflight = false;
   private queued: QueuedList | null = null;
   private listener: ((view: WorkBoardView) => void) | null = null;
+  private detailActive = 0;
+  private detailQueued: { scope: WorkBoardScope; workId: string; gen: number } | null = null;
+  private detailWaiters = new Map<number, () => void>();
 
   constructor(
     private readonly client: {
@@ -110,6 +123,12 @@ export class WorkBoardController {
   invalidate() {
     this.listGen += 1;
     this.detailGen += 1;
+    this.dropDetailReads();
+    if (this.view.detailStatus === "loading") {
+      this.view.snapshot = null;
+      this.view.detailStatus = "current";
+      this.view.detailError = null;
+    }
     const wasBusy = this.view.busy;
     this.view.busy = false;
     const queued = this.queued;
@@ -121,22 +140,31 @@ export class WorkBoardController {
   select(workId: string | null) {
     if (workId === null) {
       this.detailGen += 1;
+      this.dropDetailReads();
       this.view.selectedWorkId = null;
       this.view.snapshot = null;
+      this.view.detailStatus = "current";
+      this.view.detailError = null;
       this.emit();
       return;
     }
     if (this.view.selectedWorkId === workId) return;
     this.detailGen += 1;
+    this.dropDetailReads();
     this.view.selectedWorkId = workId;
     this.view.snapshot = null;
+    this.view.detailStatus = "loading";
+    this.view.detailError = null;
     this.emit();
   }
 
   dismissDetail() {
     this.detailGen += 1;
-    if (this.view.snapshot == null) return;
+    this.dropDetailReads();
+    if (this.view.snapshot == null && this.view.detailStatus === "current") return;
     this.view.snapshot = null;
+    this.view.detailStatus = "current";
+    this.view.detailError = null;
     this.emit();
   }
 
@@ -159,6 +187,9 @@ export class WorkBoardController {
     if (this.refuseUnavailable(scope)) return this.snapshot();
     const key = workBoardScopeKey(scope);
     if (this.scopeKey && key !== this.scopeKey) this.beginScope(key);
+    // Fence detail before the list returns, including while this restart waits
+    // behind another list request. The same work id still needs a new read.
+    this.armDetailRefresh();
     await this.request("restart", scope);
     return this.snapshot();
   }
@@ -177,28 +208,25 @@ export class WorkBoardController {
     const key = workBoardScopeKey(scope);
     if (this.scopeKey && key !== this.scopeKey) {
       this.detailGen += 1;
+      this.dropDetailReads();
       this.listGen += 1;
       return;
     }
     const gen = ++this.detailGen;
-    try {
-      const snapshot = await this.client.get(scope, workId);
-      if (gen !== this.detailGen) return;
-      if (this.scopeKey && this.scopeKey !== key) return;
-      this.view.snapshot = snapshot;
-      if (this.view.error?.startsWith("Could not open durable Work Item:")) this.view.error = null;
-      this.emit();
-    } catch (error) {
-      if (gen !== this.detailGen) return;
-      this.view.snapshot = null;
-      this.view.error = `Could not open durable Work Item: ${String(error)}`;
-      this.emit();
-    }
+    this.view.detailStatus = "loading";
+    this.view.detailError = null;
+    this.emit();
+    const done = new Promise<void>((resolve) => {
+      this.detailWaiters.set(gen, resolve);
+    });
+    this.startDetail({ scope, workId, gen });
+    await done;
   }
 
   private beginScope(key: string) {
     this.listGen += 1;
     this.detailGen += 1;
+    this.dropDetailReads();
     this.scopeKey = key;
     this.paged = false;
     this.fence = null;
@@ -207,6 +235,8 @@ export class WorkBoardController {
     this.view.snapshot = null;
     this.view.continuation = null;
     this.view.error = null;
+    this.view.detailStatus = "current";
+    this.view.detailError = null;
     this.view.traversal = "loading";
     this.view.freshness = "polling";
     this.view.busy = true;
@@ -220,6 +250,7 @@ export class WorkBoardController {
     if (!missing && !remoteDown) return false;
     this.listGen += 1;
     this.detailGen += 1;
+    this.dropDetailReads();
     const queued = this.queued;
     this.queued = null;
     queued?.resolve();
@@ -314,6 +345,8 @@ export class WorkBoardController {
       const sessionId = scope.sessionId ?? "";
       const workspace = scope.workspace ?? "";
       const incoming = page.items.map((entry) => workListEntryToItem(entry, sessionId, workspace));
+      const priorId = this.view.selectedWorkId;
+      const priorRow = priorId ? this.view.items.find((item) => item.workId === priorId) ?? null : null;
       if (kind === "loadMore") {
         const accepted = acceptWorkPage(this.listGen, gen, this.view.items, incoming, true);
         if (!accepted) return;
@@ -323,10 +356,10 @@ export class WorkBoardController {
         const accepted = acceptWorkPage(this.listGen, gen, [], incoming, false);
         if (!accepted) return;
         this.view.items = accepted;
-        this.view.selectedWorkId =
-          this.view.selectedWorkId && accepted.some((item) => item.workId === this.view.selectedWorkId)
-            ? this.view.selectedWorkId
-            : accepted[0]?.workId ?? null;
+        const kept =
+          priorId != null && accepted.some((item) => item.workId === priorId) ? priorId : null;
+        this.view.selectedWorkId = kept ?? accepted[0]?.workId ?? null;
+        if (this.view.selectedWorkId !== priorId) this.view.snapshot = null;
         this.paged = !page.complete && Boolean(page.continuation);
         this.fence = page.fence ?? null;
       }
@@ -336,6 +369,17 @@ export class WorkBoardController {
       this.view.freshness = this.paged ? "held" : "polling";
       this.view.busy = false;
       this.emit();
+      const selectedId = this.view.selectedWorkId;
+      const nextRow = selectedId ? this.view.items.find((item) => item.workId === selectedId) ?? null : null;
+      const rowChanged = Boolean(priorRow && nextRow && workRowChanged(priorRow, nextRow));
+      if (!selectedId) {
+        this.view.snapshot = null;
+        this.view.detailStatus = "current";
+        this.view.detailError = null;
+        this.emit();
+      } else if (kind === "restart" || (kind === "observe" && rowChanged)) {
+        await this.refreshDetail(scope, selectedId);
+      }
     } catch (error) {
       if (this.listGen !== gen || this.scopeKey !== key) return;
       const status = workTraversalFromError(error);
@@ -371,7 +415,88 @@ export class WorkBoardController {
     this.emit();
   }
 
+  /** Invalidate detail as soon as Refresh is requested, before its list returns. */
+  private armDetailRefresh() {
+    this.detailGen += 1;
+    this.dropDetailReads();
+    this.view.detailStatus = "loading";
+    this.view.detailError = null;
+    this.emit();
+  }
+
+  private dropDetailReads() {
+    const queued = this.detailQueued;
+    this.detailQueued = null;
+    if (queued) this.releaseDetail(queued.gen);
+    for (const gen of [...this.detailWaiters.keys()]) this.releaseDetail(gen);
+  }
+
+  private releaseDetail(gen: number) {
+    const done = this.detailWaiters.get(gen);
+    if (!done) return;
+    this.detailWaiters.delete(gen);
+    done();
+  }
+
+  /**
+   * Keep the read already in flight and at most one newer read beside it.
+   * Further refresh requests replace that newer slot instead of piling up.
+   */
+  private startDetail(job: { scope: WorkBoardScope; workId: string; gen: number }) {
+    if (this.detailActive >= 2) {
+      if (this.detailQueued) this.releaseDetail(this.detailQueued.gen);
+      this.detailQueued = job;
+      return;
+    }
+    this.launchDetail(job);
+  }
+
+  private launchDetail(job: { scope: WorkBoardScope; workId: string; gen: number }) {
+    this.detailActive += 1;
+    void (async () => {
+      try {
+        if (job.gen === this.detailGen && this.view.selectedWorkId === job.workId) {
+          await this.readDetailOnce(job.scope, job.workId, job.gen);
+        }
+      } finally {
+        this.releaseDetail(job.gen);
+        this.detailActive = Math.max(0, this.detailActive - 1);
+        const next = this.detailQueued;
+        this.detailQueued = null;
+        if (next) this.startDetail(next);
+      }
+    })();
+  }
+
+  private async readDetailOnce(scope: WorkBoardScope, workId: string, gen: number) {
+    try {
+      const snapshot = await this.client.get(scope, workId);
+      if (gen !== this.detailGen || this.view.selectedWorkId !== workId) return;
+      if (this.scopeKey && this.scopeKey !== workBoardScopeKey(scope)) return;
+      this.view.snapshot = snapshot;
+      this.view.detailStatus = "current";
+      this.view.detailError = null;
+      if (this.view.error?.startsWith("Could not open durable Work Item:")) this.view.error = null;
+      this.emit();
+    } catch (error) {
+      if (gen !== this.detailGen || this.view.selectedWorkId !== workId) return;
+      this.view.snapshot = null;
+      this.view.detailStatus = "error";
+      this.view.detailError = `Could not open durable Work Item: ${String(error)}`;
+      this.emit();
+    }
+  }
+
   private emit() {
     this.listener?.(this.snapshot());
   }
+}
+
+function workRowChanged(previous: DurableWorkItem, next: DurableWorkItem): boolean {
+  return (
+    previous.revision !== next.revision ||
+    previous.state !== next.state ||
+    previous.updatedAt !== next.updatedAt ||
+    previous.attemptCount !== next.attemptCount
+  );
 }

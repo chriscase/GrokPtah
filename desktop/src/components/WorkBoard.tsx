@@ -24,6 +24,10 @@ export type WorkBoardProps = {
   traversalStatus?: WorkTraversalStatus;
   /** Background polling is holding an established continuation instead of replacing it. */
   pagesHeld?: boolean;
+  /** `current` is the only status that may drive detail actions from `snapshot`. */
+  detailStatus?: "current" | "loading" | "error";
+  detailError?: string | null;
+  onRetryDetail?: () => void;
   onLoadMore?: () => void;
   onRetryTraversal?: () => void;
   onRefresh: () => void;
@@ -104,6 +108,9 @@ export function WorkBoard({
   sourceLabel = "Durable workload",
   traversalStatus = "complete",
   pagesHeld = false,
+  detailStatus = "current",
+  detailError = null,
+  onRetryDetail,
   onLoadMore,
   onRetryTraversal,
   onRefresh,
@@ -145,8 +152,12 @@ export function WorkBoard({
     [filter, items],
   );
   const listed = items.find((item) => item.workId === selectedWorkId) ?? null;
-  const selected =
-    listed && snapshot?.work.workId === listed.workId ? snapshot.work : listed;
+  const detailCurrent =
+    detailStatus === "current" &&
+    listed != null &&
+    snapshot?.work.workId === listed.workId;
+  const selected = detailCurrent && snapshot ? snapshot.work : listed;
+  const detailActions = Boolean(detailCurrent && mutationsEnabled);
   const activeCount = items.filter((item) => isActive(item.state)).length;
   const attentionCount = items.filter((item) => needsAttention(item.state)).length;
   const completedCount = items.filter((item) => isCompleted(item.state)).length;
@@ -342,6 +353,8 @@ export function WorkBoard({
         {pagesHeld && traversalStatus !== "expired" && traversalStatus !== "loading"
           ? " Background refresh is holding loaded pages."
           : ""}
+        {detailStatus === "loading" ? " Work detail is refreshing. Actions wait for the current detail." : ""}
+        {detailStatus === "error" ? " Work detail could not be refreshed." : ""}
       </p>
       {pagesHeld && traversalStatus !== "expired" && (
         <p className="work-board-source">
@@ -412,6 +425,22 @@ export function WorkBoard({
           description="The lane changed, or the continuation expired. Refresh replaces this page. It does not append it."
           actionLabel="Refresh"
           onAction={onRetryTraversal ?? onRefresh}
+        />
+      )}
+
+      {detailStatus === "loading" && (
+        <p className="work-board-source">
+          Refreshing this Work Item. Actions wait until the current detail arrives.
+        </p>
+      )}
+      {detailStatus === "error" && (
+        <StateCard
+          variant="error"
+          title="Work detail could not be refreshed"
+          description="The loaded list is unchanged. Retry reads this Work Item again. Older detail is not treated as current."
+          actionLabel="Retry"
+          onAction={onRetryDetail ?? onRefresh}
+          technicalDetail={detailError}
         />
       )}
 
@@ -525,7 +554,7 @@ export function WorkBoard({
                       <ul>{selected.result.evidence.map((evidence) => <li key={evidence}>{evidence}</li>)}</ul>
                     </details>
                   ) : null}
-                  {mutationsEnabled && !actionBusy && onAssign && !isCompleted(selected.state) && (
+                  {detailActions && !actionBusy && onAssign && !isCompleted(selected.state) && (
                     <form
                       className="work-action-form"
                       onSubmit={(event) => {
@@ -545,7 +574,7 @@ export function WorkBoard({
                       <button type="submit">{selected.assignedAgentId ? "Update assignment" : "Assign"}</button>
                     </form>
                   )}
-                  {mutationsEnabled && selected.state === "awaiting_approval" && onApprove && (
+                  {detailActions && selected.state === "awaiting_approval" && onApprove && (
                     <form
                       className="work-action-form"
                       onSubmit={(event) => {
@@ -565,7 +594,7 @@ export function WorkBoard({
                       <button type="submit">Approve completion</button>
                     </form>
                   )}
-                  {mutationsEnabled && selected.state === "failed" && selected.createdBy && selected.attemptCount < selected.policy.retry.maxAttempts && onRetry && (
+                  {detailActions && selected.state === "failed" && selected.createdBy && selected.attemptCount < selected.policy.retry.maxAttempts && onRetry && (
                     <button
                       type="button"
                       onClick={() => {
@@ -577,7 +606,7 @@ export function WorkBoard({
                       Retry failed Work
                     </button>
                   )}
-                  {mutationsEnabled && !isCompleted(selected.state) && onCancel && (
+                  {detailActions && !isCompleted(selected.state) && onCancel && (
                     <button
                       type="button"
                       onClick={() => {
@@ -592,7 +621,7 @@ export function WorkBoard({
                 </div>
                 <div className="work-attempts">
                   <strong>Attempt history</strong>
-                  {snapshot?.attempts.length ? (
+                  {detailCurrent && snapshot?.attempts.length ? (
                     <ol>
                       {snapshot.attempts.map((attempt) => (
                         <li key={attempt.attemptId}>
