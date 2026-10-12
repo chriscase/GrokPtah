@@ -22,6 +22,8 @@ export type WorkBoardProps = {
   error?: string | null;
   sourceLabel?: string;
   traversalStatus?: WorkTraversalStatus;
+  /** Background polling is holding an established continuation instead of replacing it. */
+  pagesHeld?: boolean;
   onLoadMore?: () => void;
   onRetryTraversal?: () => void;
   onRefresh: () => void;
@@ -101,6 +103,7 @@ export function WorkBoard({
   error,
   sourceLabel = "Durable workload",
   traversalStatus = "complete",
+  pagesHeld = false,
   onLoadMore,
   onRetryTraversal,
   onRefresh,
@@ -336,7 +339,15 @@ export function WorkBoard({
         {traversalStatus === "expired" &&
           "The work list changed or its continuation expired. Refresh to start again."}
         {traversalStatus === "error" && "The work list failed."}
+        {pagesHeld && traversalStatus !== "expired" && traversalStatus !== "loading"
+          ? " Background refresh is holding loaded pages."
+          : ""}
       </p>
+      {pagesHeld && traversalStatus !== "expired" && (
+        <p className="work-board-source">
+          Background refresh is holding these loaded pages. Refresh replaces the list.
+        </p>
+      )}
       {traversalStatus !== "complete" && (
         <p className="work-board-source">
           Counts and filters cover loaded items only.
