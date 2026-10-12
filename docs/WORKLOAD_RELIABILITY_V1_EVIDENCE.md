@@ -1,123 +1,99 @@
 # Workload reliability v1 evidence
 
-This is the requirement-to-proof record, the local evidence bundle, and the reviewer map for the implementation on `grok/workload-reliability-v1`. It is not an independent review. It does not close #520, #521, #305, #301, or #492.
+This is the requirement-to-proof record for the repair of the five adversarial findings on draft PR #584. It is not an independent review. It does not close #520, #521, #305, #301, or #492.
 
-The baseline matrix and the red 4096-item observation stay in `docs/WORKLOAD_RELIABILITY_V1.md`.
+The baseline matrix stays in `docs/WORKLOAD_RELIABILITY_V1.md`. The evidence text published at `0cb77413066fbe94ef7b69a6fc886158b634e0fd` remains in git history. This file replaces it with the repair record.
 
-## Proven on this working tree before the evidence commit
+## Identities
 
-Base: `c2b1c0b0ce4f968238d722d2ecccd2456a30f212`, tree `2c3f278fafe2e440e40d89dfcd66e13bc3e83cc3`. That SHA still matched `origin/main` when these commands ran.
+| Role | SHA | Tree |
+| --- | --- | --- |
+| PR base (`main` at review) | `c2b1c0b0ce4f968238d722d2ecccd2456a30f212` | `2c3f278fafe2e440e40d89dfcd66e13bc3e83cc3` |
+| Reviewed published tip | `0cb77413066fbe94ef7b69a6fc886158b634e0fd` | `907e8c376216f38b32be2ce325afc69f6b5a551c` |
+| Executable parent of that tip | `1e3d5f76a569b0213a90a2705777c26aa74a25e9` | `82dc8e8894731b29968cc655ae2ad95143de0abd` |
+| Repair executable | `8c0e869112d61a00a60e230e8e09ce82df1552d4` | `8fc8381e7376aac0099964967314fea9a9235659` |
 
-The crash-recovery executable before this follow-up was `4903862f0`, published as `ebc3628ba7316a2b1a7e4bd1fbe020a965132e6c`. Hosted Desktop run `38172509497` covers that head only. This follow-up changes `host.rs`, `work_page.rs`, and `remote_service.rs`, so that run does not cover the continuation-code or remote-detail fixes.
+Only `docs/WORKLOAD_RELIABILITY_V1_EVIDENCE.md` differs between `1e3d5f76a` and `0cb77413`. The repair commits on top of `0cb77413` are:
 
-Local proof on this follow-up, before publication, used an isolated `GROKPTAH_HOME` and `CARGO_INCREMENTAL=0`. Bridge clippy and the full bridge suite also set `CARGO_PROFILE_DEV_DEBUG=0` and `CARGO_PROFILE_TEST_DEBUG=0` so the test binaries fit on this volume. That profile is not the hosted default debug profile. The code under test is this tree.
+- `9f9da8f3c` Bind each work receipt to the operation that commits it.
+- `65970f82e` Persist reconciliation refusal before quarantining a journal.
+- `493024ca1` Hold loaded Work Board pages across the background poll.
+- `8c0e86911` Page nested attempt records under the existing transport ceiling.
+
+The commit that adds this repair record changes only this file. Rust, TypeScript, and the Tauri sources are identical to `8c0e86911`. Hosted `desktop.yml` has to be read on the published tip. The PR description records that run. Writing the run URL back into this file would create another SHA.
+
+Review inputs, sha256, were not modified:
+
+- `bc1c94309ebbcdab94b2ea3b074e614a3d29c8af6f5bd23430144e39ea11d6f6` adversarial review
+- `ec364210c60d9b072d65cedc2fda0a155e26b71f87fd9968c372a97085b9e7ef` review evidence
+- `7764306a812bbd183179569e7653013a61547f11e384dc5539b6bf02a60afbe9` original `adversarial_review_584.rs`
+- `cfe7b18660badc2203fc87f24fcda421efbf6958248535b2ac08054828d4195d` original `review-workboard.cjs`
+- `bd04ea692e6ab8306197c6c063a33890377e10ee2d53b3a909896fb6aad6c01f` original goal
+
+The reviewed head was reproduced before editing. The unchanged Rust battery was 4 failed and 2 passed (the 4096/16384 graph proof and the child helper), exit 101. The Work Board harness lost loaded pages on the 2500 ms refresh, exit 1. Existing `workload_reliability_pages` was 5/5 and `native_executor_store` `process_crash` was 5/5. Those two passing suites are not evidence that the five defects were absent.
+
+## Finding closure
+
+| Finding | Production repair | Old failing proof | Repaired proof | Regression | Residual |
+| --- | --- | --- | --- | --- | --- |
+| F1 P1 shared armed request | `OrchStore::bind_work_request` installs a thread-local binding. `adopt_operation_request` takes it before the store lock. Drop clears a binding the transaction did not take. Background writers pass no binding. | `concurrent_bindings_must_not_publish_foreign_work_in_the_other_receipt`: arm A, arm B, A cancels. A's receipt stayed pending and B completed with A's work and `PRIVATE_OBJECTIVE_A`. | Same schedule on `bind_work_request`. `same_lane_service_requests_keep_their_own_receipts`, `different_lane_service_requests_keep_their_own_receipts`, and `bound_service_mutation_does_not_capture_an_unbound_lifecycle_writer` use barriers. | `tests/adversarial_review_584.rs` | The host maps every credential to one agent owner. Different owners are proven on the store. The service race uses two sessions, two workspaces, and two token ids. |
+| F2 P1 quarantine before refusal | `quarantine_unbound_finalization_journal_unlocked` persists `ledger-reconciliation.json` and fsyncs it before the rename, then fsyncs both directories. Open also closes admission when any regular file remains in `managed-finalization-quarantine/`. | `failed_quarantine_marker_must_not_reopen_admission`: marker-write failure left the journal moved and the next open admitted. | Marker, destination, and directory-fsync faults, plus child exit 86 at `quarantine_before_marker`, `quarantine_after_marker`, and `quarantine_after_move`. Two further reopens keep the original bytes and the refusal. Claim, seal, close, and finalize stay denied. Authenticated `/ready` is 503. | Same test file. No marker-clear API was added. | A settled journal is still removed only when the managed intent is finalized or abandoned and the work state matches. An unresolved quarantine file is not treated as settled. |
+| F3 P1 poll replaces loaded pages | `useWorkBoardPoll` calls `WorkBoardController.observe` every 2500 ms. `restart` is explicit Refresh, Retry, and post-mutation. An established continuation is held. Scope changes and unmount invalidate list and detail. | `review-workboard.cjs`: loaded continuation pages disappeared on the automatic refresh. | Adapted harness calls `WorkBoardController.observe`. Before and after the tick the loaded ids are `first`, `second`, calls are `FIRST` and `cursor-1`, and the selection stays `first`. | `useWorkBoardPoll.test.tsx` (13) and `WorkBoard.test.tsx` (10), included in desktop vitest. | Background observation does not poll every page. Explicit Refresh replaces the traversal. |
+| F4 P1 claim receipt lost after the item write | `claim_work`, `renew_work_lease`, and `link_work_run` bind the original receipt. A committed claim replays through `lease_token_for_secret` and `token_matches`. The raw token is not stored. Renew and link use the `lease_view` shape. | `production_claim_recovery_must_complete_the_original_receipt`: child exit after the item write recovered Leased work and marked the original claim failed. | The production service caller, crash stages `lifecycle_after_intent`, `lifecycle_after_attempts`, `lifecycle_after_item`, `lifecycle_after_receipt`, and `lifecycle_after_commit`, then a fresh authenticated service. Renew and link are included. Two further reopens keep the original response. | Same test file. Verified-change settlement still completes a receipt only for `discard-candidate`, not for an intermediate lifecycle snapshot. | `create_work` is one `save_work_item` plus the outer receipt. No create-work intent was added. Credential rotation, wrong scope, expiry, stale revision, and payload conflict still refuse. |
+| F5 P2 indivisible attempt view | `attempts` returns summaries. `attempt_detail`, `attempt_evidence`, and `attempt_artifacts` page the rest. The content fence is the SHA-256 of the public attempt view. The list fence covers attempt id plus that digest, in list order. | `maximal_valid_attempt_result_must_be_readable_through_detail`: one legal attempt envelope was 4273937 bytes and `limit=1` still exceeded 2097152. | The same create/claim/fail fixture. The wrapped full view is still 4273937. The nested walk maximum is 803817. Authenticated MCP wire page is 264027 and the maximum estimated envelope is 803767. `RemoteServiceClient::get_work` rebuilds every evidence string and artifact. | `workload_reliability_pages::maximal_attempt_detail_is_readable_over_authenticated_mcp` and `remote_client_reads_oversized_work_through_detail`. | Schema version stays 1. Ceilings stay 4096 items, 16384 edges, and 2097152 bytes. Heartbeat and run link move the attempt fence without a work-revision bump. |
+
+## Commands and counts
+
+Local machine, macOS arm64, rustc 1.92.0 (`ded5c06cf 2025-12-08`), cargo 1.92.0, node v25.2.1, npm 11.6.2. `CARGO_INCREMENTAL=0`. `RUSTC_WRAPPER` was unset. Local debuginfo stayed at the Cargo dev default. This is not the hosted sccache profile. Homes were temporary directories. The operator authority file was not modified.
+
+Repair executable `8c0e86911`:
 
 - Bridge `cargo fmt --check`: exit 0.
-- Bridge `cargo clippy --locked --offline --all-targets -- -D warnings`: exit 0.
-- Bridge `cargo test --locked --offline -- --test-threads=1`: exit 0. 1306 passed, 0 failed, 15 ignored, 43 binaries. Command wall time 823s. Lib tests were 759 passed and 11 ignored. `workload_reliability_pages` passed 5 tests in 91.64s, including the 4096 lane and the maximal item detail. `verified_change_workflow` passed 102 in 299.59s. `native_executor_store` passed 46.
-- Desktop lib `cargo test --locked --offline --lib -- --test-threads=1`: exit 0, 52 passed, 0 failed, same debuginfo-off profile. This is the library target, not `cargo test` of the Tauri binary.
-- Desktop typecheck, 436 frontend tests, and the production build: exit 0. This follow-up does not change TypeScript.
-- `git diff --check` on this uncommitted tree: clean.
+- Bridge `cargo clippy --locked --all-targets -- -D warnings`: exit 0.
+- Bridge `cargo test --locked --offline -- --test-threads=1` with `GROKPTAH_HOME` set to a fresh directory: exit 0. 1323 passed, 0 failed, 15 ignored, 44 result blocks. The 15 ignored tests are the pre-existing installed-CLI, live-provider, doc, and lock-helper tests. No new ignore was added.
+- Explicit `cargo test --locked --offline --test adversarial_review_584 -- --test-threads=1 --nocapture` on that same tree: exit 0, 16 passed, 0 failed, 84.85s. Graph proof: 4096 nodes, 16384 edges, maximum estimated envelope 200256 bytes. One valid attempt wrapped body: 4273937 bytes, ceiling 2097152. Nested attempt page maximum: 803817 bytes.
+- `cargo test --locked --offline --test workload_reliability_pages maximal_attempt_detail -- --nocapture`: exit 0. Wire page 264027 bytes. Maximum estimated envelope 803767 bytes.
+- Included in the full bridge suite: `workload_reliability_pages` 6, `native_executor_store` 46, `native_executor_mcp` 16, `work_graph_authority` 25, `work_graph_service` 4, `workload_mcp` 1, `coordinator_mcp` 5, `coordinator_store` 12, `verified_change_workflow` 102, `provider_wire_conformance` 4.
+- Test gateway, from the bridge directory: fmt exit 0, clippy exit 0, test exit 0. 5 library, 11 integration, 1 doc.
+- Service `cargo fmt --check`, `cargo check --locked --all-targets`, and clippy: exit 0. The first `cargo test --locked -- --test-threads=1` failed one test, `disconnect_reconnect_restart_and_cursor_expiry_are_durable`, while the bridge and Tauri suites were compiling. Shutdown reported `journal writer queue is full` and retained the instance lock, so the restart could not acquire it. The same suite rerun with no competing compile: exit 0. 4 library, 12 conformance, 5 smoke, 0 failed. That conformance test talks authenticated MCP to a disposable loopback service and replays a submit after a dropped connection.
+- Desktop `npm run typecheck`: exit 0. `npm test`: exit 0, 60 files, 450 tests, including `useWorkBoardPoll.test.tsx` 13 and `WorkBoard.test.tsx` 10. `npm run build`: exit 0. Help public verification was not run. This repair does not change the help bundle.
+- Tauri `cargo test --locked -- --test-threads=1` from `desktop/src-tauri`: exit 0. Library 52 passed, including `remote_client_reads_oversized_work_through_detail` and `remote_client_authenticates_and_reconnects_after_service_restart`. The binary target `src/main.rs` compiled and ran 0 tests. Doc-tests ran 0. This was not `--lib`.
+- Root `cargo fmt -p xai-host-authority -- --check`: exit 0. Clippy exit 0. `cargo test -p xai-host-authority --locked -- --test-threads=1`: exit 0, 119 passed, 0 failed.
+- `git diff --check`: exit 0.
 
-Service sources are unchanged from `ebc3628ba`. The service suite and the test gateway were not re-run locally for this follow-up. Hosted `desktop.yml` runs both. Their earlier exit 0 results (service 21 passed; gateway 11 tests plus 1 doc test) belong to that earlier head.
+The first bridge suite, without an isolated `GROKPTAH_HOME`, stopped in the library target: 756 passed, 3 failed, 11 ignored. The three failures were `transient_rate_limit_is_uncertain_and_is_not_retried`, `xai_qualification_forces_at_most_one_refresh_after_401`, and `xai_qualification_rejects_a_refresh_that_changes_principal`. The refresh test returned `missing field policy_revision` from the operator authority file. That file was not edited. The isolated rerun is the bridge result above.
 
-Host: macOS 26.3, arm64. Toolchains: rustc 1.92.0, cargo 1.92.0, rustfmt 1.8.0-stable, node v25.2.1, npm 11.6.2, git 2.50.1. No production credentials, live provider, or packaged app.
+Secret scan of the added lines from `c2b1c0b0` to `8c0e86911` under `crates/` and `desktop/` (10508 added lines): no private-key block, no `AKIA` key, no `ghp_` token, no `sk-` token, and no `xai-` live token. `leaseToken` appears in the live claim response after `redact_claim_lease_token` strips it from the persisted receipt, and in tests that assert the token is absent from pages, receipts, and error text. Crash-stage children exit 86. No production credential was read.
 
-| Gate | Command | Result on this follow-up |
-| --- | --- | --- |
-| Bridge fmt | `cargo fmt --check` in `grokptah-agent-bridge` | exit 0 |
-| Bridge clippy | `cargo clippy --locked --offline --all-targets -- -D warnings` | exit 0, debuginfo off |
-| Bridge tests | `cargo test --locked --offline -- --test-threads=1` | exit 0. 1306 passed, 0 failed, 15 ignored, 43 binaries, debuginfo off |
-| Service fmt / clippy / tests | `grokptah-service` | not re-run. Sources unchanged from `ebc3628ba`. Hosted `desktop.yml` is the gate |
-| Test gateway | package tests | not re-run. Hosted `desktop.yml` is the gate |
-| Desktop typecheck, vitest, production build | `npm` scripts in `desktop/` | exit 0. vitest 59 files, 436 tests. No TypeScript change |
-| Desktop Tauri lib | `cargo test --locked --offline --lib -- --test-threads=1` in `desktop/src-tauri` | exit 0. 52 passed, 0 failed, debuginfo off |
-| `git diff --check` | worktree before this commit | clean |
+## Fault cuts
 
-The 15 ignored bridge tests are the pre-existing installed-CLI, live Grok Build, lock-holder child, and `DurableWriteGuard` doc test. This change adds no `#[ignore]`.
+Child cuts use `GROKPTAH_CRASH_STAGE` and `process::exit(86)`.
 
-Hosted `desktop.yml` on the published head of this follow-up is recorded in the PR after that run exists. Pending is not success. Run `38172509497` is not that run.
+- Lifecycle: `lifecycle_after_intent`, `lifecycle_after_attempts`, `lifecycle_after_item`, `lifecycle_after_receipt`, `lifecycle_after_commit`.
+- Mutation: `mutation_after_intent`, `mutation_after_decision`, `mutation_after_item`, `mutation_after_receipt`, `mutation_after_commit`.
+- Managed finalization: `managed_finalization_after_intent`, `managed_finalization_after_journal`.
+- Quarantine: `quarantine_before_marker`, `quarantine_after_marker`, `quarantine_after_move`, `quarantine_after_durability`. The durability fault is the directory fsync after the rename. The marker write and the destination check use the existing durable-write fault.
 
-## Requirement to proof
+## Wire, disk, and migration
 
-| Requirement | Caller | Proof | Result |
-| --- | --- | --- | --- |
-| Traverse 0 through 4096 | `select_work_list_page`, `ptah_list_work_page`, `ptah_get_work_graph_page` | `workload_reliability_pages` (5) and `legal_ceiling_list_and_graph_exceed_the_mcp_body_ceiling` | passed. Legacy list/graph of 4096 return `MCP remote error: capacity_exhausted` and do not truncate. The lane is walked by the paged tools |
-| Ties, empty filter, UTF-8, foreign deps | same selector | `lane_boundaries_filters_utf8_and_foreign_dependencies`, `bounded_pages_cover_small_lanes_and_reject_bad_continuations` | passed. 128 dependencies, 64 foreign, unresolved count only |
-| Version fence | cursor digest in `work_page.rs` | reprioritize between pages returns `restart_required` | passed |
-| Cursor rejection before data | `open_cursor` | tamper, expiry, unknown version, foreign scope, foreign reader | passed in the page tests |
-| Byte budget | `tools_call_response_len` vs the raw tools/call body | one authenticated response's byte length equals the estimator and is `<=` 2 MiB (`2097152`) | passed. The numeric length is the equality, not a stored constant |
-| Maximal item detail | `ptah_get_work_detail` | `oversized_item_detail_is_pageable_when_get_by_id_refuses` | passed. Legacy get refuses `capacity_exhausted` |
-| Standalone MCP service | `hosted_service_pages_one_work_lane_the_same_way_twice` | two authenticated clients, same page and full walk, graph agrees, legacy list of 3, zero runs | passed, 12.50s inside the service suite |
-| Desktop board states | `workTraversal.ts`, `WorkBoard.tsx` | vitest, including lane generation and partial counts | 436 passed. Counts on a partial lane are loaded counts |
-| Remote adapter | `remote_service.rs` `list_work_page` and `get_work` | `remote_client_follows_work_pages_and_refuses_a_changed_lane`; `remote_client_reads_oversized_work_through_detail` | local `cargo test --locked --offline --lib` passed, 52 tests, 0 failed. The oversized item is refused by `ptah_get_work` and read through `ptah_get_work_detail`. A small item still uses only `ptah_get_work` |
-| Managed finalization binding | `commit_work_lifecycle_intent_unlocked`, `apply_managed_finalization_unlocked` | child cuts `managed_finalization_after_intent` and `managed_finalization_after_journal`; in-process stage cuts; review stays out of execution | `native_executor_store` 46 passed |
-| Queued seal | `seal_queued_managed_work` | `process_crash_seal_queued_managed_work_commits_once` | passed inside that binary |
-| Assignment and lifecycle | offer/fail production writes | `process_crash_offer_commits_one_decision_and_replays`, `process_crash_fail_commits_one_attempt_and_replays` | passed. Replay is stable across two further reopens. `effect_counts` stays `(0, 0)` for `verified-changes/` and `runs/` |
-| Legacy journal | `quarantine_unbound_finalization_journal_unlocked` | `legacy_journal_without_envelope_is_quarantined` | passed. Open succeeds, claim is the fixed reconciliation conflict, evidence is kept |
-| Same-process tear | `note_partial_commit`, `/ready` | `same_process_item_write_failure_closes_admission_until_reopen`, `write_fault_makes_the_live_server_unready_until_reopen` | passed. Authenticated `/ready` is 503 with the fixed message and no path. Reopen after ordered shutdown is ready |
-| Verified Change receipts | `lifecycle_settles_service_receipt` | `verified_change_workflow` 102 passed after apply/discard receipts stopped being completed inside intermediate lifecycle snapshots | passed, 302.34s |
-| Preserve earlier suites | coordinator, workload store, graph authority, provider qualification under isolated home | included in the 1306 | passed on this follow-up. Provider qualification had failed earlier against the operator home's authority file (`missing field policy_revision`). That file was not modified. The isolated-home suite passed those tests |
+Schema version stays 1. Kinds stay `grokptah.work.page.v1`, `grokptah.work.graph-page.v1`, and `grokptah.work.detail.v1`. List and graph consistency stays `version_fence`. Attempt consistency is `attempt_fence`. Limits stay 4096 items, 16384 edges, and 2097152 bytes. Default list limit stays 50, maximum 200. Detail default stays 32, maximum 64.
 
-## Wire and disk compatibility
+`ptah_get_work_detail` accepts optional `attempt_id` and `consistency_fence`. New sections are `attempt_detail`, `attempt_evidence`, and `attempt_artifacts`. The `attempts` section now returns summaries: public attempt scalars, result metadata, `evidenceCount`, `artifactCount`, and `fence`. It does not return the evidence strings or artifact objects. A client of the pre-repair draft that decoded `attempts` as full `WorkAttemptView` values must walk the three nested sections. `WorkDetailPageV1` adds optional `attemptId` and `consistencyFence`. Old pages without those fields still decode. Offset 0 may omit the fence and receives the current one. A later page, or a different fence, returns `restart_required` and no elements.
 
-- Additive tools: `ptah_list_work_page`, `ptah_get_work_graph_page`, `ptah_get_work_detail`. Legacy tools keep `{work}`, `{graph}`, and `{work, attempts}`.
-- A legacy body that would exceed 2 MiB returns `capacity_exhausted` and names the paged tool. The 2 MiB ceiling, 4096-item ceiling, and 16384-edge ceiling are unchanged.
-- Page order: priority descending, `created_at` ascending, `work_id` ascending. Default limit 50, maximum 200. Preferred envelope 256 KiB. One legal entry may exceed the preferred target when it still fits under 2 MiB.
-- Consistency is a version fence. A lane digest mismatch returns `restart_required` and no items. Deadline admission uses the sealed `admitted_at` inside the cursor.
-- The cursor is HMAC-SHA256 with a host-owned `page-mac.key` (mode 0600). The token body has no workspace path, lease, or credential.
-- List rows are `WorkListEntryV1`. Graph nodes stay the existing redacted projection. Foreign dependency ids stay an unresolved count.
-- Managed finalization writes the lifecycle envelope, including prior and successor work and attempts, before the journal. Recovery adopts that envelope. A journal with no authentic envelope is moved aside and `ledger-reconciliation.json` records `unbound_managed_finalization` with no path. Admission closes with `ledger reconciliation is required`.
-- Apply and discard verified-change receipts are not settled by an intermediate `apply-candidate` or `apply-reconciliation` lifecycle snapshot. Discard receipts settle on `discard-candidate`. Apply receipts stay with `complete_pending_apply_receipt_unlocked` and `fail_exact_apply_receipt_unlocked`.
-- `begin_managed_permission_resolve` and `abort_managed_permission_resolve` remain single-record writes.
+Legacy `ptah_get_work` is unchanged: `{work, attempts}` when the body fits, `capacity_exhausted` when it does not. `RemoteServiceClient::get_work` still uses that tool first and falls back to detail only for `capacity_exhausted`. The fallback now reconstructs each attempt from the nested pages. Lease fields stay out of every page.
 
-## Crash cuts that passed
-
-Child process exit 86 at `GROKPTAH_CRASH_STAGE`, then a fresh store open, replay of the original request, then two more opens:
-
-- `mutation_after_decision` for an offer (one decision, stable replay)
-- lifecycle fail after the attempt/item/receipt cuts used by `process_crash_fail_commits_one_attempt_and_replays`
-- `managed_finalization_after_intent` and `managed_finalization_after_journal` (awaiting review is not released)
-- queued managed seal across the intent/write/cleanup boundary in `process_crash_seal_queued_managed_work_commits_once`
-
-In-process stage returns cover `BeforeJournal`, `AfterIntent`, `AfterJournal`, `AfterAttempt`, and `AfterWork` for managed finalization. A same-process fault on the `work-items` write closes admission until reopen.
-
-## Privacy scan
-
-Synthetic and offline. The page tests refuse responses and errors that contain the workspace display path, the canonical path, the bearer, or a foreign dependency id. This does not qualify a live provider or a packaged native build.
+Disk attempt files are unchanged. No attempt migration runs. `ledger-reconciliation.json` stays `{"schemaVersion":1,"code":"unbound_managed_finalization"}`. It is written and fsynced before a quarantine rename. A directory that already contains quarantine evidence closes admission on open even when the marker is missing, and the marker is then persisted. There is no marker-clear API. The shared `armed_request` slot is gone. Existing intent files that already carry a request binding still replay. Intents without one stay unbound.
 
 ## Reviewer map
 
-Changed API: `ptah_list_work_page`, `ptah_get_work_graph_page`, `ptah_get_work_detail`; error code `restart_required`; types `WorkListPageV1`, `WorkGraphPageV1`, `WorkDetailPageV1`.
+- Request binding: `OrchStore::bind_work_request` and `adopt_operation_request` in `orchestration/store.rs`. Service callers bind in `orchestration/service.rs` (`bind_work_request` near the claim path, `claim_work`, `link_work_run`, and `work_lease_mutation` for renew). Validation checks the pending idempotency receipt, owner, session, workspace digest, tool, payload hash, target work, target attempt, and expected revision. The test gate waits inside `bind_work_request`, not inside adopt, so a supervisor cannot consume the barrier.
+- Original response recovery: `commit_lifecycle_with_request_unlocked` persists the intent before the attempt, item, and receipt. Open runs `recover_work_lifecycle_intents` before orphaned-receipt failure. Claim replay restores the lease with `lease_token_for_secret` and `token_matches`. Empty or rotated secrets refuse without rewriting a complete receipt. `lifecycle_settles_service_receipt` still withholds settlement for intermediate verified-change snapshots.
+- Quarantine order: `quarantine_unbound_finalization_journal_unlocked`. Marker, then destination check, directory create, rename, source-directory fsync, quarantine-directory fsync. `load_ledger_reconciliation_marker` also treats a quarantine file as unresolved evidence.
+- UI poll: `desktop/src/lib/useWorkBoardPoll.ts` interval `WORK_BOARD_POLL_MS` (2500) calls `observe`. `WorkBoardController.restart` replaces the list. `loadMore` appends. A fence change or expired cursor sets refresh-required and does not mix the new first page into old pages.
+- Nested attempts: `attempt_content_fence` and `project_work_detail` in `orchestration/work_page.rs`. MCP arguments in `mcp_control.rs`. Remote reconstruction is `collect_attempt_views` in `desktop/src-tauri/src/remote_service.rs`.
 
-Store commit and recovery: `commit_work_lifecycle_intent_unlocked`, `lifecycle_settles_service_receipt`, `complete_bound_request_unlocked`, `recover_work_lifecycle_intents`, `apply_managed_finalization_unlocked`, `quarantine_unbound_finalization_journal_unlocked`, `note_partial_commit`, `load_or_create_page_mac_key`.
+## Local versus hosted
 
-Selectors: `select_work_list_page`, `select_work_graph_page`, `project_work_detail` in `orchestration/work_page.rs`. MCP handlers only call those. Desktop `work_list` and `RemoteServiceClient::list_work_page` do the same. `list_work_page_for_session` preserves the orchestration error code. `RemoteServiceClient::get_work` follows `ptah_get_work_detail` after `capacity_exhausted`. The detail summary is the non-bulky identity projection.
+Hosted Desktop success on `0cb77413` (run `38178900645`) does not cover this repair. Local commands above were run on `8c0e86911` before this evidence commit. No live provider, production credential, Computer Use session, or native input was used. Loopback and synthetic tokens supplied the service and MCP proofs.
 
-Fault hooks, test-only: `GROKPTAH_CRASH_STAGE` (`process::exit(86)`), `DURABLE_WRITE_FAULT` (existing verified-change needle), `APPLY_FAULT`, `CLEANUP_FAULT`.
-
-Highest risk:
-
-1. A lifecycle snapshot inside verified-change apply must not complete that receipt. `lifecycle_settles_service_receipt` is the guard. The 102 verified-change tests are the regression net.
-2. Version-fence restarts are correct when reconciliation rewrites dependency state. A long limit-1 graph walk can cross the 5 second supervisor tick and return `restart_required`. The product does that on purpose. The unchanged-lane proof stays inside one interval.
-3. `page_mac_key` loss invalidates every continuation. Callers must restart. The key is not in the cursor.
-4. Legacy unbounded tools still build the full body and then refuse. They do not truncate, and they are not the traversal path.
-5. Remote selected work follows `ptah_get_work_detail` only after `capacity_exhausted`. The summary section now carries the non-bulky operator identity used to rebuild that snapshot. Result metadata (`completedAt`, `cancellationReason`, verification) rides with the result section. A single element that still does not fit stays a refusal.
-
-## Skeptic follow-up
-
-`list_work_page_for_session` returns the orchestration display, so the string contains `restart_required` or `cursor_expired`. `list_work_page_for_session_preserves_restart_and_expiry_codes` calls that function for a changed lane and an expired cursor. `detail_summary_keeps_operator_identity_out_of_the_result_body` checks the summary and result projections. Both passed in the bridge lib tests.
-
-`RemoteServiceClient::get_work` calls `ptah_get_work_detail` when get-by-id returns `MCP remote error: capacity_exhausted`. Stable page refusals do not reconnect. A stale session `invalid_request` still reconnects. Local proof: desktop lib 52 passed, including `remote_client_reads_oversized_work_through_detail` and `remote_client_authenticates_and_reconnects_after_service_restart`. That run used `CARGO_PROFILE_TEST_DEBUG=0` so the test binary would fit. It is the library target, not `cargo test` of the Tauri binary.
-
-Hosted run `38172509497` covers `ebc3628ba7316a2b1a7e4bd1fbe020a965132e6c` only. It does not cover this follow-up.
-
-The executable commit for this follow-up is `1e3d5f76a569b0213a90a2705777c26aa74a25e9`, tree `82dc8e8894731b29968cc655ae2ad95143de0abd`. The commit that records this SHA changes only this file. Rust and TypeScript are identical to that executable commit. Hosted `desktop.yml` has to be read on the published tip.
-
-## Unresolved on this tree
-
-- Local `desktop/src-tauri` `cargo test --locked` of the binary target did not run. The library target did: 52 passed, 0 failed. Hosted `desktop.yml` `cargo test --locked` remains the macOS binary gate and must be green on this commit. The earlier success does not count.
-- A lane of 16384 edges was not materialized. The edge ceiling was not lowered. The covered graph is one item with 128 dependencies.
-- Not every production writer has its own child-process cut. Block, renew, progress, approval, and reconciliation rely on the shared lifecycle/mutation envelope plus the existing store tests.
-- The portable SDK (`grokptah-agent-sdk`) does not expose list/graph work tools, so it was not given a second client.
-- Hosted workflow status for this follow-up is unknown until `desktop.yml` finishes on this commit. Run `38172509497` is an earlier head.
+Unobserved until the published tip's `desktop.yml` finishes: the hosted normal-profile build, hosted sccache, and the hosted macOS Tauri `cargo test --locked`. A local pass is not that oracle. The 15 ignored bridge tests were not promoted into this claim.
