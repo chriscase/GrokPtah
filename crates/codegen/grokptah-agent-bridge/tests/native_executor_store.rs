@@ -2007,14 +2007,15 @@ fn workload_reliability_crash_child() {
     store
         .claim_idempotency(&scope, &tool, &request_id, "payload-reliability")
         .unwrap();
-    store.arm_work_request(WorkRequestBinding::bound(
+    let _bound = OrchStore::bind_work_request(WorkRequestBinding::bound(
         &scope,
         &workspace,
         &request_id,
         &tool,
         "payload-reliability",
         &shape,
-    ));
+    ))
+    .unwrap();
     match op.as_str() {
         "managed_close" => {
             let intent_id = std::env::var("GROKPTAH_CRASH_INTENT").unwrap();

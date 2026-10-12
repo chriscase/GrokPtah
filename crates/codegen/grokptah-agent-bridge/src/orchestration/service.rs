@@ -470,18 +470,27 @@ impl Drop for IdempotencyLease {
 }
 
 impl OrchestrationService {
-    fn arm_work_request(&self, lease: &IdempotencyLease, workspace_display: &str, shape: &str) {
-        self.store
-            .arm_work_request(super::store::WorkRequestBinding {
-                request_id: lease.request_id.clone(),
-                owner_id: lease.scope.owner_id.clone(),
-                tool: lease.tool.clone(),
-                session_id: lease.scope.session_id,
-                workspace_digest: lease.scope.workspace_digest.clone(),
-                workspace_display: workspace_display.to_string(),
-                payload_hash: lease.payload_hash.clone(),
-                shape: shape.to_string(),
-            });
+    fn bind_work_request(
+        &self,
+        lease: &IdempotencyLease,
+        workspace_display: &str,
+        shape: &str,
+        target_work_id: Option<&str>,
+        target_attempt_id: Option<&str>,
+        expected_revision: Option<u64>,
+    ) -> Result<super::store::BoundWorkRequest, OrchError> {
+        let mut binding = super::store::WorkRequestBinding::bound(
+            &lease.scope,
+            workspace_display,
+            lease.request_id.clone(),
+            lease.tool.clone(),
+            lease.payload_hash.clone(),
+            shape,
+        );
+        binding.target_work_id = target_work_id.map(str::to_string);
+        binding.target_attempt_id = target_attempt_id.map(str::to_string);
+        binding.expected_revision = expected_revision;
+        super::store::OrchStore::bind_work_request(binding)
     }
 
     pub fn new(
@@ -5294,7 +5303,7 @@ impl OrchestrationService {
             IdempotencyStart::Replay(response) => return self.restore_claim_response(response),
             IdempotencyStart::Perform(lease) => lease,
         };
-        let item = match self.load_work_scoped(session_id, &claimed, work_id, false) {
+        let _item = match self.load_work_scoped(session_id, &claimed, work_id, false) {
             Ok((item, _)) => item,
             Err(error) => {
                 return Err(self.fail_claim(&mut lease, None, session_id, &claimed, error))
@@ -5311,6 +5320,14 @@ impl OrchestrationService {
             }
         }
         let claimant = agent_id.unwrap_or_else(|| auth.token_id.clone());
+        let _bound = self.bind_work_request(
+            &lease,
+            &claimed.display().to_string(),
+            "claim",
+            Some(work_id),
+            None,
+            None,
+        )?;
         let claim = match self.store.claim_work_with_lease_secret(
             work_id,
             &claimant,
@@ -5322,14 +5339,14 @@ impl OrchestrationService {
                 return Err(self.fail_claim(&mut lease, None, session_id, &claimed, error))
             }
         };
-        let response = json!({
+        let persisted_response = redact_claim_lease_token(json!({
             "work": claim.work,
             "attempt": WorkAttemptView::from(&claim.attempt),
-            "leaseToken": claim.lease_token,
-            "sessionId": item.session_id,
+            "sessionId": session_id,
             "workspace": claimed.display().to_string(),
-        });
-        let persisted_response = redact_claim_lease_token(response.clone());
+        }));
+        let mut response = persisted_response.clone();
+        response["leaseToken"] = json!(claim.lease_token);
         lease
             .complete(Some(work_id.to_string()), persisted_response)
             .map_err(|error| {
@@ -5397,9 +5414,21 @@ impl OrchestrationService {
             IdempotencyStart::Replay(response) => return Ok(response),
             IdempotencyStart::Perform(lease) => lease,
         };
-        if let Err(error) = self.load_work_scoped(session_id, &claimed, work_id, false) {
-            return Err(self.fail_claim(&mut lease, None, session_id, &claimed, error));
-        }
+        let item = match self.load_work_scoped(session_id, &claimed, work_id, false) {
+            Ok((item, _)) => item,
+            Err(error) => {
+                return Err(self.fail_claim(&mut lease, None, session_id, &claimed, error))
+            }
+        };
+        let attempt_id = details.get("attemptId").and_then(|value| value.as_str());
+        let _bound = self.bind_work_request(
+            &lease,
+            &claimed.display().to_string(),
+            "lease_view",
+            Some(work_id),
+            attempt_id,
+            Some(item.revision),
+        )?;
         let attempt = match operation(&self.store) {
             Ok(attempt) => attempt,
             Err(error) => {
@@ -5499,11 +5528,17 @@ impl OrchestrationService {
         if let Err(error) = self.load_work_scoped(session_id, &claimed, work_id, false) {
             return Err(self.fail_claim(&mut lease, None, session_id, &claimed, error));
         }
-        self.arm_work_request(&lease, &claimed.display().to_string(), "work_attempt");
+        let _bound = self.bind_work_request(
+            &lease,
+            &claimed.display().to_string(),
+            "work_attempt",
+            Some(work_id),
+            Some(attempt_id),
+            None,
+        )?;
         let progress_result =
             self.store
                 .report_work_progress(work_id, attempt_id, lease_token, progress);
-        self.store.disarm_work_request();
         let (item, attempt) = match progress_result {
             Ok(value) => value,
             Err(error) => {
@@ -5632,9 +5667,16 @@ impl OrchestrationService {
         if let Err(error) = self.load_work_scoped(session_id, &claimed, work_id, false) {
             return Err(self.fail_claim(&mut lease, None, session_id, &claimed, error));
         }
-        self.arm_work_request(&lease, &claimed.display().to_string(), "work_attempt");
+        let attempt_id = details.get("attemptId").and_then(|value| value.as_str());
+        let _bound = self.bind_work_request(
+            &lease,
+            &claimed.display().to_string(),
+            "work_attempt",
+            Some(work_id),
+            attempt_id,
+            None,
+        )?;
         let attempt_result = operation(&self.store);
-        self.store.disarm_work_request();
         let (item, attempt) = match attempt_result {
             Ok(value) => value,
             Err(error) => {
@@ -5685,11 +5727,17 @@ impl OrchestrationService {
         if let Err(error) = self.load_work_scoped(session_id, &claimed, work_id, false) {
             return Err(self.fail_claim(&mut lease, None, session_id, &claimed, error));
         }
-        self.arm_work_request(&lease, &claimed.display().to_string(), "work_attempts");
+        let _bound = self.bind_work_request(
+            &lease,
+            &claimed.display().to_string(),
+            "work_attempts",
+            Some(work_id),
+            None,
+            expected_revision,
+        )?;
         let cancel_result = self
             .store
             .cancel_work_checked(work_id, &reason, expected_revision);
-        self.store.disarm_work_request();
         let (item, attempts) = match cancel_result {
             Ok(value) => value,
             Err(error) => {
@@ -5963,7 +6011,14 @@ impl OrchestrationService {
             }
         };
         let manager_id = actors.manager.as_ref().map(|agent| agent.agent_id.clone());
-        self.arm_work_request(&lease, &claimed.display().to_string(), "decision");
+        let _bound = self.bind_work_request(
+            &lease,
+            &claimed.display().to_string(),
+            "decision",
+            Some(work_id),
+            None,
+            expected_revision,
+        )?;
         let offer_result = self.store.offer_work(
             work_id,
             &actors.worker.agent_id,
@@ -5973,7 +6028,6 @@ impl OrchestrationService {
             expected_revision,
             Utc::now(),
         );
-        self.store.disarm_work_request();
         let (item, decision) = match offer_result {
             Ok(value) => value,
             Err(error) => {
@@ -6107,6 +6161,14 @@ impl OrchestrationService {
             }
         };
         let manager_id = actors.manager.as_ref().map(|agent| agent.agent_id.clone());
+        let _bound = self.bind_work_request(
+            &lease,
+            &claimed.display().to_string(),
+            "decision",
+            Some(work_id),
+            None,
+            expected_revision,
+        )?;
         let (item, decision) = match self.store.reassign_work(
             work_id,
             &actors.worker.agent_id,
@@ -6234,6 +6296,14 @@ impl OrchestrationService {
         if let Err(error) = self.load_work_scoped(session_id, &claimed, work_id, false) {
             return Err(self.fail_claim(&mut lease, None, session_id, &claimed, error));
         }
+        let _bound = self.bind_work_request(
+            &lease,
+            &claimed.display().to_string(),
+            "unblock",
+            Some(work_id),
+            None,
+            expected_revision,
+        )?;
         let item = match self.store.unblock_work(
             work_id,
             &auth.token_id,
@@ -6984,9 +7054,18 @@ impl OrchestrationService {
         if let Err(error) = self.load_work_scoped(session_id, &claimed, work_id, false) {
             return Err(self.fail_claim(&mut lease, None, session_id, &claimed, error));
         }
-        self.arm_work_request(&lease, &claimed.display().to_string(), "work_scope");
+        let expected_revision = details
+            .get("expectedRevision")
+            .and_then(|value| value.as_u64());
+        let _bound = self.bind_work_request(
+            &lease,
+            &claimed.display().to_string(),
+            "work_scope",
+            Some(work_id),
+            None,
+            expected_revision,
+        )?;
         let item_result = operation(&self.store);
-        self.store.disarm_work_request();
         let item = match item_result {
             Ok(item) => item,
             Err(error) => {
@@ -7069,7 +7148,14 @@ impl OrchestrationService {
         {
             return Err(self.fail_claim(&mut lease, None, session_id, &claimed, error));
         }
-        self.arm_work_request(&lease, &claimed.display().to_string(), "decision_scope");
+        let _bound = self.bind_work_request(
+            &lease,
+            &claimed.display().to_string(),
+            "decision_scope",
+            Some(work_id),
+            None,
+            expected_revision,
+        )?;
         let identity_result = operation(
             &self.store,
             agent_id,
@@ -7078,7 +7164,6 @@ impl OrchestrationService {
             expected_revision,
             Utc::now(),
         );
-        self.store.disarm_work_request();
         let (item, decision) = match identity_result {
             Ok(value) => value,
             Err(error) => {
@@ -7347,6 +7432,14 @@ impl OrchestrationService {
         if let Err(error) = self.load_work_scoped(session_id, &claimed, work_id, false) {
             return Err(self.fail_claim(&mut lease, None, session_id, &claimed, error));
         }
+        let _bound = self.bind_work_request(
+            &lease,
+            &claimed.display().to_string(),
+            "decision",
+            Some(work_id),
+            None,
+            expected_revision,
+        )?;
         let (item, decision) = match self.store.authorize_work_execution(
             work_id,
             &auth.token_id,

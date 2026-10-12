@@ -85,7 +85,8 @@ pub use service::{
 pub(crate) use store::workspaces_match;
 pub(crate) use store::AuditWriterStopReport;
 pub use store::{
-    IdempotencyClaim, OrchStore, RetentionPolicy, RetentionReport, WorkRequestBinding,
+    BoundWorkRequest, IdempotencyClaim, OrchStore, RetentionPolicy, RetentionReport,
+    WorkRequestBinding,
 };
 pub use supervisor::{
     ManagerSupervisorReport, ManagerSupervisorStatus, RoutineSupervisor, RoutineSupervisorStatus,
