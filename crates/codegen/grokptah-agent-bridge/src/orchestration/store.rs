@@ -5533,6 +5533,7 @@ impl OrchStore {
         stage: ManagedFinalizationStage,
     ) -> Result<Option<ManagedExecutionIntent>, OrchError> {
         let request = self.adopt_operation_request();
+        self.refuse_closed_admission()?;
         let _guard = self.inner.lock.lock();
         let Some(intent) = self.load_managed_intent_unlocked(intent_id)? else {
             return Ok(None);
@@ -5645,6 +5646,7 @@ impl OrchStore {
         stage: ManagedFinalizationStage,
     ) -> Result<Option<ManagedExecutionIntent>, OrchError> {
         let request = self.adopt_operation_request();
+        self.refuse_closed_admission()?;
         let _guard = self.inner.lock.lock();
         let Some(intent) = self.load_managed_intent_unlocked(intent_id)? else {
             return Ok(None);
@@ -6094,11 +6096,88 @@ impl OrchStore {
         error
     }
 
+    fn refuse_closed_admission(&self) -> Result<(), OrchError> {
+        if let Some(message) = self.ledger_admission_closed() {
+            return Err(OrchError::new(OrchErrorCode::Conflict, message));
+        }
+        Ok(())
+    }
+
+    fn mark_reconciliation_required(&self) {
+        *self.inner.ledger_admission_closed.lock() =
+            Some("ledger reconciliation is required".to_string());
+    }
+
+    /// Persist the refusal before any evidence move. The marker is the durable
+    /// admission authority. Quarantine files are a second authority for ledgers
+    /// that moved evidence and then died before the marker, and for a marker
+    /// that is missing while those files remain.
+    fn persist_ledger_reconciliation_marker_unlocked(&self) -> Result<(), OrchError> {
+        atomic_write_json(
+            &self.lease(),
+            &self.inner.root.join("ledger-reconciliation.json"),
+            &serde_json::json!({
+                "schemaVersion": 1,
+                "code": "unbound_managed_finalization"
+            }),
+        )
+        .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        self.mark_reconciliation_required();
+        Ok(())
+    }
+
     fn load_ledger_reconciliation_marker(&self) -> Result<(), OrchError> {
         let path = self.inner.root.join("ledger-reconciliation.json");
+        let evidence = self.unresolved_quarantine_evidence()?;
         if path.is_file() {
-            *self.inner.ledger_admission_closed.lock() =
-                Some("ledger reconciliation is required".to_string());
+            self.mark_reconciliation_required();
+            if evidence {
+                // Finish directory durability if a previous process died after
+                // the rename and before its directory fsync.
+                self.fsync_directory(&self.inner.root.join("managed-finalization-quarantine"))?;
+                self.fsync_directory(&self.inner.root)?;
+            }
+            return Ok(());
+        }
+        if evidence {
+            self.persist_ledger_reconciliation_marker_unlocked()?;
+            self.fsync_directory(&self.inner.root.join("managed-finalization-quarantine"))?;
+        }
+        Ok(())
+    }
+
+    /// Any regular file under the quarantine directory is unresolved evidence.
+    /// A later Work state is not a resolution, and an unparseable file is not
+    /// discarded.
+    fn unresolved_quarantine_evidence(&self) -> Result<bool, OrchError> {
+        let dir = self.inner.root.join("managed-finalization-quarantine");
+        if !dir.is_dir() {
+            return Ok(false);
+        }
+        for entry in fs::read_dir(&dir)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
+        {
+            let path = entry
+                .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
+                .path();
+            if !path.is_file() {
+                continue;
+            }
+            fs::read(&path)
+                .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    fn fsync_directory(&self, path: &Path) -> Result<(), OrchError> {
+        crate::verified_change::fail_durable_write_if_armed(path)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        #[cfg(unix)]
+        {
+            fs::File::open(path)
+                .and_then(|file| file.sync_all())
+                .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
         }
         Ok(())
     }
@@ -6178,24 +6257,31 @@ impl OrchStore {
         &self,
         path: &Path,
     ) -> Result<(), OrchError> {
-        let dir = self.inner.root.join("managed-finalization-quarantine");
-        fs::create_dir_all(&dir)
-            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        // The marker lands before the journal leaves the recovery scan. A
+        // failed marker write keeps the original bytes where reopen will see
+        // them. A failed move or directory fsync keeps the marker, so reopen
+        // stays refused even if the rename has not become durable.
+        crash_process_if_stage("quarantine_before_marker");
+        self.persist_ledger_reconciliation_marker_unlocked()?;
+        crash_process_if_stage("quarantine_after_marker");
         let name = path
             .file_name()
             .and_then(|value| value.to_str())
             .unwrap_or("journal.json");
+        let dir = self.inner.root.join("managed-finalization-quarantine");
         let destination = dir.join(format!("{name}.unbound-{}", Uuid::new_v4().simple()));
-        fs::rename(path, destination)
+        crate::verified_change::fail_durable_write_if_armed(&destination)
             .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
-        atomic_write_json(
-            &self.lease(),
-            &self.inner.root.join("ledger-reconciliation.json"),
-            &serde_json::json!({"schemaVersion": 1, "code": "unbound_managed_finalization"}),
-        )
-        .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
-        *self.inner.ledger_admission_closed.lock() =
-            Some("ledger reconciliation is required".to_string());
+        fs::create_dir_all(&dir)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        fs::rename(path, &destination)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        crash_process_if_stage("quarantine_after_move");
+        if let Some(source_dir) = path.parent() {
+            self.fsync_directory(source_dir)?;
+        }
+        self.fsync_directory(&dir)?;
+        crash_process_if_stage("quarantine_after_durability");
         Ok(())
     }
 
@@ -6360,6 +6446,7 @@ impl OrchStore {
         now: chrono::DateTime<Utc>,
     ) -> Result<Option<WorkItem>, OrchError> {
         let request = self.adopt_operation_request();
+        self.refuse_closed_admission()?;
         let _guard = self.inner.lock.lock();
         let Some(mut item) = self
             .load_work_item_unlocked(work_id)

@@ -14,9 +14,12 @@
 //! - `production_claim_recovery_must_complete_the_original_receipt` still crashes
 //!   the production claim at `lifecycle_after_item`. It now replays through a
 //!   fresh authenticated service.
-//! - `failed_quarantine_marker_must_not_reopen_admission` and
-//!   `maximal_valid_attempt_result_must_be_readable_through_detail` are ported
-//!   with the quarantine and nested-attempt repairs, not in this binding pass.
+//! - `failed_quarantine_marker_must_not_reopen_admission` keeps the marker-write
+//!   fault. The old `assert!(!path.exists())` recorded the bug (the journal
+//!   moved before the marker). The port requires the original bytes to remain
+//!   until the marker is durable, then to survive in quarantine across reopens.
+//! - `maximal_valid_attempt_result_must_be_readable_through_detail` is ported
+//!   with the nested-attempt repair, not in this quarantine pass.
 //! - `full_item_and_edge_ceiling_graph_walk_is_lossless` is unchanged.
 
 mod common;
@@ -25,15 +28,19 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Barrier};
 
 use grokptah_agent_bridge::orchestration::{
-    canonical_workspace, order_work, select_work_graph_page, tools_call_response_len, AttemptState,
-    AuthContext, AuthCredential, GraphScope, IdempotencyScope, OrchStore, OrchestrationConfig,
-    OrchestrationService, RunBounds, RunRecord, RunState, WorkDependency, WorkItem, WorkPageFilter,
-    WorkPageKind, WorkPageQuery, WorkPageReader, WorkPolicy, WorkRequestBinding, WorkState,
-    WorkspaceAllowlist, MAX_GRAPH_EDGES, MAX_GRAPH_SCOPE_ITEMS, WORK_PAGE_TRANSPORT_CEILING_BYTES,
+    canonical_workspace, order_work, safe_id_filename, select_work_graph_page,
+    tools_call_response_len, AttemptState, AuthContext, AuthCredential, GraphScope,
+    IdempotencyScope, ManagedExecutionIntent, ManagedFinalizationOutcome,
+    ManagedFinalizationRecord, ManagedIntentState, ManagedRetryCause, OrchStore,
+    OrchestrationConfig, OrchestrationService, RunBounds, RunRecord, RunState, WorkDependency,
+    WorkItem, WorkPageFilter, WorkPageKind, WorkPageQuery, WorkPageReader, WorkPolicy,
+    WorkRequestBinding, WorkState, WorkspaceAllowlist, MANAGED_EXECUTION_SCHEMA_VERSION,
+    MANAGED_FINALIZATION_SCHEMA_VERSION, MAX_GRAPH_EDGES, MAX_GRAPH_SCOPE_ITEMS,
+    WORK_PAGE_TRANSPORT_CEILING_BYTES,
 };
 use grokptah_agent_bridge::{
-    set_grokptah_home_override, AgentHost, DurableWriteFault, HostConfig, HostRuntime, SessionKind,
-    DURABLE_WRITE_FAULT,
+    set_grokptah_home_override, start_control_server, AgentHost, DurableWriteFault, HostConfig,
+    HostRuntime, SessionKind, DURABLE_WRITE_FAULT,
 };
 use serde_json::{json, Value};
 use tempfile::TempDir;
@@ -1162,4 +1169,552 @@ fn full_item_and_edge_ceiling_graph_walk_is_lossless() {
         cursor = page.continuation;
     }
     panic!("graph walk failed to finish");
+}
+
+const RECONCILIATION_REQUIRED: &str = "ledger reconciliation is required";
+
+fn arm_durable_fault(needle: &'static str, skips_remaining: u32) {
+    *DURABLE_WRITE_FAULT
+        .lock()
+        .unwrap_or_else(|error| error.into_inner()) = Some(DurableWriteFault {
+        needle,
+        skips_remaining,
+    });
+}
+
+fn clear_durable_fault() {
+    *DURABLE_WRITE_FAULT
+        .lock()
+        .unwrap_or_else(|error| error.into_inner()) = None;
+}
+
+struct QuarantineFixture {
+    root: TempDir,
+    workspace: TempDir,
+    work_id: String,
+    intent_id: String,
+    settled_work_id: String,
+    journal: PathBuf,
+    journal_bytes: Vec<u8>,
+    settled_bytes: Vec<u8>,
+}
+
+fn plant_quarantine_fixture() -> QuarantineFixture {
+    let root = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let store = OrchStore::open(root.path()).unwrap();
+    let mut item = WorkItem::new(
+        "test",
+        "legacy reconciliation",
+        Uuid::new_v4(),
+        workspace.path().display().to_string(),
+        "operator",
+        WorkPolicy::default(),
+    )
+    .unwrap();
+    store.save_work_item(&item).unwrap();
+    item = store.load_work_item(&item.work_id).unwrap().unwrap();
+    assert_eq!(item.state, WorkState::Queued);
+    let now = chrono::Utc::now();
+    let intent_id = "legacy-intent".to_string();
+    store
+        .save_managed_intent(&ManagedExecutionIntent {
+            schema_version: MANAGED_EXECUTION_SCHEMA_VERSION,
+            intent_id: intent_id.clone(),
+            agent_id: "worker-a".into(),
+            agent_spec_revision: 1,
+            work_id: item.work_id.clone(),
+            work_revision: item.revision,
+            attempt_id: None,
+            run_id: None,
+            session_id: item.session_id,
+            workspace: item.workspace.clone(),
+            source_routine_id: None,
+            source_activation_id: None,
+            model_selection_key: "grok".into(),
+            bounds: RunBounds::default(),
+            execution_mode: Default::default(),
+            input_hash: "hash".into(),
+            grok: None,
+            state: ManagedIntentState::Claiming,
+            permission_request_id: None,
+            created_at: now,
+            updated_at: now,
+        })
+        .unwrap();
+    let mut settled = WorkItem::new(
+        "test",
+        "settled historical work",
+        item.session_id,
+        item.workspace.clone(),
+        "operator",
+        WorkPolicy::default(),
+    )
+    .unwrap();
+    settled.state = WorkState::Failed;
+    store.save_work_item(&settled).unwrap();
+    store
+        .save_managed_intent(&ManagedExecutionIntent {
+            schema_version: MANAGED_EXECUTION_SCHEMA_VERSION,
+            intent_id: "settled-intent".into(),
+            agent_id: "worker-a".into(),
+            agent_spec_revision: 1,
+            work_id: settled.work_id.clone(),
+            work_revision: settled.revision,
+            attempt_id: None,
+            run_id: None,
+            session_id: settled.session_id,
+            workspace: settled.workspace.clone(),
+            source_routine_id: None,
+            source_activation_id: None,
+            model_selection_key: "grok".into(),
+            bounds: RunBounds::default(),
+            execution_mode: Default::default(),
+            input_hash: "hash".into(),
+            grok: None,
+            state: ManagedIntentState::Finalized,
+            permission_request_id: None,
+            created_at: now,
+            updated_at: now,
+        })
+        .unwrap();
+    drop(store);
+    let unbound = ManagedFinalizationRecord {
+        schema_version: MANAGED_FINALIZATION_SCHEMA_VERSION,
+        intent_id: intent_id.clone(),
+        work_id: item.work_id.clone(),
+        attempt_id: None,
+        outcome: ManagedFinalizationOutcome::Failed,
+        attempt_state: AttemptState::Expired,
+        work_state: WorkState::Failed,
+        reason: "legacy unbound journal".into(),
+        result: None,
+        created_at: now,
+    };
+    let settled_record = ManagedFinalizationRecord {
+        schema_version: MANAGED_FINALIZATION_SCHEMA_VERSION,
+        intent_id: "settled-intent".into(),
+        work_id: settled.work_id.clone(),
+        attempt_id: None,
+        outcome: ManagedFinalizationOutcome::Failed,
+        attempt_state: AttemptState::Failed,
+        work_state: WorkState::Failed,
+        reason: "settled historical record".into(),
+        result: None,
+        created_at: now,
+    };
+    let journal_bytes = serde_json::to_vec(&unbound).unwrap();
+    let settled_bytes = serde_json::to_vec(&settled_record).unwrap();
+    let journal = write_finalization_journal(root.path(), &unbound.intent_id, &journal_bytes);
+    write_finalization_journal(root.path(), &settled_record.intent_id, &settled_bytes);
+    QuarantineFixture {
+        root,
+        workspace,
+        work_id: item.work_id,
+        intent_id,
+        settled_work_id: settled.work_id,
+        journal,
+        journal_bytes,
+        settled_bytes,
+    }
+}
+
+fn write_finalization_journal(root: &Path, intent_id: &str, bytes: &[u8]) -> PathBuf {
+    let path = root
+        .join("managed-finalization")
+        .join(format!("{}.json", safe_id_filename(intent_id).unwrap()));
+    std::fs::write(&path, bytes).unwrap();
+    path
+}
+
+fn quarantine_payloads(root: &Path) -> Vec<Vec<u8>> {
+    let dir = root.join("managed-finalization-quarantine");
+    if !dir.is_dir() {
+        return Vec::new();
+    }
+    let mut payloads = Vec::new();
+    for entry in std::fs::read_dir(dir).unwrap() {
+        let path = entry.unwrap().path();
+        if path.is_file() {
+            payloads.push(std::fs::read(path).unwrap());
+        }
+    }
+    payloads
+}
+
+fn assert_refusal_holds(root: &Path, fixture: &QuarantineFixture) {
+    for _ in 0..2 {
+        let store = OrchStore::open(root).unwrap();
+        assert_eq!(
+            store.ledger_admission_closed().as_deref(),
+            Some(RECONCILIATION_REQUIRED)
+        );
+        let payloads = quarantine_payloads(root);
+        assert!(
+            payloads.iter().any(|bytes| bytes == &fixture.journal_bytes),
+            "original journal bytes were not preserved"
+        );
+        assert!(
+            payloads.iter().all(|bytes| bytes != &fixture.settled_bytes),
+            "a settled historical journal was quarantined as unresolved"
+        );
+        assert!(!fixture.journal.exists());
+        assert_eq!(
+            store
+                .load_work_item(&fixture.work_id)
+                .unwrap()
+                .unwrap()
+                .state,
+            WorkState::Queued
+        );
+        assert_eq!(
+            store
+                .load_work_item(&fixture.settled_work_id)
+                .unwrap()
+                .unwrap()
+                .state,
+            WorkState::Failed
+        );
+        assert_eq!(
+            store
+                .load_managed_intent(&fixture.intent_id)
+                .unwrap()
+                .unwrap()
+                .state,
+            ManagedIntentState::Claiming
+        );
+        assert_eq!(
+            store
+                .load_managed_intent("settled-intent")
+                .unwrap()
+                .unwrap()
+                .state,
+            ManagedIntentState::Finalized
+        );
+        let claim = store
+            .claim_work(&fixture.work_id, "worker-a", None)
+            .unwrap_err();
+        assert_eq!(claim.message, RECONCILIATION_REQUIRED);
+        let sealed = store
+            .seal_queued_managed_work(&fixture.work_id, "must not seal", chrono::Utc::now())
+            .unwrap_err();
+        assert_eq!(sealed.message, RECONCILIATION_REQUIRED);
+        let closed = store
+            .close_managed_attempt(
+                &fixture.intent_id,
+                false,
+                ManagedRetryCause::Interrupted,
+                "must not close",
+                chrono::Utc::now(),
+            )
+            .unwrap_err();
+        assert_eq!(closed.message, RECONCILIATION_REQUIRED);
+        let finalized = store
+            .finalize_managed_intent(
+                &fixture.intent_id,
+                ManagedFinalizationOutcome::Failed,
+                "must not finalize",
+                None,
+                chrono::Utc::now(),
+            )
+            .unwrap_err();
+        assert_eq!(finalized.message, RECONCILIATION_REQUIRED);
+        assert_eq!(
+            store
+                .load_managed_intent(&fixture.intent_id)
+                .unwrap()
+                .unwrap()
+                .state,
+            ManagedIntentState::Claiming
+        );
+        drop(store);
+    }
+    assert!(root.join("ledger-reconciliation.json").is_file());
+}
+
+fn assert_honest_reconciliation_readiness(ledger: &Path, workspace: &Path) {
+    let _home = HomeGuard;
+    let mut env = ProcessEnvGuard::new();
+    env.set("GROKPTAH_AGENT_OFFLINE", "1");
+    let home = tempfile::tempdir().unwrap();
+    set_grokptah_home_override(Some(home.path().join(".grokptah")));
+    let host = AgentHost::create(HostConfig {
+        always_approve: true,
+        ..HostConfig::default()
+    })
+    .unwrap();
+    host.start().unwrap();
+    let store = OrchStore::open(ledger).unwrap();
+    let orch = OrchestrationService::new(
+        host.clone(),
+        host.event_bus(),
+        store,
+        OrchestrationConfig {
+            bearer_token: BEARER.into(),
+            allowlist: WorkspaceAllowlist::new([workspace.to_path_buf()]),
+            max_concurrent_runs: 2,
+            bounds: RunBounds::default(),
+        },
+    );
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let server = start_control_server(orch.clone(), 0).await.unwrap();
+        let client = reqwest::Client::new();
+        let url = format!("http://{}/ready", server.addr);
+        let authed = client.get(&url).bearer_auth(BEARER).send().await.unwrap();
+        assert_eq!(authed.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+        let body: Value = authed.json().await.unwrap();
+        assert_eq!(body["ready"], false);
+        assert_eq!(
+            body["capacity"]["health"]["ledgerAdmissionClosed"],
+            RECONCILIATION_REQUIRED
+        );
+        let open = client.get(&url).send().await.unwrap();
+        assert_eq!(open.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+        let open_body: Value = open.json().await.unwrap();
+        assert_eq!(open_body["ready"], false);
+        assert!(open_body.get("capacity").is_none());
+        assert!(!open_body.to_string().contains(RECONCILIATION_REQUIRED));
+        assert!(server.stop_and_wait().await.is_clean());
+        let stopped = orch.stop_background_tasks().await;
+        assert!(
+            stopped.fully_stopped && stopped.errors.is_empty(),
+            "{:?}",
+            stopped.errors
+        );
+        drop(orch);
+        let shutdown = host.shutdown().await;
+        assert!(shutdown.is_clean(), "{}", shutdown.operator_summary());
+    });
+    drop(host);
+}
+
+#[test]
+fn failed_quarantine_marker_must_not_reopen_admission() {
+    let fixture = plant_quarantine_fixture();
+    arm_durable_fault("ledger-reconciliation.json", 0);
+    let first = OrchStore::open(fixture.root.path());
+    clear_durable_fault();
+    let error = match first {
+        Err(error) => error,
+        Ok(_) => panic!("the marker write fault must execute"),
+    };
+    assert!(
+        error.to_string().contains("injected durable write failure"),
+        "{error}"
+    );
+    assert!(
+        fixture.journal.is_file(),
+        "a marker failure must leave the original journal in the recovery scan"
+    );
+    assert_eq!(
+        std::fs::read(&fixture.journal).unwrap(),
+        fixture.journal_bytes
+    );
+    assert!(!fixture
+        .root
+        .path()
+        .join("ledger-reconciliation.json")
+        .exists());
+    let reopened = OrchStore::open(fixture.root.path()).unwrap();
+    assert_eq!(
+        reopened.ledger_admission_closed().as_deref(),
+        Some(RECONCILIATION_REQUIRED)
+    );
+    drop(reopened);
+    assert_refusal_holds(fixture.root.path(), &fixture);
+    println!(
+        "Preserved quarantine records: {}; reopened admission state: {:?}",
+        quarantine_payloads(fixture.root.path()).len(),
+        Some(RECONCILIATION_REQUIRED)
+    );
+    assert_honest_reconciliation_readiness(fixture.root.path(), fixture.workspace.path());
+}
+
+#[test]
+fn failed_quarantine_move_must_keep_the_marker_and_the_journal() {
+    let fixture = plant_quarantine_fixture();
+    arm_durable_fault("managed-finalization-quarantine", 0);
+    let first = OrchStore::open(fixture.root.path());
+    clear_durable_fault();
+    let error = match first {
+        Err(error) => error,
+        Ok(_) => panic!("the evidence move fault must execute"),
+    };
+    assert!(
+        error.to_string().contains("injected durable write failure"),
+        "{error}"
+    );
+    assert_eq!(
+        std::fs::read(&fixture.journal).unwrap(),
+        fixture.journal_bytes
+    );
+    assert!(fixture
+        .root
+        .path()
+        .join("ledger-reconciliation.json")
+        .is_file());
+    let reopened = OrchStore::open(fixture.root.path()).unwrap();
+    assert_eq!(
+        reopened.ledger_admission_closed().as_deref(),
+        Some(RECONCILIATION_REQUIRED)
+    );
+    drop(reopened);
+    assert_refusal_holds(fixture.root.path(), &fixture);
+}
+
+#[test]
+fn failed_quarantine_directory_fsync_must_keep_moved_evidence() {
+    let fixture = plant_quarantine_fixture();
+    arm_durable_fault("managed-finalization-quarantine", 1);
+    let first = OrchStore::open(fixture.root.path());
+    clear_durable_fault();
+    let error = match first {
+        Err(error) => error,
+        Ok(_) => panic!("the directory durability fault must execute"),
+    };
+    assert!(
+        error.to_string().contains("injected durable write failure"),
+        "{error}"
+    );
+    assert!(
+        !fixture.journal.exists(),
+        "the rename completed before fsync failed"
+    );
+    let payloads = quarantine_payloads(fixture.root.path());
+    assert!(payloads.iter().any(|bytes| bytes == &fixture.journal_bytes));
+    assert!(fixture
+        .root
+        .path()
+        .join("ledger-reconciliation.json")
+        .is_file());
+    let reopened = OrchStore::open(fixture.root.path()).unwrap();
+    assert_eq!(
+        reopened.ledger_admission_closed().as_deref(),
+        Some(RECONCILIATION_REQUIRED)
+    );
+    drop(reopened);
+    assert_refusal_holds(fixture.root.path(), &fixture);
+}
+
+#[test]
+fn legacy_quarantine_without_marker_stays_refused() {
+    let fixture = plant_quarantine_fixture();
+    let dir = fixture.root.path().join("managed-finalization-quarantine");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::rename(
+        &fixture.journal,
+        dir.join("legacy-intent.json.unbound-legacy"),
+    )
+    .unwrap();
+    let garbage = dir.join("truncated.json");
+    std::fs::write(&garbage, b"{not-a-record").unwrap();
+    assert!(!fixture
+        .root
+        .path()
+        .join("ledger-reconciliation.json")
+        .exists());
+    let opened = OrchStore::open(fixture.root.path()).unwrap();
+    assert_eq!(
+        opened.ledger_admission_closed().as_deref(),
+        Some(RECONCILIATION_REQUIRED)
+    );
+    drop(opened);
+    assert_eq!(
+        std::fs::read(dir.join("legacy-intent.json.unbound-legacy")).unwrap(),
+        fixture.journal_bytes
+    );
+    assert_eq!(std::fs::read(&garbage).unwrap(), b"{not-a-record");
+    assert!(fixture
+        .root
+        .path()
+        .join("ledger-reconciliation.json")
+        .is_file());
+    assert_refusal_holds(fixture.root.path(), &fixture);
+    assert_eq!(std::fs::read(&garbage).unwrap(), b"{not-a-record");
+}
+
+#[test]
+fn quarantine_crash_child() {
+    let Ok(root) = std::env::var("REVIEW584_QUARANTINE_ROOT") else {
+        return;
+    };
+    match OrchStore::open(root) {
+        Err(error) => panic!("quarantine crash point did not execute: {error:#}"),
+        Ok(_) => panic!("quarantine crash point did not execute"),
+    }
+}
+
+#[test]
+fn quarantine_process_cuts_preserve_evidence_and_refusal() {
+    for stage in [
+        "quarantine_before_marker",
+        "quarantine_after_marker",
+        "quarantine_after_move",
+    ] {
+        let fixture = plant_quarantine_fixture();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("quarantine_crash_child")
+            .arg("--nocapture")
+            .env("REVIEW584_QUARANTINE_ROOT", fixture.root.path())
+            .env("GROKPTAH_CRASH_STAGE", stage)
+            .env_remove("REVIEW584_CHILD_ROOT")
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(86),
+            "{stage} child stdout/stderr: {} / {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        match stage {
+            "quarantine_before_marker" => {
+                assert_eq!(
+                    std::fs::read(&fixture.journal).unwrap(),
+                    fixture.journal_bytes
+                );
+                assert!(!fixture
+                    .root
+                    .path()
+                    .join("ledger-reconciliation.json")
+                    .exists());
+            }
+            "quarantine_after_marker" => {
+                assert_eq!(
+                    std::fs::read(&fixture.journal).unwrap(),
+                    fixture.journal_bytes
+                );
+                assert!(fixture
+                    .root
+                    .path()
+                    .join("ledger-reconciliation.json")
+                    .is_file());
+            }
+            "quarantine_after_move" => {
+                assert!(!fixture.journal.exists());
+                assert!(quarantine_payloads(fixture.root.path())
+                    .iter()
+                    .any(|bytes| bytes == &fixture.journal_bytes));
+                assert!(fixture
+                    .root
+                    .path()
+                    .join("ledger-reconciliation.json")
+                    .is_file());
+            }
+            _ => unreachable!(),
+        }
+        let reopened = OrchStore::open(fixture.root.path()).unwrap();
+        assert_eq!(
+            reopened.ledger_admission_closed().as_deref(),
+            Some(RECONCILIATION_REQUIRED)
+        );
+        drop(reopened);
+        assert_refusal_holds(fixture.root.path(), &fixture);
+        println!("{stage}: evidence preserved and admission refused");
+    }
 }
