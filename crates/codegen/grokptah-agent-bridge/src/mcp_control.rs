@@ -1598,6 +1598,12 @@ struct WorkDetailArgs {
     offset: usize,
     #[serde(default)]
     limit: Option<usize>,
+    /// Required for `attempt_detail`, `attempt_evidence`, and `attempt_artifacts`.
+    #[serde(default)]
+    attempt_id: Option<String>,
+    /// Attempt list fence, or one attempt's content fence. Required once `offset` is past zero.
+    #[serde(default)]
+    consistency_fence: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2579,9 +2585,11 @@ fn tool_input_schema(name: &str) -> Value {
                 "session_id": session,
                 "workspace": workspace,
                 "work_id": run_id,
-                "section": {"type": "string", "enum": ["summary", "objective", "progress", "result", "attempts", "policy", "dependencies"]},
+                "section": {"type": "string", "enum": ["summary", "objective", "progress", "result", "attempts", "policy", "dependencies", "attempt_detail", "attempt_evidence", "attempt_artifacts"]},
                 "offset": {"type": "integer", "minimum": 0},
-                "limit": {"type": "integer", "minimum": 1, "maximum": MAX_WORK_DETAIL_LIMIT}
+                "limit": {"type": "integer", "minimum": 1, "maximum": MAX_WORK_DETAIL_LIMIT},
+                "attempt_id": {"type": "string", "minLength": 1, "maxLength": 256},
+                "consistency_fence": {"type": "string", "minLength": 64, "maxLength": 64}
             }
         }),
         "ptah_create_work" => json!({
@@ -3545,6 +3553,8 @@ async fn dispatch_tool(
                 section,
                 args.offset,
                 args.limit,
+                args.attempt_id.as_deref(),
+                args.consistency_fence.as_deref(),
             )
         }
         "ptah_create_work" => {

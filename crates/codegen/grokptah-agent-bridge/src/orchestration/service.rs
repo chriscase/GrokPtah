@@ -4447,24 +4447,27 @@ impl OrchestrationService {
         section: WorkDetailSection,
         offset: usize,
         limit: Option<usize>,
+        attempt_id: Option<&str>,
+        consistency_fence: Option<&str>,
     ) -> Result<serde_json::Value, OrchError> {
         let (item, _) = self.load_work_scoped(session_id, workspace, work_id, true)?;
         let attempts = self
             .store
             .list_work_attempts(Some(&item.work_id))
             .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
-        let attempts_json = attempts
+        let views = attempts
             .iter()
-            .map(|attempt| serde_json::to_value(WorkAttemptView::from(attempt)))
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+            .map(WorkAttemptView::from)
+            .collect::<Vec<_>>();
         let page = project_work_detail(
             &item,
-            &attempts_json,
+            &views,
             section,
             offset,
             limit.unwrap_or(DEFAULT_WORK_DETAIL_LIMIT),
             WORK_PAGE_TRANSPORT_CEILING_BYTES,
+            attempt_id,
+            consistency_fence,
         )?;
         serde_json::to_value(page)
             .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))

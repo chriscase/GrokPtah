@@ -1160,9 +1160,12 @@ impl RemoteServiceClient {
 
     /// Assemble one authorized snapshot from `ptah_get_work_detail` after
     /// `ptah_get_work` refuses the 2 MiB ceiling. Scalar sections are read
-    /// once. Collections follow `nextOffset` until `complete`. A page that
-    /// does not advance, a revision that changes mid-read, or a single
-    /// element that still does not fit is a refusal, not a truncated item.
+    /// once. Collections follow `nextOffset` until `complete`. Attempt
+    /// summaries omit evidence and artifacts; those collections are read from
+    /// `attempt_evidence` and `attempt_artifacts` under the summary fence.
+    /// A page that does not advance, a revision or attempt fence that changes
+    /// mid-read, or a single element that still does not fit is a refusal,
+    /// not a truncated item.
     async fn read_work_through_detail(
         &mut self,
         session_id: Uuid,
@@ -1200,10 +1203,8 @@ impl RemoteServiceClient {
         let (result_meta, evidence, artifacts) = self
             .collect_detail_result(session_id, workspace, work_id, revision)
             .await?;
-        let attempt_values = self
-            .collect_detail_array(
-                session_id, workspace, work_id, "attempts", "attempts", revision,
-            )
+        let attempts = self
+            .collect_attempt_views(session_id, workspace, work_id, revision)
             .await?;
         let result = assemble_detail_result(&result_meta, evidence, artifacts)?;
         let work = serde_json::from_value(json!({
@@ -1239,8 +1240,6 @@ impl RemoteServiceClient {
             "updatedAt": summary.body["updatedAt"],
         }))
         .context("decode remote work detail snapshot")?;
-        let attempts = serde_json::from_value(Value::Array(attempt_values))
-            .context("decode remote work detail attempts")?;
         Ok(RemoteWorkSnapshot { work, attempts })
     }
 
@@ -1252,7 +1251,7 @@ impl RemoteServiceClient {
         section: &str,
     ) -> Result<grokptah_agent_bridge::orchestration::WorkDetailPageV1> {
         let page = self
-            .read_detail_page(session_id, workspace, work_id, section, 0, 1)
+            .read_detail_page(session_id, workspace, work_id, section, 0, 1, None, None)
             .await?;
         if page.work_id != work_id || !page.complete {
             bail!("work detail section {section} was not a complete page");
@@ -1280,6 +1279,8 @@ impl RemoteServiceClient {
                     section,
                     offset,
                     grokptah_agent_bridge::orchestration::MAX_WORK_DETAIL_LIMIT,
+                    None,
+                    None,
                 )
                 .await?;
             if page.work_id != work_id || page.revision != revision {
@@ -1328,6 +1329,8 @@ impl RemoteServiceClient {
                     "result",
                     offset,
                     grokptah_agent_bridge::orchestration::MAX_WORK_DETAIL_LIMIT,
+                    None,
+                    None,
                 )
                 .await?;
             if page.work_id != work_id || page.revision != revision {
@@ -1367,6 +1370,7 @@ impl RemoteServiceClient {
         bail!("work detail page walk did not finish")
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn read_detail_page(
         &mut self,
         session_id: Uuid,
@@ -1375,21 +1379,166 @@ impl RemoteServiceClient {
         section: &str,
         offset: usize,
         limit: usize,
+        attempt_id: Option<&str>,
+        consistency_fence: Option<&str>,
     ) -> Result<grokptah_agent_bridge::orchestration::WorkDetailPageV1> {
-        let value = self
-            .call_tool(
-                "ptah_get_work_detail",
-                json!({
-                    "session_id": session_id,
-                    "workspace": workspace,
-                    "work_id": work_id,
-                    "section": section,
-                    "offset": offset,
-                    "limit": limit,
-                }),
+        let mut arguments = json!({
+            "session_id": session_id,
+            "workspace": workspace,
+            "work_id": work_id,
+            "section": section,
+            "offset": offset,
+            "limit": limit,
+        });
+        if let Some(attempt_id) = attempt_id {
+            arguments["attempt_id"] = json!(attempt_id);
+        }
+        if let Some(consistency_fence) = consistency_fence {
+            arguments["consistency_fence"] = json!(consistency_fence);
+        }
+        let value = self.call_tool("ptah_get_work_detail", arguments).await?;
+        serde_json::from_value(value).context("decode remote work detail page")
+    }
+
+    /// Attempts list, then each attempt's detail, evidence, and artifacts.
+    /// The content fence from the summary is sent on every nested page, so a
+    /// heartbeat or run link that does not bump the Work revision still
+    /// refuses the read instead of mixing two attempt snapshots.
+    async fn collect_attempt_views(
+        &mut self,
+        session_id: Uuid,
+        workspace: &str,
+        work_id: &str,
+        revision: u64,
+    ) -> Result<Vec<WorkAttemptView>> {
+        let summaries = self
+            .collect_fenced_array(
+                session_id, workspace, work_id, "attempts", "attempts", revision, None, None,
             )
             .await?;
-        serde_json::from_value(value).context("decode remote work detail page")
+        let mut views = Vec::with_capacity(summaries.len());
+        for summary in summaries {
+            let attempt_id = summary
+                .get("attemptId")
+                .and_then(Value::as_str)
+                .ok_or_else(|| anyhow!("attempt summary omitted its id"))?
+                .to_string();
+            let fence = summary
+                .get("fence")
+                .and_then(Value::as_str)
+                .ok_or_else(|| anyhow!("attempt summary omitted its consistency fence"))?
+                .to_string();
+            let detail = self
+                .read_detail_page(
+                    session_id,
+                    workspace,
+                    work_id,
+                    "attempt_detail",
+                    0,
+                    1,
+                    Some(&attempt_id),
+                    Some(&fence),
+                )
+                .await?;
+            if detail.work_id != work_id
+                || detail.revision != revision
+                || detail.attempt_id.as_deref() != Some(attempt_id.as_str())
+                || detail.consistency_fence.as_deref() != Some(fence.as_str())
+                || !detail.complete
+            {
+                bail!("attempt detail fence changed during the read");
+            }
+            let evidence = self
+                .collect_fenced_array(
+                    session_id,
+                    workspace,
+                    work_id,
+                    "attempt_evidence",
+                    "evidence",
+                    revision,
+                    Some(&attempt_id),
+                    Some(&fence),
+                )
+                .await?;
+            let artifacts = self
+                .collect_fenced_array(
+                    session_id,
+                    workspace,
+                    work_id,
+                    "attempt_artifacts",
+                    "artifacts",
+                    revision,
+                    Some(&attempt_id),
+                    Some(&fence),
+                )
+                .await?;
+            views.push(assemble_attempt_view(&detail.body, evidence, artifacts)?);
+        }
+        Ok(views)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn collect_fenced_array(
+        &mut self,
+        session_id: Uuid,
+        workspace: &str,
+        work_id: &str,
+        section: &str,
+        field: &str,
+        revision: u64,
+        attempt_id: Option<&str>,
+        consistency_fence: Option<&str>,
+    ) -> Result<Vec<Value>> {
+        let mut offset = 0usize;
+        let mut collected = Vec::new();
+        let mut expected_fence = consistency_fence.map(str::to_string);
+        for _ in 0..1024 {
+            let page = self
+                .read_detail_page(
+                    session_id,
+                    workspace,
+                    work_id,
+                    section,
+                    offset,
+                    grokptah_agent_bridge::orchestration::MAX_WORK_DETAIL_LIMIT,
+                    attempt_id,
+                    expected_fence.as_deref(),
+                )
+                .await?;
+            if page.work_id != work_id || page.revision != revision {
+                bail!("work detail revision changed during the read");
+            }
+            if let Some(attempt_id) = attempt_id {
+                if page.attempt_id.as_deref() != Some(attempt_id) {
+                    bail!("attempt detail identity changed during the read");
+                }
+            }
+            match (expected_fence.as_deref(), page.consistency_fence.as_deref()) {
+                (None, Some(fence)) => expected_fence = Some(fence.to_string()),
+                (Some(expected), Some(actual)) if expected == actual => {}
+                _ => bail!("attempt consistency fence changed during the read"),
+            }
+            let batch = page
+                .body
+                .get(field)
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            if page.complete {
+                collected.extend(batch);
+                return Ok(collected);
+            }
+            if batch.is_empty() {
+                bail!("work detail page did not include data");
+            }
+            let next = page
+                .next_offset
+                .filter(|next| *next > offset)
+                .ok_or_else(|| anyhow!("work detail page did not advance"))?;
+            collected.extend(batch);
+            offset = next;
+        }
+        bail!("work detail page walk did not finish")
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2029,6 +2178,47 @@ fn normalize_base_url(value: &str) -> Result<String> {
     Ok(value.trim().trim_end_matches('/').to_string())
 }
 
+fn assemble_attempt_view(
+    body: &Value,
+    evidence: Vec<Value>,
+    artifacts: Vec<Value>,
+) -> Result<WorkAttemptView> {
+    let mut attempt = body
+        .get("attempt")
+        .cloned()
+        .ok_or_else(|| anyhow!("attempt detail omitted the attempt"))?;
+    let evidence_count = attempt
+        .pointer("/result/evidenceCount")
+        .and_then(Value::as_u64)
+        .unwrap_or(0) as usize;
+    let artifact_count = attempt
+        .pointer("/result/artifactCount")
+        .and_then(Value::as_u64)
+        .unwrap_or(0) as usize;
+    if evidence.len() != evidence_count || artifacts.len() != artifact_count {
+        bail!("attempt detail collections did not match the summary counts");
+    }
+    if let Some(result) = attempt.get_mut("result") {
+        if result.is_null() {
+            if !evidence.is_empty() || !artifacts.is_empty() {
+                bail!("attempt detail returned collections for an empty result");
+            }
+        } else {
+            let object = result
+                .as_object_mut()
+                .ok_or_else(|| anyhow!("attempt result metadata was not an object"))?;
+            object.remove("evidenceCount");
+            object.remove("artifactCount");
+            object.insert("evidence".into(), Value::Array(evidence));
+            object.insert("artifacts".into(), Value::Array(artifacts));
+        }
+    }
+    if let Some(object) = attempt.as_object_mut() {
+        object.remove("fence");
+    }
+    serde_json::from_value(attempt).context("decode remote attempt detail")
+}
+
 fn assemble_detail_result(
     meta: &Value,
     evidence: Vec<Value>,
@@ -2128,9 +2318,10 @@ mod tests {
         should_reconnect_remote_error, RemoteServiceClient, RemoteServiceState,
     };
     use grokptah_agent_bridge::orchestration::{
-        canonical_workspace, safe_id_filename, CoordinatorAgentView, CoordinatorResumePlanView,
-        WorkApproval, WorkArtifactRef, WorkAttempt, WorkDependency, WorkItem, WorkPolicy,
-        WorkProgress, WorkResult, WorkState, MAX_WORK_ARTIFACTS, MAX_WORK_ARTIFACT_BYTES,
+        canonical_workspace, safe_id_filename, AttemptState, CoordinatorAgentView,
+        CoordinatorResumePlanView, WorkApproval, WorkArtifactRef, WorkAttempt, WorkDependency,
+        WorkItem, WorkPolicy, WorkProgress, WorkResult, WorkState, MAX_WORK_ARTIFACTS,
+        MAX_WORK_ARTIFACT_BYTES,
     };
 
     #[test]
@@ -2734,7 +2925,28 @@ mod tests {
             candidate_verification: None,
         });
         store.save_work_item_unchecked(&item).unwrap();
-        let attempt = WorkAttempt::new("fat-item", 1, "worker-1", "LEASE_NEEDLE_DO_NOT_LEAK");
+        let mut attempt = WorkAttempt::new("fat-item", 1, "worker-1", "LEASE_NEEDLE_DO_NOT_LEAK");
+        attempt.state = AttemptState::Failed;
+        attempt.terminal_reason = Some("attempt failed".into());
+        attempt.result = Some(WorkResult {
+            summary: "attempt result".into(),
+            evidence: vec![heavy.clone(); MAX_WORK_ARTIFACTS],
+            artifacts: (0..MAX_WORK_ARTIFACTS)
+                .map(|index| WorkArtifactRef {
+                    artifact_id: format!("b{index:04}"),
+                    kind: heavy.clone(),
+                    label: heavy.clone(),
+                    digest: Some(heavy.clone()),
+                    retained_until: None,
+                })
+                .collect(),
+            failure: Some("attempt failed".into()),
+            cancellation_reason: None,
+            completed_at: now,
+            verification: None,
+            candidate_verification: None,
+        });
+        attempt.validate().unwrap();
         let attempt_name = safe_id_filename(&attempt.attempt_id).unwrap();
         let attempt_dir = store.root().join("work-attempts");
         std::fs::create_dir_all(&attempt_dir).unwrap();
@@ -2798,6 +3010,34 @@ mod tests {
         assert_eq!(snapshot.attempts.len(), 1);
         assert_eq!(snapshot.attempts[0].claimant_id, "worker-1");
         assert_eq!(snapshot.attempts[0].attempt_number, 1);
+        let attempt_result = snapshot.attempts[0]
+            .result
+            .as_ref()
+            .expect("attempt result");
+        assert_eq!(attempt_result.summary, "attempt result");
+        assert_eq!(attempt_result.failure.as_deref(), Some("attempt failed"));
+        assert_eq!(attempt_result.evidence.len(), MAX_WORK_ARTIFACTS);
+        assert_eq!(attempt_result.artifacts.len(), MAX_WORK_ARTIFACTS);
+        assert_eq!(attempt_result.evidence[0], heavy);
+        assert_eq!(
+            attempt_result.evidence.last().map(String::as_str),
+            Some(heavy.as_str())
+        );
+        assert_eq!(attempt_result.artifacts[0].artifact_id, "b0000");
+        assert_eq!(attempt_result.artifacts[0].kind, heavy);
+        assert_eq!(attempt_result.artifacts[0].label, heavy);
+        assert_eq!(
+            attempt_result.artifacts[0].digest.as_deref(),
+            Some(heavy.as_str())
+        );
+        let last_artifact_id = format!("b{:04}", MAX_WORK_ARTIFACTS - 1);
+        assert_eq!(
+            attempt_result
+                .artifacts
+                .last()
+                .map(|artifact| artifact.artifact_id.as_str()),
+            Some(last_artifact_id.as_str())
+        );
         let rendered = serde_json::to_string(&snapshot).unwrap();
         assert!(
             !rendered.contains("LEASE_NEEDLE_DO_NOT_LEAK"),

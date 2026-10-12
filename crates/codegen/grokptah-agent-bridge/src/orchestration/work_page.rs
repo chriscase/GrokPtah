@@ -21,6 +21,19 @@
 //! counts. Objective text, progress, policy, dependencies, result bodies, and
 //! attempt records stay in their own sections. Leases stay out of every
 //! section. Graph nodes stay redacted.
+//!
+//! Attempt inspection is nested. The `attempts` section pages summaries that
+//! omit evidence strings and artifact records. `attempt_detail` returns one
+//! attempt's public scalars and result metadata. `attempt_evidence` and
+//! `attempt_artifacts` page those collections. Each nested page is bound to
+//! the attempt id and an `attempt_fence`: the SHA-256 of the public attempt
+//! view, which changes when a heartbeat, lease renewal, or run link updates
+//! the attempt even if the Work item revision does not. The `attempts` page
+//! itself carries a list fence over `(attempt id, attempt fence)` in list
+//! order. Offset zero may omit the fence and receives the current one. Any
+//! later page, or offset zero that presents a different fence, returns
+//! `restart_required` and no elements. Schema version stays 1. The new page
+//! fields are optional on decode.
 
 use std::collections::BTreeMap;
 
@@ -32,7 +45,7 @@ use uuid::Uuid;
 
 use super::graph::{project_scoped_graph, GraphScope, WorkGraphNode};
 use super::types::{hash_payload, OrchError, OrchErrorCode};
-use super::workload::{AssignmentStatus, WorkItem, WorkState};
+use super::workload::{AssignmentStatus, WorkArtifactRef, WorkAttemptView, WorkItem, WorkState};
 
 pub const WORK_PAGE_SCHEMA_VERSION: u32 = 1;
 pub const WORK_LIST_PAGE_KIND: &str = "grokptah.work.page.v1";
@@ -40,6 +53,8 @@ pub const WORK_GRAPH_PAGE_KIND: &str = "grokptah.work.graph-page.v1";
 pub const WORK_DETAIL_KIND: &str = "grokptah.work.detail.v1";
 pub const WORK_PAGE_ORDER_V1: &str = "priority_desc_created_at_asc_work_id_asc";
 pub const WORK_PAGE_CONSISTENCY: &str = "version_fence";
+/// Attempt pages use this fence mode. It is not the work-item revision.
+pub const ATTEMPT_CONSISTENCY: &str = "attempt_fence";
 pub const DEFAULT_WORK_PAGE_LIMIT: usize = 50;
 pub const MAX_WORK_PAGE_LIMIT: usize = 200;
 /// Soft target. A single legal entry may exceed it when that entry still fits
@@ -172,6 +187,13 @@ pub enum WorkDetailSection {
     Attempts,
     Policy,
     Dependencies,
+    /// One attempt's public scalars and result metadata, without evidence or
+    /// artifact collections.
+    AttemptDetail,
+    /// Evidence strings for one attempt. Offset is an index into that array.
+    AttemptEvidence,
+    /// Artifact records for one attempt. Offset is an index into that array.
+    AttemptArtifacts,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -187,6 +209,14 @@ pub struct WorkDetailPageV1 {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next_offset: Option<usize>,
     pub body: Value,
+    /// Set on attempt sections. Nested pages name the attempt. The attempts
+    /// list leaves this empty because the page covers every summary in order.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attempt_id: Option<String>,
+    /// List fence on `attempts`. Content fence on the nested attempt sections.
+    /// Absent on work-item sections, which remain bound to `revision`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub consistency_fence: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -899,22 +929,439 @@ fn detail_result_body(
     })
 }
 
-/// Bounded section of one authorized work item. Collections page by offset.
-/// A section that cannot fit even one element returns `capacity_exhausted`
-/// rather than a truncated element.
-pub fn project_work_detail(
+/// SHA-256 of the public attempt view. Heartbeat, renewal, run link, progress,
+/// and result changes move this digest without a Work item revision bump.
+/// The view has no lease token or lease-token hash.
+pub fn attempt_content_fence(view: &WorkAttemptView) -> String {
+    hash_payload(&serde_json::to_value(view).unwrap_or(Value::Null))
+}
+
+/// SHA-256 of `attempt_id`, tab, content fence, newline, in list order.
+pub fn attempt_list_fence(attempts: &[WorkAttemptView]) -> String {
+    let mut lines = String::new();
+    for attempt in attempts {
+        lines.push_str(&attempt.attempt_id);
+        lines.push('\t');
+        lines.push_str(&attempt_content_fence(attempt));
+        lines.push('\n');
+    }
+    hash_payload(&Value::String(lines))
+}
+
+fn attempt_summary(view: &WorkAttemptView) -> Value {
+    let result = view.result.as_ref().map(|stored| {
+        json!({
+            "summary": stored.summary,
+            "failure": stored.failure,
+            "cancellationReason": stored.cancellation_reason,
+            "completedAt": stored.completed_at,
+            "verification": stored.verification,
+            "candidateVerification": stored.candidate_verification,
+            "evidenceCount": stored.evidence.len(),
+            "artifactCount": stored.artifacts.len(),
+        })
+    });
+    json!({
+        "schemaVersion": view.schema_version,
+        "attemptId": view.attempt_id,
+        "workId": view.work_id,
+        "attemptNumber": view.attempt_number,
+        "claimantId": view.claimant_id,
+        "acquiredAt": view.acquired_at,
+        "leaseExpiresAt": view.lease_expires_at,
+        "lastHeartbeatAt": view.last_heartbeat_at,
+        "state": view.state,
+        "linkedRunIds": view.linked_run_ids,
+        "progress": view.progress,
+        "result": result,
+        "terminalReason": view.terminal_reason,
+        "createdAt": view.created_at,
+        "updatedAt": view.updated_at,
+        "fence": attempt_content_fence(view),
+    })
+}
+
+fn valid_attempt_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 256
+        && !value.contains("..")
+        && !value.contains('/')
+        && !value.contains('\\')
+        && !value.contains('\0')
+}
+
+fn unknown_attempt() -> OrchError {
+    OrchError::new(OrchErrorCode::InvalidRequest, "unknown attempt_id")
+}
+
+fn past_end() -> OrchError {
+    OrchError::new(
+        OrchErrorCode::InvalidRequest,
+        "detail offset is past the end of the collection",
+    )
+}
+
+fn capacity_exhausted() -> OrchError {
+    OrchError::new(
+        OrchErrorCode::CapacityExhausted,
+        "a single work detail element exceeds the transport ceiling",
+    )
+}
+
+fn normalize_attempt_fence(fence: Option<&str>) -> Result<Option<&str>, OrchError> {
+    let Some(fence) = fence.filter(|fence| !fence.is_empty()) else {
+        return Ok(None);
+    };
+    let lowercase_hex = fence.len() == 64
+        && fence
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase());
+    if !lowercase_hex {
+        return Err(OrchError::new(
+            OrchErrorCode::InvalidRequest,
+            "attempt consistency fence is not valid",
+        ));
+    }
+    Ok(Some(fence))
+}
+
+fn accept_attempt_fence(
+    current: &str,
+    requested: Option<&str>,
+    offset: usize,
+) -> Result<(), OrchError> {
+    match requested {
+        Some(fence) if fence == current => Ok(()),
+        Some(_) => Err(restart(
+            "attempt consistency fence changed; restart the attempt traversal",
+        )),
+        None if offset == 0 => Ok(()),
+        None => Err(restart(
+            "attempt continuation requires the consistency fence from the first page",
+        )),
+    }
+}
+
+fn require_attempt<'a>(
+    attempts: &'a [WorkAttemptView],
+    attempt_id: &str,
+) -> Result<&'a WorkAttemptView, OrchError> {
+    if !valid_attempt_id(attempt_id) {
+        return Err(unknown_attempt());
+    }
+    attempts
+        .iter()
+        .find(|attempt| attempt.attempt_id == attempt_id)
+        .ok_or_else(unknown_attempt)
+}
+
+struct AttemptProjection {
+    body: Value,
+    next_offset: Option<usize>,
+    complete: bool,
+    attempt_id: Option<String>,
+    consistency_fence: String,
+}
+
+fn page_over_budget(page: &WorkDetailPageV1, max_response_bytes: usize) -> bool {
+    serde_json::to_value(page)
+        .map(|value| tools_call_response_len(&value) > max_response_bytes)
+        .unwrap_or(true)
+}
+
+fn project_attempt_list(
     item: &WorkItem,
-    attempts_json: &[Value],
+    attempts: &[WorkAttemptView],
+    offset: usize,
+    limit: usize,
+    max_response_bytes: usize,
+    requested_fence: Option<&str>,
+) -> Result<AttemptProjection, OrchError> {
+    let fence = attempt_list_fence(attempts);
+    accept_attempt_fence(&fence, requested_fence, offset)?;
+    if offset > attempts.len() {
+        return Err(past_end());
+    }
+    let mut index = offset;
+    let mut taken = Vec::new();
+    while index < attempts.len() && taken.len() < limit {
+        taken.push(attempt_summary(&attempts[index]));
+        index += 1;
+        let complete = index == attempts.len();
+        let trial = WorkDetailPageV1 {
+            schema_version: WORK_PAGE_SCHEMA_VERSION,
+            kind: WORK_DETAIL_KIND.to_string(),
+            work_id: item.work_id.clone(),
+            revision: item.revision,
+            section: WorkDetailSection::Attempts,
+            offset,
+            complete,
+            next_offset: (!complete).then_some(index),
+            body: json!({
+                "attempts": taken,
+                "consistency": ATTEMPT_CONSISTENCY,
+            }),
+            attempt_id: None,
+            consistency_fence: Some(fence.clone()),
+        };
+        if page_over_budget(&trial, max_response_bytes) {
+            if taken.len() == 1 {
+                return Err(capacity_exhausted());
+            }
+            taken.pop();
+            index -= 1;
+            break;
+        }
+    }
+    let complete = index >= attempts.len();
+    Ok(AttemptProjection {
+        body: json!({
+            "attempts": taken,
+            "consistency": ATTEMPT_CONSISTENCY,
+        }),
+        next_offset: (!complete).then_some(index),
+        complete,
+        attempt_id: None,
+        consistency_fence: fence,
+    })
+}
+
+fn project_attempt_detail(
+    item: &WorkItem,
+    attempt: &WorkAttemptView,
+    offset: usize,
+    max_response_bytes: usize,
+    requested_fence: Option<&str>,
+) -> Result<AttemptProjection, OrchError> {
+    if offset != 0 {
+        return Err(OrchError::new(
+            OrchErrorCode::InvalidRequest,
+            "attempt detail does not accept an offset",
+        ));
+    }
+    let fence = attempt_content_fence(attempt);
+    accept_attempt_fence(&fence, requested_fence, 0)?;
+    let body = json!({ "attempt": attempt_summary(attempt) });
+    let trial = WorkDetailPageV1 {
+        schema_version: WORK_PAGE_SCHEMA_VERSION,
+        kind: WORK_DETAIL_KIND.to_string(),
+        work_id: item.work_id.clone(),
+        revision: item.revision,
+        section: WorkDetailSection::AttemptDetail,
+        offset: 0,
+        complete: true,
+        next_offset: None,
+        body: body.clone(),
+        attempt_id: Some(attempt.attempt_id.clone()),
+        consistency_fence: Some(fence.clone()),
+    };
+    if page_over_budget(&trial, max_response_bytes) {
+        return Err(capacity_exhausted());
+    }
+    Ok(AttemptProjection {
+        body,
+        next_offset: None,
+        complete: true,
+        attempt_id: Some(attempt.attempt_id.clone()),
+        consistency_fence: fence,
+    })
+}
+
+fn project_attempt_collection(
+    item: &WorkItem,
+    attempt: &WorkAttemptView,
     section: WorkDetailSection,
     offset: usize,
     limit: usize,
     max_response_bytes: usize,
+    requested_fence: Option<&str>,
+) -> Result<AttemptProjection, OrchError> {
+    let fence = attempt_content_fence(attempt);
+    accept_attempt_fence(&fence, requested_fence, offset)?;
+    let evidence = attempt
+        .result
+        .as_ref()
+        .map(|result| result.evidence.as_slice())
+        .unwrap_or(&[]);
+    let artifacts = attempt
+        .result
+        .as_ref()
+        .map(|result| result.artifacts.as_slice())
+        .unwrap_or(&[]);
+    let total = match section {
+        WorkDetailSection::AttemptEvidence => evidence.len(),
+        WorkDetailSection::AttemptArtifacts => artifacts.len(),
+        _ => unreachable!("attempt collection section"),
+    };
+    if offset > total {
+        return Err(past_end());
+    }
+    let mut index = offset;
+    let mut taken_evidence: Vec<&str> = Vec::new();
+    let mut taken_artifacts: Vec<&WorkArtifactRef> = Vec::new();
+    let mut count = 0usize;
+    while index < total && count < limit {
+        match section {
+            WorkDetailSection::AttemptEvidence => taken_evidence.push(evidence[index].as_str()),
+            WorkDetailSection::AttemptArtifacts => taken_artifacts.push(&artifacts[index]),
+            _ => unreachable!("attempt collection section"),
+        }
+        index += 1;
+        count += 1;
+        let complete = index == total;
+        let trial = WorkDetailPageV1 {
+            schema_version: WORK_PAGE_SCHEMA_VERSION,
+            kind: WORK_DETAIL_KIND.to_string(),
+            work_id: item.work_id.clone(),
+            revision: item.revision,
+            section,
+            offset,
+            complete,
+            next_offset: (!complete).then_some(index),
+            body: attempt_collection_body(section, &taken_evidence, &taken_artifacts),
+            attempt_id: Some(attempt.attempt_id.clone()),
+            consistency_fence: Some(fence.clone()),
+        };
+        if page_over_budget(&trial, max_response_bytes) {
+            if count == 1 {
+                return Err(capacity_exhausted());
+            }
+            index -= 1;
+            match section {
+                WorkDetailSection::AttemptEvidence => {
+                    taken_evidence.pop();
+                }
+                WorkDetailSection::AttemptArtifacts => {
+                    taken_artifacts.pop();
+                }
+                _ => unreachable!("attempt collection section"),
+            }
+            break;
+        }
+    }
+    let complete = index >= total;
+    Ok(AttemptProjection {
+        body: attempt_collection_body(section, &taken_evidence, &taken_artifacts),
+        next_offset: (!complete).then_some(index),
+        complete,
+        attempt_id: Some(attempt.attempt_id.clone()),
+        consistency_fence: fence,
+    })
+}
+
+fn attempt_collection_body(
+    section: WorkDetailSection,
+    evidence: &[&str],
+    artifacts: &[&WorkArtifactRef],
+) -> Value {
+    match section {
+        WorkDetailSection::AttemptEvidence => json!({ "evidence": evidence }),
+        WorkDetailSection::AttemptArtifacts => json!({ "artifacts": artifacts }),
+        _ => unreachable!("attempt collection section"),
+    }
+}
+
+/// Bounded section of one authorized work item. Collections page by offset.
+/// A section that cannot fit even one element returns `capacity_exhausted`
+/// rather than a truncated element.
+///
+/// `attempt_id` and `consistency_fence` are required only for the nested
+/// attempt sections. The attempts list accepts a fence and rejects an attempt
+/// id. Work-item sections reject both.
+#[allow(clippy::too_many_arguments)]
+pub fn project_work_detail(
+    item: &WorkItem,
+    attempts: &[WorkAttemptView],
+    section: WorkDetailSection,
+    offset: usize,
+    limit: usize,
+    max_response_bytes: usize,
+    attempt_id: Option<&str>,
+    consistency_fence: Option<&str>,
 ) -> Result<WorkDetailPageV1, OrchError> {
     if limit == 0 || limit > MAX_WORK_DETAIL_LIMIT {
         return Err(OrchError::new(
             OrchErrorCode::InvalidRequest,
             format!("limit must be between 1 and {MAX_WORK_DETAIL_LIMIT}"),
         ));
+    }
+    let requested_fence = normalize_attempt_fence(consistency_fence)?;
+    let nested = matches!(
+        section,
+        WorkDetailSection::AttemptDetail
+            | WorkDetailSection::AttemptEvidence
+            | WorkDetailSection::AttemptArtifacts
+    );
+    if nested && attempt_id.is_none() {
+        return Err(OrchError::new(
+            OrchErrorCode::InvalidRequest,
+            "attempt_id is required",
+        ));
+    }
+    if !nested && attempt_id.is_some() {
+        return Err(OrchError::new(
+            OrchErrorCode::InvalidRequest,
+            "attempt_id is only valid for an attempt detail page",
+        ));
+    }
+    if requested_fence.is_some() && !nested && section != WorkDetailSection::Attempts {
+        return Err(OrchError::new(
+            OrchErrorCode::InvalidRequest,
+            "consistency fence is only valid for attempt pages",
+        ));
+    }
+    if nested || section == WorkDetailSection::Attempts {
+        let projected = if section == WorkDetailSection::Attempts {
+            project_attempt_list(
+                item,
+                attempts,
+                offset,
+                limit,
+                max_response_bytes,
+                requested_fence,
+            )?
+        } else {
+            let attempt = require_attempt(attempts, attempt_id.expect("nested attempt id"))?;
+            if attempt.work_id != item.work_id {
+                return Err(unknown_attempt());
+            }
+            match section {
+                WorkDetailSection::AttemptDetail => project_attempt_detail(
+                    item,
+                    attempt,
+                    offset,
+                    max_response_bytes,
+                    requested_fence,
+                )?,
+                WorkDetailSection::AttemptEvidence | WorkDetailSection::AttemptArtifacts => {
+                    project_attempt_collection(
+                        item,
+                        attempt,
+                        section,
+                        offset,
+                        limit,
+                        max_response_bytes,
+                        requested_fence,
+                    )?
+                }
+                _ => unreachable!("nested attempt section"),
+            }
+        };
+        let page = WorkDetailPageV1 {
+            schema_version: WORK_PAGE_SCHEMA_VERSION,
+            kind: WORK_DETAIL_KIND.to_string(),
+            work_id: item.work_id.clone(),
+            revision: item.revision,
+            section,
+            offset,
+            complete: projected.complete,
+            next_offset: projected.next_offset,
+            body: projected.body,
+            attempt_id: projected.attempt_id,
+            consistency_fence: Some(projected.consistency_fence),
+        };
+        confirm_budget(&page, max_response_bytes)?;
+        return Ok(page);
     }
     let (body, next_offset, complete) = match section {
         WorkDetailSection::Summary => (
@@ -930,7 +1377,7 @@ pub fn project_work_detail(
                 "progressBytes": item.progress.as_ref().map(|progress| progress.summary.len()).unwrap_or(0),
                 "evidenceCount": item.result.as_ref().map(|result| result.evidence.len()).unwrap_or(0),
                 "artifactCount": item.result.as_ref().map(|result| result.artifacts.len()).unwrap_or(0),
-                "attemptRecordCount": attempts_json.len(),
+                "attemptRecordCount": attempts.len(),
                 "dependencyCount": item.dependencies.len(),
                 "sessionId": item.session_id,
                 "workspace": item.workspace,
@@ -1013,6 +1460,8 @@ pub fn project_work_detail(
                     complete: index == total,
                     next_offset: (index != total).then_some(index),
                     body: detail_result_body(item, &taken_evidence, &taken_artifacts),
+                    attempt_id: None,
+                    consistency_fence: None,
                 };
                 if tools_call_response_len(&json!(trial)) > max_response_bytes {
                     if count == 1 {
@@ -1037,48 +1486,11 @@ pub fn project_work_detail(
                 complete,
             )
         }
-        WorkDetailSection::Attempts => {
-            if offset > attempts_json.len() {
-                return Err(OrchError::new(
-                    OrchErrorCode::InvalidRequest,
-                    "detail offset is past the end of the collection",
-                ));
-            }
-            let mut index = offset;
-            let mut taken = Vec::new();
-            while index < attempts_json.len() && taken.len() < limit {
-                taken.push(attempts_json[index].clone());
-                index += 1;
-                let trial_complete = index == attempts_json.len();
-                let trial = json!({
-                    "schemaVersion": WORK_PAGE_SCHEMA_VERSION,
-                    "kind": WORK_DETAIL_KIND,
-                    "workId": item.work_id,
-                    "revision": item.revision,
-                    "section": "attempts",
-                    "offset": offset,
-                    "complete": trial_complete,
-                    "nextOffset": if trial_complete { Value::Null } else { json!(index) },
-                    "body": { "attempts": taken },
-                });
-                if tools_call_response_len(&trial) > max_response_bytes {
-                    if taken.len() == 1 {
-                        return Err(OrchError::new(
-                            OrchErrorCode::CapacityExhausted,
-                            "a single work detail element exceeds the transport ceiling",
-                        ));
-                    }
-                    taken.pop();
-                    index -= 1;
-                    break;
-                }
-            }
-            let complete = index >= attempts_json.len();
-            (
-                json!({ "attempts": taken }),
-                (!complete).then_some(index),
-                complete,
-            )
+        WorkDetailSection::Attempts
+        | WorkDetailSection::AttemptDetail
+        | WorkDetailSection::AttemptEvidence
+        | WorkDetailSection::AttemptArtifacts => {
+            unreachable!("attempt sections return before the work-item match")
         }
     };
     let page = WorkDetailPageV1 {
@@ -1091,6 +1503,8 @@ pub fn project_work_detail(
         complete,
         next_offset,
         body,
+        attempt_id: None,
+        consistency_fence: None,
     };
     confirm_budget(&page, max_response_bytes)?;
     Ok(page)
@@ -1230,6 +1644,8 @@ mod tests {
             0,
             1,
             2 * 1024 * 1024,
+            None,
+            None,
         )
         .unwrap();
         assert_eq!(summary.body["createdBy"], "operator-remote");
@@ -1237,9 +1653,17 @@ mod tests {
         assert_eq!(summary.body["approval"]["reviewerId"], "reviewer-1");
         assert!(summary.body.get("objective").is_none());
         assert!(summary.body["objectiveBytes"].as_u64().unwrap() > 0);
-        let result =
-            project_work_detail(&item, &[], WorkDetailSection::Result, 0, 1, 2 * 1024 * 1024)
-                .unwrap();
+        let result = project_work_detail(
+            &item,
+            &[],
+            WorkDetailSection::Result,
+            0,
+            1,
+            2 * 1024 * 1024,
+            None,
+            None,
+        )
+        .unwrap();
         assert_eq!(result.body["summary"], "visible result");
         assert_eq!(result.body["cancellationReason"], "not cancelled");
         assert!(result.body["completedAt"].is_string());

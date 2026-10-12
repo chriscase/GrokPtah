@@ -23,6 +23,7 @@ Result: exit 0, the one test passed in 201.78s. Both `ptah_list_work` and `ptah_
 - Embedded Desktop reader identity is the existing `local-desktop` origin. Service cursors bind `AuthContext` owner and token ids, so a rotated bearer does not continue a page.
 - Embedded `list_work_page_for_session` returns the orchestration error display, which includes `restart_required` or `cursor_expired`. The Work Board matches those codes.
 - Detail `summary` carries the non-bulky operator identity (session, workspace, creator, assignment, approval, timestamps, assignment status). Objective, progress, policy, dependencies, results, and attempts stay in their sections. A remote get that returns `capacity_exhausted` is assembled from those sections. A single element that still does not fit stays `capacity_exhausted`.
+- Attempt records are not one element. `attempts` pages summaries with counts and a per-attempt `fence`. `attempt_detail` returns the public scalars and result metadata. `attempt_evidence` and `attempt_artifacts` page the collections. The content fence is the SHA-256 of the public attempt view, so a heartbeat, renewal, or run link changes it without a Work revision bump. The attempts list fence covers attempt id plus that content fence, in list order. Offset zero may omit the fence. A later page, or a fence that does not match, returns `restart_required` and no elements. Schema version stays 1. Lease tokens stay out of every page.
 
 ## Acceptance matrix
 

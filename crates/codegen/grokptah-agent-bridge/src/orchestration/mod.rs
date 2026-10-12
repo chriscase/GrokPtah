@@ -108,15 +108,15 @@ pub use types::{
     LOCAL_DESKTOP_ORIGIN_ID, MAX_AGENT_CONTEXT_BYTES,
 };
 pub use work_page::{
-    encoded_tools_call_response, issue_cursor_for_tests, issue_unknown_version_cursor_for_tests,
-    lane_digest, legacy_payload_within_ceiling, project_work_detail, select_work_graph_page,
-    select_work_list_page, tools_call_response_len, workspace_digest, WorkDetailPageV1,
-    WorkDetailSection, WorkGraphPageV1, WorkListEntryV1, WorkListPageV1, WorkPageFilter,
-    WorkPageKind, WorkPageQuery, WorkPageReader, DEFAULT_WORK_DETAIL_LIMIT,
-    DEFAULT_WORK_PAGE_LIMIT, MAX_WORK_CURSOR_CHARS, MAX_WORK_DETAIL_LIMIT, MAX_WORK_PAGE_LIMIT,
-    PREFERRED_WORK_PAGE_BYTES, WORK_DETAIL_KIND, WORK_GRAPH_PAGE_KIND, WORK_LIST_PAGE_KIND,
-    WORK_PAGE_CONSISTENCY, WORK_PAGE_CURSOR_TTL_SECS, WORK_PAGE_ORDER_V1, WORK_PAGE_SCHEMA_VERSION,
-    WORK_PAGE_TRANSPORT_CEILING_BYTES,
+    attempt_content_fence, attempt_list_fence, encoded_tools_call_response, issue_cursor_for_tests,
+    issue_unknown_version_cursor_for_tests, lane_digest, legacy_payload_within_ceiling,
+    project_work_detail, select_work_graph_page, select_work_list_page, tools_call_response_len,
+    workspace_digest, WorkDetailPageV1, WorkDetailSection, WorkGraphPageV1, WorkListEntryV1,
+    WorkListPageV1, WorkPageFilter, WorkPageKind, WorkPageQuery, WorkPageReader,
+    ATTEMPT_CONSISTENCY, DEFAULT_WORK_DETAIL_LIMIT, DEFAULT_WORK_PAGE_LIMIT, MAX_WORK_CURSOR_CHARS,
+    MAX_WORK_DETAIL_LIMIT, MAX_WORK_PAGE_LIMIT, PREFERRED_WORK_PAGE_BYTES, WORK_DETAIL_KIND,
+    WORK_GRAPH_PAGE_KIND, WORK_LIST_PAGE_KIND, WORK_PAGE_CONSISTENCY, WORK_PAGE_CURSOR_TTL_SECS,
+    WORK_PAGE_ORDER_V1, WORK_PAGE_SCHEMA_VERSION, WORK_PAGE_TRANSPORT_CEILING_BYTES,
 };
 pub use worker::{
     reject_privilege_amplification, MeasuredCapability, WorkerHostKind, WorkerLivenessState,

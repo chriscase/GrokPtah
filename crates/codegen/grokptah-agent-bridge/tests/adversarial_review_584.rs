@@ -18,8 +18,12 @@
 //!   fault. The old `assert!(!path.exists())` recorded the bug (the journal
 //!   moved before the marker). The port requires the original bytes to remain
 //!   until the marker is durable, then to survive in quarantine across reopens.
-//! - `maximal_valid_attempt_result_must_be_readable_through_detail` is ported
-//!   with the nested-attempt repair, not in this quarantine pass.
+//! - `maximal_valid_attempt_result_must_be_readable_through_detail` keeps the
+//!   production create/claim/fail fixture and the full-view size assertion.
+//!   The read now walks attempt summaries plus `attempt_evidence` and
+//!   `attempt_artifacts` under the attempt content fence. The old single
+//!   `project_work_detail(..., Attempts, 0, 1)` call could not succeed while
+//!   one attempt view was larger than the transport ceiling.
 //! - `full_item_and_edge_ceiling_graph_walk_is_lossless` is unchanged.
 
 mod common;
@@ -28,15 +32,16 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Barrier};
 
 use grokptah_agent_bridge::orchestration::{
-    canonical_workspace, order_work, safe_id_filename, select_work_graph_page,
-    tools_call_response_len, AttemptState, AuthContext, AuthCredential, GraphScope,
-    IdempotencyScope, ManagedExecutionIntent, ManagedFinalizationOutcome,
-    ManagedFinalizationRecord, ManagedIntentState, ManagedRetryCause, OrchStore,
-    OrchestrationConfig, OrchestrationService, RunBounds, RunRecord, RunState, WorkDependency,
-    WorkItem, WorkPageFilter, WorkPageKind, WorkPageQuery, WorkPageReader, WorkPolicy,
-    WorkRequestBinding, WorkState, WorkspaceAllowlist, MANAGED_EXECUTION_SCHEMA_VERSION,
+    attempt_content_fence, canonical_workspace, order_work, project_work_detail, safe_id_filename,
+    select_work_graph_page, tools_call_response_len, AttemptState, AuthContext, AuthCredential,
+    GraphScope, IdempotencyScope, ManagedExecutionIntent, ManagedFinalizationOutcome,
+    ManagedFinalizationRecord, ManagedIntentState, ManagedRetryCause, OrchErrorCode, OrchStore,
+    OrchestrationConfig, OrchestrationService, RunBounds, RunRecord, RunState, WorkArtifactRef,
+    WorkAttemptView, WorkDependency, WorkDetailPageV1, WorkDetailSection, WorkItem, WorkPageFilter,
+    WorkPageKind, WorkPageQuery, WorkPageReader, WorkPolicy, WorkRequestBinding, WorkResult,
+    WorkState, WorkspaceAllowlist, ATTEMPT_CONSISTENCY, MANAGED_EXECUTION_SCHEMA_VERSION,
     MANAGED_FINALIZATION_SCHEMA_VERSION, MAX_GRAPH_EDGES, MAX_GRAPH_SCOPE_ITEMS,
-    WORK_PAGE_TRANSPORT_CEILING_BYTES,
+    MAX_WORK_ARTIFACTS, MAX_WORK_ARTIFACT_BYTES, WORK_PAGE_TRANSPORT_CEILING_BYTES,
 };
 use grokptah_agent_bridge::{
     set_grokptah_home_override, start_control_server, AgentHost, DurableWriteFault, HostConfig,
@@ -233,7 +238,7 @@ fn same_lane_service_requests_keep_their_own_receipts() {
     let _home = HomeGuard;
     let workspace_dir = tempfile::tempdir().unwrap();
     let workspace = canonical_workspace(workspace_dir.path()).unwrap();
-    let (_env, _home_dir, _host, orch, store) = boot_service(&[workspace.clone()]);
+    let (_env, _home_dir, _host, orch, store) = boot_service(std::slice::from_ref(&workspace));
     let session = _host.session_new_kind(SessionKind::Build).unwrap();
     _host.session_set_cwd(session.id, &workspace).unwrap();
     let auth = orch.auth_header(Some(&format!("Bearer {BEARER}"))).unwrap();
@@ -1717,4 +1722,529 @@ fn quarantine_process_cuts_preserve_evidence_and_refusal() {
         assert_refusal_holds(fixture.root.path(), &fixture);
         println!("{stage}: evidence preserved and admission refused");
     }
+}
+
+fn attempt_views(store: &OrchStore, work_id: &str) -> Vec<WorkAttemptView> {
+    store
+        .list_work_attempts(Some(work_id))
+        .unwrap()
+        .iter()
+        .map(WorkAttemptView::from)
+        .collect()
+}
+
+fn read_detail(
+    item: &WorkItem,
+    attempts: &[WorkAttemptView],
+    section: WorkDetailSection,
+    offset: usize,
+    limit: usize,
+    attempt_id: Option<&str>,
+    fence: Option<&str>,
+) -> Result<WorkDetailPageV1, grokptah_agent_bridge::orchestration::OrchError> {
+    project_work_detail(
+        item,
+        attempts,
+        section,
+        offset,
+        limit,
+        WORK_PAGE_TRANSPORT_CEILING_BYTES,
+        attempt_id,
+        fence,
+    )
+}
+
+fn note_bounded(page: &WorkDetailPageV1, largest: &mut usize, lease_token: &str) {
+    let bytes = tools_call_response_len(&serde_json::json!(page));
+    *largest = (*largest).max(bytes);
+    assert!(
+        bytes <= WORK_PAGE_TRANSPORT_CEILING_BYTES,
+        "detail page is {bytes} bytes"
+    );
+    let rendered = serde_json::to_string(page).unwrap();
+    assert!(
+        !rendered.contains(lease_token),
+        "lease token leaked into a page"
+    );
+    assert!(!rendered.contains("leaseTokenHash"));
+}
+
+fn collect_evidence(
+    item: &WorkItem,
+    attempts: &[WorkAttemptView],
+    attempt_id: &str,
+    largest: &mut usize,
+    lease_token: &str,
+) -> Vec<String> {
+    let mut offset = 0usize;
+    let mut fence = None;
+    let mut collected = Vec::new();
+    for _ in 0..(MAX_WORK_ARTIFACTS + 4) {
+        let page = read_detail(
+            item,
+            attempts,
+            WorkDetailSection::AttemptEvidence,
+            offset,
+            1,
+            Some(attempt_id),
+            fence.as_deref(),
+        )
+        .unwrap();
+        note_bounded(&page, largest, lease_token);
+        let page_fence = page.consistency_fence.clone().unwrap();
+        if let Some(expected) = &fence {
+            assert_eq!(expected, &page_fence);
+        }
+        fence = Some(page_fence);
+        assert_eq!(page.attempt_id.as_deref(), Some(attempt_id));
+        for value in page.body["evidence"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+        {
+            collected.push(value.as_str().unwrap().to_string());
+        }
+        if page.complete {
+            return collected;
+        }
+        let next = page.next_offset.unwrap();
+        assert!(next > offset);
+        let missing_fence = read_detail(
+            item,
+            attempts,
+            WorkDetailSection::AttemptEvidence,
+            next,
+            1,
+            Some(attempt_id),
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(missing_fence.code, OrchErrorCode::RestartRequired);
+        offset = next;
+    }
+    panic!("evidence walk did not finish");
+}
+
+fn collect_artifacts(
+    item: &WorkItem,
+    attempts: &[WorkAttemptView],
+    attempt_id: &str,
+    largest: &mut usize,
+    lease_token: &str,
+) -> Vec<WorkArtifactRef> {
+    let mut offset = 0usize;
+    let mut fence = None;
+    let mut collected = Vec::new();
+    for _ in 0..(MAX_WORK_ARTIFACTS + 4) {
+        let page = read_detail(
+            item,
+            attempts,
+            WorkDetailSection::AttemptArtifacts,
+            offset,
+            64,
+            Some(attempt_id),
+            fence.as_deref(),
+        )
+        .unwrap();
+        note_bounded(&page, largest, lease_token);
+        let page_fence = page.consistency_fence.clone().unwrap();
+        if let Some(expected) = &fence {
+            assert_eq!(expected, &page_fence);
+        }
+        fence = Some(page_fence);
+        assert_eq!(page.attempt_id.as_deref(), Some(attempt_id));
+        for value in page.body["artifacts"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+        {
+            collected.push(serde_json::from_value(value).unwrap());
+        }
+        if page.complete {
+            return collected;
+        }
+        let next = page.next_offset.unwrap();
+        assert!(next > offset);
+        let stale = "0".repeat(64);
+        let wrong = read_detail(
+            item,
+            attempts,
+            WorkDetailSection::AttemptArtifacts,
+            next,
+            64,
+            Some(attempt_id),
+            Some(&stale),
+        )
+        .unwrap_err();
+        assert_eq!(wrong.code, OrchErrorCode::RestartRequired);
+        offset = next;
+    }
+    panic!("artifact walk did not finish");
+}
+
+#[test]
+fn maximal_valid_attempt_result_must_be_readable_through_detail() {
+    let root = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let store = OrchStore::open(root.path()).unwrap();
+    let item = WorkItem::new(
+        "test",
+        "bounded objective",
+        Uuid::new_v4(),
+        workspace.path().display().to_string(),
+        "operator",
+        WorkPolicy::default(),
+    )
+    .unwrap();
+    store.save_work_item(&item).unwrap();
+    let claim = store
+        .claim_work(&item.work_id, "worker", Some(60_000))
+        .unwrap();
+    let blob = "q".repeat(MAX_WORK_ARTIFACT_BYTES);
+    let result = WorkResult {
+        summary: "failed with full legal evidence".into(),
+        evidence: vec![blob.clone(); MAX_WORK_ARTIFACTS],
+        artifacts: (0..MAX_WORK_ARTIFACTS)
+            .map(|index| WorkArtifactRef {
+                artifact_id: format!("artifact-{index}"),
+                kind: blob.clone(),
+                label: blob.clone(),
+                digest: Some(blob.clone()),
+                retained_until: None,
+            })
+            .collect(),
+        failure: Some("fixture failure".into()),
+        cancellation_reason: None,
+        completed_at: chrono::Utc::now(),
+        verification: None,
+        candidate_verification: None,
+    };
+    result.validate().unwrap();
+    let (failed, attempt) = store
+        .fail_work(
+            &item.work_id,
+            &claim.attempt.attempt_id,
+            &claim.lease_token,
+            result,
+        )
+        .unwrap();
+    attempt.validate().unwrap();
+    failed.validate().unwrap();
+    let attempts = vec![serde_json::to_value(WorkAttemptView::from(&attempt)).unwrap()];
+    let wrapped = tools_call_response_len(&json!({ "attempts": attempts }));
+    println!(
+        "One valid attempt wrapped body bytes: {wrapped} (ceiling {WORK_PAGE_TRANSPORT_CEILING_BYTES})"
+    );
+    assert!(wrapped > WORK_PAGE_TRANSPORT_CEILING_BYTES);
+    let views = attempt_views(&store, &failed.work_id);
+    assert_eq!(views.len(), 1);
+    let mut largest = 0usize;
+    let listed = read_detail(
+        &failed,
+        &views,
+        WorkDetailSection::Attempts,
+        0,
+        1,
+        None,
+        None,
+    )
+    .expect("a legal attempt summary fits under the transport ceiling");
+    note_bounded(&listed, &mut largest, &claim.lease_token);
+    assert_eq!(listed.schema_version, 1);
+    assert!(listed.complete);
+    assert_eq!(listed.body["consistency"], ATTEMPT_CONSISTENCY);
+    assert!(listed.body["attempts"][0]["result"]
+        .get("evidence")
+        .is_none());
+    assert!(listed.body["attempts"][0]["result"]
+        .get("artifacts")
+        .is_none());
+    assert_eq!(
+        listed.body["attempts"][0]["result"]["evidenceCount"],
+        MAX_WORK_ARTIFACTS
+    );
+    assert_eq!(
+        listed.body["attempts"][0]["result"]["artifactCount"],
+        MAX_WORK_ARTIFACTS
+    );
+    assert!(!listed.body.to_string().contains(&blob));
+    let content_fence = listed.body["attempts"][0]["fence"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(content_fence, attempt_content_fence(&views[0]));
+    let detail = read_detail(
+        &failed,
+        &views,
+        WorkDetailSection::AttemptDetail,
+        0,
+        1,
+        Some(&attempt.attempt_id),
+        Some(&content_fence),
+    )
+    .unwrap();
+    note_bounded(&detail, &mut largest, &claim.lease_token);
+    assert!(detail.complete);
+    assert_eq!(
+        detail.consistency_fence.as_deref(),
+        Some(content_fence.as_str())
+    );
+    assert_eq!(
+        detail.body["attempt"]["result"]["summary"],
+        "failed with full legal evidence"
+    );
+    assert_eq!(
+        detail.body["attempt"]["result"]["failure"],
+        "fixture failure"
+    );
+    let evidence = collect_evidence(
+        &failed,
+        &views,
+        &attempt.attempt_id,
+        &mut largest,
+        &claim.lease_token,
+    );
+    let artifacts = collect_artifacts(
+        &failed,
+        &views,
+        &attempt.attempt_id,
+        &mut largest,
+        &claim.lease_token,
+    );
+    assert_eq!(evidence, attempt.result.as_ref().unwrap().evidence);
+    assert_eq!(artifacts, attempt.result.as_ref().unwrap().artifacts);
+    println!("Nested attempt page max envelope: {largest} bytes");
+    assert!(largest <= WORK_PAGE_TRANSPORT_CEILING_BYTES);
+}
+
+#[test]
+fn attempt_pages_follow_heartbeat_and_keep_every_nested_element() {
+    let root = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let store = OrchStore::open(root.path()).unwrap();
+    let item = WorkItem::new(
+        "test",
+        "fence objective",
+        Uuid::new_v4(),
+        workspace.path().display().to_string(),
+        "operator",
+        WorkPolicy::default(),
+    )
+    .unwrap();
+    store.save_work_item(&item).unwrap();
+    let empty = read_detail(&item, &[], WorkDetailSection::Attempts, 0, 1, None, None).unwrap();
+    assert!(empty.complete);
+    assert_eq!(empty.body["attempts"].as_array().unwrap().len(), 0);
+    assert!(empty.consistency_fence.is_some());
+    let claim = store
+        .claim_work(&item.work_id, "worker", Some(60_000))
+        .unwrap();
+    let revision = claim.work.revision;
+    let before = attempt_views(&store, &item.work_id);
+    let before_fence = attempt_content_fence(&before[0]);
+    let list_fence = read_detail(
+        &claim.work,
+        &before,
+        WorkDetailSection::Attempts,
+        0,
+        1,
+        None,
+        None,
+    )
+    .unwrap()
+    .consistency_fence
+    .unwrap();
+    store
+        .renew_work_lease(
+            &item.work_id,
+            &claim.attempt.attempt_id,
+            &claim.lease_token,
+            Some(60_000),
+        )
+        .unwrap();
+    let renewed_item = store.load_work_item(&item.work_id).unwrap().unwrap();
+    assert_eq!(renewed_item.revision, revision);
+    let renewed = attempt_views(&store, &item.work_id);
+    assert_ne!(attempt_content_fence(&renewed[0]), before_fence);
+    assert_ne!(renewed[0].last_heartbeat_at, before[0].last_heartbeat_at);
+    let stale = read_detail(
+        &renewed_item,
+        &renewed,
+        WorkDetailSection::AttemptDetail,
+        0,
+        1,
+        Some(&claim.attempt.attempt_id),
+        Some(&before_fence),
+    )
+    .unwrap_err();
+    assert_eq!(stale.code, OrchErrorCode::RestartRequired);
+    store
+        .link_work_run(
+            &item.work_id,
+            &claim.attempt.attempt_id,
+            &claim.lease_token,
+            "run-1",
+        )
+        .unwrap();
+    let linked_item = store.load_work_item(&item.work_id).unwrap().unwrap();
+    assert_eq!(linked_item.revision, revision);
+    let linked = attempt_views(&store, &item.work_id);
+    assert_eq!(linked[0].linked_run_ids, vec!["run-1".to_string()]);
+    assert_ne!(
+        attempt_content_fence(&linked[0]),
+        attempt_content_fence(&renewed[0])
+    );
+    let quotes = "\"".repeat(MAX_WORK_ARTIFACT_BYTES);
+    let snow = "𝄞".repeat(MAX_WORK_ARTIFACT_BYTES / "𝄞".len());
+    assert_eq!(snow.len(), MAX_WORK_ARTIFACT_BYTES);
+    let mut evidence = vec![quotes.clone(); 3];
+    evidence.push(snow.clone());
+    let failed_result = WorkResult {
+        summary: snow.clone(),
+        evidence,
+        artifacts: vec![
+            WorkArtifactRef {
+                artifact_id: "snow-1".into(),
+                kind: quotes.clone(),
+                label: snow.clone(),
+                digest: Some(quotes.clone()),
+                retained_until: None,
+            },
+            WorkArtifactRef {
+                artifact_id: "snow-2".into(),
+                kind: "log".into(),
+                label: quotes.clone(),
+                digest: None,
+                retained_until: None,
+            },
+        ],
+        failure: Some("quoted failure".into()),
+        cancellation_reason: None,
+        completed_at: chrono::Utc::now(),
+        verification: None,
+        candidate_verification: None,
+    };
+    failed_result.validate().unwrap();
+    let (failed, attempt) = store
+        .fail_work(
+            &item.work_id,
+            &claim.attempt.attempt_id,
+            &claim.lease_token,
+            failed_result,
+        )
+        .unwrap();
+    assert!(failed.revision > revision);
+    let views = attempt_views(&store, &item.work_id);
+    let mut largest = 0usize;
+    let evidence = collect_evidence(
+        &failed,
+        &views,
+        &attempt.attempt_id,
+        &mut largest,
+        &claim.lease_token,
+    );
+    let artifacts = collect_artifacts(
+        &failed,
+        &views,
+        &attempt.attempt_id,
+        &mut largest,
+        &claim.lease_token,
+    );
+    assert_eq!(evidence, attempt.result.as_ref().unwrap().evidence);
+    assert_eq!(artifacts, attempt.result.as_ref().unwrap().artifacts);
+    assert_eq!(evidence.last().map(String::as_str), Some(snow.as_str()));
+    assert!(largest <= WORK_PAGE_TRANSPORT_CEILING_BYTES);
+
+    let second = store
+        .claim_work(&item.work_id, "worker", Some(60_000))
+        .unwrap();
+    let both = attempt_views(&store, &item.work_id);
+    assert_eq!(both.len(), 2);
+    assert_eq!(both[0].attempt_id, attempt.attempt_id);
+    assert_eq!(both[1].attempt_number, 2);
+    let mixed = read_detail(
+        &second.work,
+        &both,
+        WorkDetailSection::Attempts,
+        0,
+        1,
+        None,
+        Some(&list_fence),
+    )
+    .unwrap_err();
+    assert_eq!(mixed.code, OrchErrorCode::RestartRequired);
+    let first_still = read_detail(
+        &second.work,
+        &both,
+        WorkDetailSection::AttemptEvidence,
+        0,
+        1,
+        Some(&attempt.attempt_id),
+        Some(&attempt_content_fence(&both[0])),
+    )
+    .unwrap();
+    assert_eq!(first_still.body["evidence"][0], quotes);
+    let unknown = read_detail(
+        &second.work,
+        &both,
+        WorkDetailSection::AttemptDetail,
+        0,
+        1,
+        Some("missing-attempt"),
+        None,
+    )
+    .unwrap_err();
+    assert_eq!(unknown.code, OrchErrorCode::InvalidRequest);
+    assert_eq!(unknown.message, "unknown attempt_id");
+    let foreign = read_detail(
+        &second.work,
+        &both,
+        WorkDetailSection::AttemptDetail,
+        0,
+        1,
+        Some(&second.attempt.attempt_id),
+        None,
+    )
+    .unwrap();
+    assert_eq!(
+        foreign.attempt_id.as_deref(),
+        Some(second.attempt.attempt_id.as_str())
+    );
+    let other = WorkItem::new(
+        "test",
+        "other objective",
+        Uuid::new_v4(),
+        workspace.path().display().to_string(),
+        "operator",
+        WorkPolicy::default(),
+    )
+    .unwrap();
+    store.save_work_item(&other).unwrap();
+    let other_claim = store
+        .claim_work(&other.work_id, "worker", Some(60_000))
+        .unwrap();
+    let wrong_work = read_detail(
+        &other,
+        &attempt_views(&store, &other.work_id),
+        WorkDetailSection::AttemptDetail,
+        0,
+        1,
+        Some(&attempt.attempt_id),
+        None,
+    )
+    .unwrap_err();
+    assert_eq!(wrong_work.code, unknown.code);
+    assert_eq!(wrong_work.message, unknown.message);
+    assert_ne!(other_claim.attempt.attempt_id, attempt.attempt_id);
+    let on_summary = read_detail(
+        &other,
+        &[],
+        WorkDetailSection::Summary,
+        0,
+        1,
+        Some(&other_claim.attempt.attempt_id),
+        None,
+    )
+    .unwrap_err();
+    assert_eq!(on_summary.code, OrchErrorCode::InvalidRequest);
 }

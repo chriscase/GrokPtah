@@ -1098,3 +1098,295 @@ async fn write_fault_makes_the_live_server_unready_until_reopen() {
     assert!(server.stop_and_wait().await.is_clean());
     set_grokptah_home_override(None);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::await_holding_lock)]
+async fn maximal_attempt_detail_is_readable_over_authenticated_mcp() {
+    let mut lane = boot().await;
+    let canonical = canonical_workspace(lane.workspace.path())
+        .unwrap()
+        .display()
+        .to_string();
+    let now = chrono::Utc::now();
+    let item = item_at(
+        lane.session,
+        &canonical,
+        "fat-attempt",
+        "bounded objective",
+        0,
+        now,
+    );
+    plant(&lane.store, item);
+    let claim = lane
+        .store
+        .claim_work("fat-attempt", "worker", Some(60_000))
+        .unwrap();
+    let revision = claim.work.revision;
+    let before = lane
+        .client
+        .call_tool(
+            "ptah_get_work_detail",
+            json!({
+                "session_id": lane.session,
+                "workspace": canonical,
+                "work_id": "fat-attempt",
+                "section": "attempt_detail",
+                "attempt_id": claim.attempt.attempt_id,
+                "offset": 0,
+                "limit": 1
+            }),
+        )
+        .await
+        .unwrap()
+        .structured;
+    assert_eq!(before["revision"], revision);
+    let old_fence = before["consistencyFence"].as_str().unwrap().to_string();
+    lane.store
+        .renew_work_lease(
+            "fat-attempt",
+            &claim.attempt.attempt_id,
+            &claim.lease_token,
+            Some(60_000),
+        )
+        .unwrap();
+    assert_eq!(
+        lane.store
+            .load_work_item("fat-attempt")
+            .unwrap()
+            .unwrap()
+            .revision,
+        revision
+    );
+    let stale = lane
+        .client
+        .call_tool(
+            "ptah_get_work_detail",
+            json!({
+                "session_id": lane.session,
+                "workspace": canonical,
+                "work_id": "fat-attempt",
+                "section": "attempt_evidence",
+                "attempt_id": claim.attempt.attempt_id,
+                "consistency_fence": old_fence,
+                "offset": 0,
+                "limit": 1
+            }),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+    assert_eq!(stale, "MCP remote error: restart_required", "{stale}");
+    let blob = "q".repeat(MAX_WORK_ARTIFACT_BYTES);
+    let result = WorkResult {
+        summary: "failed with full legal evidence".into(),
+        evidence: vec![blob.clone(); MAX_WORK_ARTIFACTS],
+        artifacts: (0..MAX_WORK_ARTIFACTS)
+            .map(|index| WorkArtifactRef {
+                artifact_id: format!("artifact-{index}"),
+                kind: blob.clone(),
+                label: blob.clone(),
+                digest: Some(blob.clone()),
+                retained_until: None,
+            })
+            .collect(),
+        failure: Some("fixture failure".into()),
+        cancellation_reason: None,
+        completed_at: now,
+        verification: None,
+        candidate_verification: None,
+    };
+    result.validate().unwrap();
+    let (failed, attempt) = lane
+        .store
+        .fail_work(
+            "fat-attempt",
+            &claim.attempt.attempt_id,
+            &claim.lease_token,
+            result,
+        )
+        .unwrap();
+    attempt.validate().unwrap();
+    failed.validate().unwrap();
+    let mut largest = 0usize;
+    let mut evidence = Vec::new();
+    let mut artifacts = Vec::new();
+    let mut fence = None;
+    for section in ["attempt_evidence", "attempt_artifacts"] {
+        let mut offset = 0usize;
+        let field = if section == "attempt_evidence" {
+            "evidence"
+        } else {
+            "artifacts"
+        };
+        for _ in 0..(MAX_WORK_ARTIFACTS + 4) {
+            let mut args = json!({
+                "session_id": lane.session,
+                "workspace": canonical,
+                "work_id": "fat-attempt",
+                "section": section,
+                "attempt_id": attempt.attempt_id,
+                "offset": offset,
+                "limit": 64
+            });
+            if let Some(fence) = &fence {
+                args["consistency_fence"] = json!(fence);
+            }
+            let page = lane
+                .client
+                .call_tool("ptah_get_work_detail", args)
+                .await
+                .unwrap()
+                .structured;
+            let bytes = encoded_tools_call_response(&json!(u64::MAX), &page).len();
+            largest = largest.max(bytes);
+            assert!(bytes <= WORK_PAGE_TRANSPORT_CEILING_BYTES, "{bytes}");
+            assert!(!page.to_string().contains(&claim.lease_token));
+            let page_fence = page["consistencyFence"].as_str().unwrap().to_string();
+            if fence.is_none() {
+                fence = Some(page_fence);
+            } else {
+                assert_eq!(fence.as_deref(), Some(page_fence.as_str()));
+            }
+            let batch = page["body"][field].as_array().cloned().unwrap_or_default();
+            if section == "attempt_evidence" {
+                evidence.extend(batch);
+            } else {
+                artifacts.extend(batch);
+            }
+            if page["complete"].as_bool().unwrap() {
+                break;
+            }
+            let next = page["nextOffset"].as_u64().unwrap() as usize;
+            assert!(next > offset);
+            offset = next;
+        }
+        fence = None;
+    }
+    assert_eq!(evidence.len(), MAX_WORK_ARTIFACTS);
+    assert_eq!(artifacts.len(), MAX_WORK_ARTIFACTS);
+    assert_eq!(evidence[0], blob);
+    assert_eq!(
+        evidence.last().and_then(|value| value.as_str()),
+        Some(blob.as_str())
+    );
+    assert_eq!(artifacts[0]["artifactId"], "artifact-0");
+    assert_eq!(artifacts[0]["kind"], blob);
+    assert_eq!(artifacts[0]["label"], blob);
+    assert_eq!(artifacts[0]["digest"], blob);
+    let last_artifact_id = format!("artifact-{}", MAX_WORK_ARTIFACTS - 1);
+    assert_eq!(
+        artifacts
+            .last()
+            .and_then(|value| value["artifactId"].as_str()),
+        Some(last_artifact_id.as_str())
+    );
+    let header = lane.client.session_id().unwrap().to_string();
+    let base = format!("http://{}", lane._server.addr);
+    let (status, bytes) = raw_tools_call(
+        &base,
+        "work-page-token",
+        &header,
+        91,
+        "ptah_get_work_detail",
+        json!({
+            "session_id": lane.session,
+            "workspace": canonical,
+            "work_id": "fat-attempt",
+            "section": "attempt_evidence",
+            "attempt_id": attempt.attempt_id,
+            "offset": 0,
+            "limit": 64
+        }),
+    )
+    .await;
+    assert!(status.is_success(), "{status}");
+    let parsed: Value = serde_json::from_slice(&bytes).unwrap();
+    let estimated =
+        encoded_tools_call_response(&parsed["id"], &parsed["result"]["structuredContent"]);
+    assert_eq!(
+        bytes.len(),
+        estimated.len(),
+        "estimator drifted from the wire body"
+    );
+    assert!(bytes.len() <= WORK_PAGE_TRANSPORT_CEILING_BYTES);
+    println!(
+        "Attempt detail wire page {} bytes; max estimated envelope {largest}",
+        bytes.len()
+    );
+    let other = item_at(lane.session, &canonical, "other-attempt", "other", 0, now);
+    plant(&lane.store, other);
+    let other_claim = lane
+        .store
+        .claim_work("other-attempt", "worker", Some(60_000))
+        .unwrap();
+    let unknown = lane
+        .client
+        .call_tool(
+            "ptah_get_work_detail",
+            json!({
+                "session_id": lane.session,
+                "workspace": canonical,
+                "work_id": "fat-attempt",
+                "section": "attempt_detail",
+                "attempt_id": "missing-attempt"
+            }),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+    let foreign_attempt = lane
+        .client
+        .call_tool(
+            "ptah_get_work_detail",
+            json!({
+                "session_id": lane.session,
+                "workspace": canonical,
+                "work_id": "fat-attempt",
+                "section": "attempt_detail",
+                "attempt_id": other_claim.attempt.attempt_id
+            }),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+    assert_eq!(unknown, "MCP remote error: invalid_request");
+    assert_eq!(foreign_attempt, unknown);
+    let (unknown_status, unknown_body) = raw_tools_call(
+        &base,
+        "work-page-token",
+        &header,
+        92,
+        "ptah_get_work_detail",
+        json!({
+            "session_id": lane.session,
+            "workspace": canonical,
+            "work_id": "fat-attempt",
+            "section": "attempt_detail",
+            "attempt_id": "missing-attempt"
+        }),
+    )
+    .await;
+    let (foreign_status, foreign_body) = raw_tools_call(
+        &base,
+        "work-page-token",
+        &header,
+        93,
+        "ptah_get_work_detail",
+        json!({
+            "session_id": lane.session,
+            "workspace": canonical,
+            "work_id": "fat-attempt",
+            "section": "attempt_detail",
+            "attempt_id": other_claim.attempt.attempt_id
+        }),
+    )
+    .await;
+    assert_eq!(unknown_status, foreign_status);
+    let unknown_error = serde_json::from_slice::<Value>(&unknown_body).unwrap()["error"].clone();
+    let foreign_error = serde_json::from_slice::<Value>(&foreign_body).unwrap()["error"].clone();
+    assert_eq!(unknown_error["message"], "unknown attempt_id");
+    assert_eq!(foreign_error["message"], unknown_error["message"]);
+    assert_eq!(foreign_error["data"], unknown_error["data"]);
+    assert!(!String::from_utf8_lossy(&unknown_body).contains(&claim.lease_token));
+    set_grokptah_home_override(None);
+}
