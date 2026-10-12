@@ -12,6 +12,7 @@ The baseline matrix stays in `docs/WORKLOAD_RELIABILITY_V1.md`. The evidence tex
 | Reviewed published tip | `0cb77413066fbe94ef7b69a6fc886158b634e0fd` | `907e8c376216f38b32be2ce325afc69f6b5a551c` |
 | Executable parent of that tip | `1e3d5f76a569b0213a90a2705777c26aa74a25e9` | `82dc8e8894731b29968cc655ae2ad95143de0abd` |
 | Repair executable | `8c0e869112d61a00a60e230e8e09ce82df1552d4` | `8fc8381e7376aac0099964967314fea9a9235659` |
+| First evidence tip | `e12a3692dcab8b9edfca7af0d7101ee1049770cc` | `d54452e1395b0b8c196ce346c766d1ce3888a38f` |
 
 Only `docs/WORKLOAD_RELIABILITY_V1_EVIDENCE.md` differs between `1e3d5f76a` and `0cb77413`. The repair commits on top of `0cb77413` are:
 
@@ -19,8 +20,11 @@ Only `docs/WORKLOAD_RELIABILITY_V1_EVIDENCE.md` differs between `1e3d5f76a` and 
 - `65970f82e` Persist reconciliation refusal before quarantining a journal.
 - `493024ca1` Hold loaded Work Board pages across the background poll.
 - `8c0e86911` Page nested attempt records under the existing transport ceiling.
+- `e12a3692d` Record the workload reliability repair evidence.
 
-The commit that adds this repair record changes only this file. Rust, TypeScript, and the Tauri sources are identical to `8c0e86911`. Hosted `desktop.yml` has to be read on the published tip. The PR description records that run. Writing the run URL back into this file would create another SHA.
+`e12a3692d` changes only this file relative to `8c0e86911`. Hosted `desktop.yml` run `38200651982` completed with conclusion `success` on that exact SHA: https://github.com/chriscase/GrokPtah/actions/runs/38200651982. Event `pull_request`, 41m21s. Job `desktop` succeeded, including `Typecheck + unit tests`, `Cargo tests (desktop)`, `Bridge fmt + clippy + tests`, `Headless service fmt + clippy + tests`, and `Host authority spine (fmt + clippy + tests)`. No other workflow matched that push.
+
+This commit records that terminal result. It also changes only this file. Rust, TypeScript, and the Tauri sources stay identical to `8c0e86911`. The hosted run for this newer tip is a separate check. Its URL is written on the PR description when that run reaches a terminal conclusion, because the URL does not exist until after this commit is published.
 
 Review inputs, sha256, were not modified:
 
@@ -51,10 +55,10 @@ Repair executable `8c0e86911`:
 - Bridge `cargo fmt --check`: exit 0.
 - Bridge `cargo clippy --locked --all-targets -- -D warnings`: exit 0.
 - Bridge `cargo test --locked --offline -- --test-threads=1` with `GROKPTAH_HOME` set to a fresh directory: exit 0. 1323 passed, 0 failed, 15 ignored, 44 result blocks. The 15 ignored tests are the pre-existing installed-CLI, live-provider, doc, and lock-helper tests. No new ignore was added.
-- Explicit `cargo test --locked --offline --test adversarial_review_584 -- --test-threads=1 --nocapture` on that same tree: exit 0, 16 passed, 0 failed, 84.85s. Graph proof: 4096 nodes, 16384 edges, maximum estimated envelope 200256 bytes. One valid attempt wrapped body: 4273937 bytes, ceiling 2097152. Nested attempt page maximum: 803817 bytes.
+- Explicit `cargo test --locked --offline --test adversarial_review_584 -- --test-threads=1 --nocapture` on that same tree: exit 0, 16 passed, 0 failed, 0 ignored, 84.85s. Each test ended `ok`: `attempt_pages_follow_heartbeat_and_keep_every_nested_element`, `bound_service_mutation_does_not_capture_an_unbound_lifecycle_writer`, `claim_renew_and_link_cuts_replay_without_duplicate_effects`, `concurrent_bindings_must_not_publish_foreign_work_in_the_other_receipt`, `different_lane_service_requests_keep_their_own_receipts`, `failed_quarantine_directory_fsync_must_keep_moved_evidence`, `failed_quarantine_marker_must_not_reopen_admission`, `failed_quarantine_move_must_keep_the_marker_and_the_journal`, `full_item_and_edge_ceiling_graph_walk_is_lossless`, `legacy_quarantine_without_marker_stays_refused`, `maximal_valid_attempt_result_must_be_readable_through_detail`, `production_claim_crash_child`, `production_claim_recovery_must_complete_the_original_receipt`, `quarantine_crash_child`, `quarantine_process_cuts_preserve_evidence_and_refusal`, `same_lane_service_requests_keep_their_own_receipts`. Graph proof: 4096 nodes, 16384 edges, maximum estimated envelope 200256 bytes. One valid attempt wrapped body: 4273937 bytes, ceiling 2097152. Nested attempt page maximum: 803817 bytes.
 - `cargo test --locked --offline --test workload_reliability_pages maximal_attempt_detail -- --nocapture`: exit 0. Wire page 264027 bytes. Maximum estimated envelope 803767 bytes.
 - Included in the full bridge suite: `workload_reliability_pages` 6, `native_executor_store` 46, `native_executor_mcp` 16, `work_graph_authority` 25, `work_graph_service` 4, `workload_mcp` 1, `coordinator_mcp` 5, `coordinator_store` 12, `verified_change_workflow` 102, `provider_wire_conformance` 4.
-- Test gateway, from the bridge directory: fmt exit 0, clippy exit 0, test exit 0. 5 library, 11 integration, 1 doc.
+- Test gateway, from `crates/codegen/grokptah-agent-bridge`, manifest `test-support/grokptah-test-gateway/Cargo.toml`: `cargo fmt --manifest-path test-support/grokptah-test-gateway/Cargo.toml --all -- --check` exit 0; `cargo clippy --manifest-path test-support/grokptah-test-gateway/Cargo.toml --locked --all-targets -- -D warnings` exit 0; `cargo test --manifest-path test-support/grokptah-test-gateway/Cargo.toml --locked` exit 0. 5 library, 11 integration, 1 doc, 0 failed.
 - Service `cargo fmt --check`, `cargo check --locked --all-targets`, and clippy: exit 0. The first `cargo test --locked -- --test-threads=1` failed one test, `disconnect_reconnect_restart_and_cursor_expiry_are_durable`, while the bridge and Tauri suites were compiling. Shutdown reported `journal writer queue is full` and retained the instance lock, so the restart could not acquire it. The same suite rerun with no competing compile: exit 0. 4 library, 12 conformance, 5 smoke, 0 failed. That conformance test talks authenticated MCP to a disposable loopback service and replays a submit after a dropped connection.
 - Desktop `npm run typecheck`: exit 0. `npm test`: exit 0, 60 files, 450 tests, including `useWorkBoardPoll.test.tsx` 13 and `WorkBoard.test.tsx` 10. `npm run build`: exit 0. Help public verification was not run. This repair does not change the help bundle.
 - Tauri `cargo test --locked -- --test-threads=1` from `desktop/src-tauri`: exit 0. Library 52 passed, including `remote_client_reads_oversized_work_through_detail` and `remote_client_authenticates_and_reconnects_after_service_restart`. The binary target `src/main.rs` compiled and ran 0 tests. Doc-tests ran 0. This was not `--lib`.
@@ -94,6 +98,6 @@ Disk attempt files are unchanged. No attempt migration runs. `ledger-reconciliat
 
 ## Local versus hosted
 
-Hosted Desktop success on `0cb77413` (run `38178900645`) does not cover this repair. Local commands above were run on `8c0e86911` before this evidence commit. No live provider, production credential, Computer Use session, or native input was used. Loopback and synthetic tokens supplied the service and MCP proofs.
+Hosted Desktop success on `0cb77413` (run `38178900645`) does not cover this repair. Local commands above were run on `8c0e86911`. No live provider, production credential, Computer Use session, or native input was used. Loopback and synthetic tokens supplied the service and MCP proofs.
 
-Unobserved until the published tip's `desktop.yml` finishes: the hosted normal-profile build, hosted sccache, and the hosted macOS Tauri `cargo test --locked`. A local pass is not that oracle. The 15 ignored bridge tests were not promoted into this claim.
+Hosted `desktop.yml` on the first evidence tip `e12a3692d` is terminal success, run `38200651982`. That run used the hosted normal profile, hosted sccache, and the hosted macOS `cargo test --locked` for the Tauri binary. It is not a result for a later documentation SHA. The 15 ignored bridge tests were not promoted into this claim.
