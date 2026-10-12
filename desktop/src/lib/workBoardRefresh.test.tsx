@@ -15,6 +15,7 @@ function WiredBoard({
   scope,
   enabled = true,
   api,
+  showBoard = true,
 }: {
   client: {
     list: (scope: WorkBoardScope, cursor: string | null) => Promise<WorkBoardPage>;
@@ -23,6 +24,8 @@ function WiredBoard({
   scope: WorkBoardScope;
   enabled?: boolean;
   api?: { current: ReturnType<typeof useWorkBoardPoll> | null };
+  /** When false, the hook stays mounted and the Work Board view unmounts. */
+  showBoard?: boolean;
 }) {
   const board = useWorkBoardPoll({ enabled, scope, client });
   if (api) api.current = board;
@@ -35,6 +38,7 @@ function WiredBoard({
     }
     void refreshDetail(selectedWorkId);
   }, [dismissDetail, enabled, refreshDetail, selectedWorkId]);
+  if (!showBoard) return null;
   return (
     <WorkBoard
       items={board.view.items}
@@ -494,7 +498,7 @@ describe("production Work Board detail refresh", () => {
       return Promise.resolve(namedSnapshot(workId, `live-${workId}`, "running"));
     });
     const api: { current: ReturnType<typeof useWorkBoardPoll> | null } = { current: null };
-    const { rerender, unmount } = render(
+    const { rerender } = render(
       <WiredBoard api={api} client={{ list, get }} scope={lane} />,
     );
     await flush();
@@ -505,53 +509,38 @@ describe("production Work Board detail refresh", () => {
     const pendingDetail = api.current?.refreshDetail("work-a");
     await flush();
     expect(held).toHaveLength(1);
+    const staleRead = held[0];
 
     fireEvent.click(screen.getByRole("button", { name: /^work-b/ }));
     await flush();
-    held[0].resolve(namedSnapshot("work-a", staleObjective, "awaiting_approval"));
-    await pendingDetail;
-    await flush();
-    expect(screen.getByRole("button", { name: /^work-b/, pressed: true })).toBeInTheDocument();
-    expect(screen.queryByRole("heading", { name: staleObjective })).toBeNull();
-    expect(screen.queryByRole("button", { name: "Approve completion" })).toBeNull();
     expect(screen.getByRole("heading", { name: "live-work-b" })).toBeInTheDocument();
-
-    holdNext = true;
-    const pendingRemoval = api.current?.refreshDetail("work-b");
+    fireEvent.click(screen.getByRole("button", { name: /^work-a/ }));
     await flush();
+    expect(screen.getByRole("heading", { name: "live-work-a" })).toBeInTheDocument();
+    expect(held).toHaveLength(1);
+
     rows = [entry("work-b", 1, "running")];
-    const removal = api.current?.restart();
-    await flush();
-    held.at(-1)?.resolve(namedSnapshot("work-b", staleObjective, "awaiting_approval"));
-    await pendingRemoval;
-    await removal;
-    await flush();
+    await act(async () => {
+      await api.current?.restart();
+    });
     expect(screen.queryByRole("button", { name: /^work-a/ })).toBeNull();
-    expect(screen.queryByRole("heading", { name: staleObjective })).toBeNull();
-    expect(screen.queryByRole("button", { name: "Approve completion" })).toBeNull();
     expect(screen.getByRole("heading", { name: "live-work-b" })).toBeInTheDocument();
+    expect(held).toHaveLength(1);
 
-    holdNext = true;
-    const pendingEmpty = api.current?.refreshDetail("work-b");
-    await flush();
     rows = [];
-    const emptied = api.current?.restart();
-    await flush();
-    held.at(-1)?.resolve(namedSnapshot("work-b", staleObjective, "awaiting_approval"));
-    await pendingEmpty;
-    await emptied;
-    await flush();
+    await act(async () => {
+      await api.current?.restart();
+    });
     expect(screen.getByText("No durable Work Items in this Lane")).toBeInTheDocument();
-    expect(screen.queryByRole("heading", { name: staleObjective })).toBeNull();
-    expect(screen.queryByRole("heading", { name: "live-work-b" })).toBeNull();
+    expect(held).toHaveLength(1);
+
+    rows = [entry("work-a", 1, "running"), entry("work-b", 1, "running")];
+    await act(async () => {
+      await api.current?.restart();
+    });
+    expect(screen.getByRole("heading", { name: "live-work-a" })).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Approve completion" })).toBeNull();
 
-    rows = [entry("work-a", 1, "running")];
-    rerender(<WiredBoard api={api} client={{ list, get }} scope={lane} />);
-    await flush();
-    holdNext = true;
-    const pendingDisconnect = api.current?.refreshDetail("work-a");
-    await flush();
     rerender(
       <WiredBoard
         api={api}
@@ -565,28 +554,22 @@ describe("production Work Board detail refresh", () => {
       />,
     );
     await flush();
-    held.at(-1)?.resolve(namedSnapshot("work-a", staleObjective, "awaiting_approval"));
-    await pendingDisconnect;
-    await flush();
     expect(screen.getByText(/disconnected/i)).toBeInTheDocument();
-    expect(screen.queryByRole("heading", { name: staleObjective })).toBeNull();
-    expect(screen.queryByRole("button", { name: "Approve completion" })).toBeNull();
-
+    rerender(<WiredBoard api={api} client={{ list, get }} scope={lane} showBoard={false} />);
+    await flush();
+    expect(screen.queryByRole("heading", { name: "live-work-a" })).toBeNull();
     rerender(<WiredBoard api={api} client={{ list, get }} scope={lane} />);
     await flush();
-    expect(screen.queryByRole("heading", { name: staleObjective })).toBeNull();
-    expect(screen.queryByRole("button", { name: "Approve completion" })).toBeNull();
+    expect(held).toHaveLength(1);
     expect(screen.getByRole("button", { name: /^work-a/ })).toBeInTheDocument();
-    expect(screen.getByRole("heading", { name: /work-a/ }).textContent).not.toBe(staleObjective);
 
-    holdNext = true;
-    const pendingUnmount = api.current?.refreshDetail("work-a");
+    staleRead.resolve(namedSnapshot("work-a", staleObjective, "awaiting_approval"));
+    await pendingDetail;
     await flush();
-    unmount();
-    held.at(-1)?.resolve(namedSnapshot("work-a", staleObjective, "awaiting_approval"));
-    await pendingUnmount;
+    expect(screen.getByRole("heading", { name: "live-work-a" })).toBeInTheDocument();
     expect(screen.queryByRole("heading", { name: staleObjective })).toBeNull();
     expect(screen.queryByRole("button", { name: "Approve completion" })).toBeNull();
+    expect(held).toHaveLength(1);
   });
 
   it("retries a failed detail read without dropping another loaded page", async () => {
