@@ -12,7 +12,7 @@ use grokptah_agent_bridge::{
     AuthCredential, LiveNotification, McpControlClient, McpRemoteError, RunScope,
 };
 use grokptah_service::{start_service, ServiceConfig};
-use serde_json::json;
+use serde_json::{json, Value};
 use tokio::time::timeout;
 use uuid::Uuid;
 
@@ -1150,6 +1150,163 @@ async fn hosted_service_exposes_native_executor_controls() {
         store.load_manager_plan(&plan_id).unwrap()
     );
     client.close_session().await.unwrap();
+    handle.stop_and_wait().await;
+}
+
+async fn service_work_page_head(
+    client: &mut McpControlClient,
+    session_id: Uuid,
+    workspace: &std::path::Path,
+) -> Value {
+    client
+        .call_tool(
+            "ptah_list_work_page",
+            json!({
+                "session_id": session_id,
+                "workspace": workspace,
+                "limit": 1
+            }),
+        )
+        .await
+        .unwrap()
+        .structured
+}
+
+async fn service_work_page_ids(
+    client: &mut McpControlClient,
+    session_id: Uuid,
+    workspace: &std::path::Path,
+) -> Vec<String> {
+    let mut cursor = None;
+    let mut ids = Vec::new();
+    for _ in 0..6 {
+        let mut args = json!({
+            "session_id": session_id,
+            "workspace": workspace,
+            "limit": 1
+        });
+        if let Some(token) = &cursor {
+            args["cursor"] = json!(token);
+        }
+        let page = client
+            .call_tool("ptah_list_work_page", args)
+            .await
+            .unwrap()
+            .structured;
+        ids.extend(
+            page["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|item| item["workId"].as_str().map(str::to_string)),
+        );
+        if page["complete"].as_bool().unwrap() {
+            break;
+        }
+        let next = page["continuation"].as_str().unwrap().to_string();
+        assert_ne!(cursor.as_ref(), Some(&next));
+        cursor = Some(next);
+    }
+    ids
+}
+
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn hosted_service_pages_one_work_lane_the_same_way_twice() {
+    let env = ServiceEnv::new();
+    let workspace = env.workspace_path();
+    let handle = start_isolated(&env, vec![workspace.clone()], 2).await;
+    let mut alice = mcp_client(handle.addr).await;
+    let mut bob = mcp_client(handle.addr).await;
+    let session_id = create_build_session(&mut alice, &workspace, "service page lane").await;
+    let mut created = Vec::new();
+    for (index, priority) in [(0, 1), (1, 5), (2, 1)] {
+        let response = alice
+            .call_tool(
+                "ptah_create_work",
+                json!({
+                    "request_id": format!("service-page-{index}"),
+                    "session_id": session_id,
+                    "workspace": workspace,
+                    "kind": "service-page",
+                    "objective": format!("lane item {index}"),
+                    "priority": priority,
+                }),
+            )
+            .await
+            .unwrap_or_else(|error| panic!("create work {index}: {error}"));
+        assert!(!response.is_error, "{:?}", response.raw);
+        created.push(
+            response.structured["work"]["workId"]
+                .as_str()
+                .unwrap()
+                .to_string(),
+        );
+    }
+
+    let alice_head = service_work_page_head(&mut alice, session_id, &workspace).await;
+    let bob_head = service_work_page_head(&mut bob, session_id, &workspace).await;
+    assert_eq!(alice_head["schemaVersion"], 1);
+    assert_eq!(alice_head["kind"], "grokptah.work.page.v1");
+    assert_eq!(alice_head["complete"], false);
+    assert_eq!(alice_head["items"], bob_head["items"]);
+    assert_eq!(alice_head["items"][0]["workId"], created[1]);
+    let head_body = alice_head.to_string();
+    assert!(!head_body.contains(TOKEN));
+    assert!(!head_body.contains(&workspace.display().to_string()));
+
+    let alice_ids = service_work_page_ids(&mut alice, session_id, &workspace).await;
+    let bob_ids = service_work_page_ids(&mut bob, session_id, &workspace).await;
+    assert_eq!(alice_ids, bob_ids);
+    assert_eq!(
+        alice_ids,
+        vec![created[1].clone(), created[0].clone(), created[2].clone()]
+    );
+    let graph = alice
+        .call_tool(
+            "ptah_get_work_graph_page",
+            json!({
+                "session_id": session_id,
+                "workspace": workspace,
+                "limit": 10
+            }),
+        )
+        .await
+        .unwrap()
+        .structured;
+    let graph_ids: Vec<String> = graph["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|node| node["workId"].as_str().map(str::to_string))
+        .collect();
+    assert_eq!(graph_ids, alice_ids);
+    assert_eq!(graph["complete"], true);
+    let legacy = alice
+        .call_tool(
+            "ptah_list_work",
+            json!({
+                "session_id": session_id,
+                "workspace": workspace
+            }),
+        )
+        .await
+        .unwrap();
+    assert!(!legacy.is_error, "{:?}", legacy.raw);
+    assert_eq!(legacy.structured["work"].as_array().unwrap().len(), 3);
+    let runs = alice
+        .call_tool(
+            "ptah_list_runs",
+            json!({
+                "session_id": session_id,
+                "workspace": workspace
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(runs.structured["runs"].as_array().unwrap().len(), 0);
+    alice.close_session().await.unwrap();
+    bob.close_session().await.unwrap();
     handle.stop_and_wait().await;
 }
 

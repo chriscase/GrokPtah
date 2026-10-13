@@ -1,11 +1,13 @@
 //! Durable run records, idempotency receipts, audit log (#196).
 
+use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
 use std::fs;
 use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{sync_channel, SyncSender, TrySendError};
-use std::sync::Arc;
+use std::sync::{Arc, Barrier};
 
 use anyhow::Context;
 use chrono::{Duration, Utc};
@@ -37,8 +39,8 @@ use super::types::{
 use super::worker::{WorkerHostKind, WorkerPresence, WorkerProjection};
 use super::workload::{
     lease_duration, AssignmentStatus, AttemptState, BlockProvenance, WorkApproval, WorkAttempt,
-    WorkClaim, WorkDecision, WorkDecisionAction, WorkItem, WorkProgress, WorkResult, WorkState,
-    WorkloadReconciliationReport, WORKLOAD_SCHEMA_VERSION,
+    WorkAttemptView, WorkClaim, WorkDecision, WorkDecisionAction, WorkItem, WorkProgress,
+    WorkResult, WorkState, WorkloadReconciliationReport, WORKLOAD_SCHEMA_VERSION,
 };
 use super::{assemble_continuation_context, ContinuationContext, ContinuationInputSnapshot};
 use crate::completion::{evidence_authorizes_success, CompletionEvidence};
@@ -104,6 +106,11 @@ impl OrchStore {
     pub fn authority_home_lock(&self) -> PathBuf {
         self.inner.write_lease.lock().home_lock_path().to_path_buf()
     }
+
+    /// Host authenticator for work-page continuations. Callers must not log it.
+    pub fn page_mac_key(&self) -> [u8; 32] {
+        self.inner.page_mac_key
+    }
 }
 
 struct OrchStoreInner {
@@ -122,6 +129,49 @@ struct OrchStoreInner {
     last_audit_error: Arc<Mutex<Option<String>>>,
     audit_file_lock: Arc<Mutex<()>>,
     audit_writer: AuditWriter,
+    /// Host key for work-page continuations. Not serialized into records.
+    page_mac_key: [u8; 32],
+    /// In-memory refusal. A durable reconciliation marker reloads it on open.
+    ledger_admission_closed: Mutex<Option<String>>,
+}
+
+thread_local! {
+    static OPERATION_REQUEST: RefCell<Option<WorkRequestBinding>> = const { RefCell::new(None) };
+    static OPERATION_GATE_GENERATION: Cell<u64> = const { Cell::new(0) };
+}
+
+static WORK_REQUEST_TEST_GATE: Mutex<Option<Arc<Barrier>>> = Mutex::new(None);
+static WORK_REQUEST_TEST_GATE_GENERATION: AtomicU64 = AtomicU64::new(1);
+
+/// Operation-local request guard. Drop clears the binding if the transaction
+/// did not take it. Another thread, and another task that runs after an await,
+/// cannot see it.
+pub struct BoundWorkRequest {
+    active: bool,
+}
+
+impl Drop for BoundWorkRequest {
+    fn drop(&mut self) {
+        if self.active {
+            OPERATION_REQUEST.with(|slot| {
+                slot.borrow_mut().take();
+            });
+        }
+    }
+}
+
+fn wait_for_work_request_test_gate() {
+    let generation = WORK_REQUEST_TEST_GATE_GENERATION.load(Ordering::SeqCst);
+    let gate = WORK_REQUEST_TEST_GATE.lock().clone();
+    let Some(barrier) = gate else {
+        return;
+    };
+    let already = OPERATION_GATE_GENERATION.with(|seen| seen.get() == generation);
+    if already {
+        return;
+    }
+    OPERATION_GATE_GENERATION.with(|seen| seen.set(generation));
+    barrier.wait();
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -163,6 +213,64 @@ struct ManagerCreationIntent {
     root_work: WorkItem,
 }
 
+/// Service receipt identity stored inside an existing work intent.
+///
+/// Recovery completes this receipt from the sealed successor. The body is not
+/// a caller-supplied checksum, and it does not carry a workspace path beyond
+/// the display string the authenticated request already used.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkRequestBinding {
+    pub request_id: String,
+    pub owner_id: String,
+    pub tool: String,
+    pub session_id: Uuid,
+    pub workspace_digest: String,
+    pub workspace_display: String,
+    pub payload_hash: String,
+    /// `work_attempt`, `work_attempts`, `work_scope`, `decision`, `decision_scope`,
+    /// `claim`, `lease_view`, or `unblock`.
+    pub shape: String,
+    /// Work item this request named. Absent for a request that creates the id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_work_id: Option<String>,
+    /// Attempt this request named. Absent when the attempt does not exist yet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_attempt_id: Option<String>,
+    /// Caller revision fence. Absent when the operation has no revision argument.
+    /// A claim may expire a dead lease before its snapshot, so claim leaves this
+    /// empty and relies on the work id plus the idempotency payload.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_revision: Option<u64>,
+}
+
+impl WorkRequestBinding {
+    /// Copy the scope the service already authenticated. The digest stays the
+    /// one `IdempotencyScope` computed. Callers do not supply it.
+    pub fn bound(
+        scope: &IdempotencyScope,
+        workspace_display: impl Into<String>,
+        request_id: impl Into<String>,
+        tool: impl Into<String>,
+        payload_hash: impl Into<String>,
+        shape: impl Into<String>,
+    ) -> Self {
+        Self {
+            request_id: request_id.into(),
+            owner_id: scope.owner_id.clone(),
+            tool: tool.into(),
+            session_id: scope.session_id,
+            workspace_digest: scope.workspace_digest.clone(),
+            workspace_display: workspace_display.into(),
+            payload_hash: payload_hash.into(),
+            shape: shape.into(),
+            target_work_id: None,
+            target_attempt_id: None,
+            expected_revision: None,
+        }
+    }
+}
+
 /// Crash-recovery envelope for the paired WorkDecision + WorkItem mutation.
 ///
 /// Each record is still an independently atomic JSON file, but the intent is
@@ -180,6 +288,8 @@ struct WorkMutationIntent {
     decision_digest: String,
     item: WorkItem,
     decision: WorkDecision,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    request: Option<WorkRequestBinding>,
 }
 
 /// Crash-recovery envelope for WorkItem and WorkAttempt lifecycle changes.
@@ -201,6 +311,8 @@ struct WorkLifecycleIntent {
     item: WorkItem,
     prior_attempts: Vec<WorkAttempt>,
     attempts: Vec<WorkAttempt>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    request: Option<WorkRequestBinding>,
 }
 
 const WORK_LIFECYCLE_INTENT_SCHEMA_VERSION: u32 = 1;
@@ -518,6 +630,7 @@ impl WorkLifecycleIntent {
             item,
             prior_attempts,
             attempts,
+            request: None,
         };
         intent.validate()?;
         Ok(intent)
@@ -585,6 +698,7 @@ impl WorkMutationIntent {
             decision_digest,
             item,
             decision,
+            request: None,
         };
         intent.validate()?;
         Ok(intent)
@@ -851,6 +965,7 @@ impl OrchStore {
         fs::create_dir_all(root.join("work-lifecycle-intents"))?;
         fs::create_dir_all(root.join("apply-source-intents"))?;
         let root = dunce::canonicalize(root)?;
+        let page_mac_key = load_or_create_page_mac_key(&write_lease, &root)?;
         let lock_path = root.join(".store.lock");
         let store_lock = OpenOptions::new()
             .create(true)
@@ -906,6 +1021,8 @@ impl OrchStore {
                     join_state,
                     last_audit_error: last_audit_error.clone(),
                 },
+                page_mac_key,
+                ledger_admission_closed: Mutex::new(None),
             }),
         };
         store.quarantine_legacy_idempotency_receipts()?;
@@ -918,6 +1035,7 @@ impl OrchStore {
         store.recover_apply_admissions()?;
         store.recover_apply_source_intents()?;
         store.recover_managed_finalization_intents()?;
+        store.load_ledger_reconciliation_marker()?;
         store.mark_unfinished_interrupted()?;
         store.fail_orphaned_idempotency_claims()?;
         store.reconcile_workloads()?;
@@ -2089,13 +2207,28 @@ impl OrchStore {
                 ));
             }
         } else {
-            self.save_work_decision_unlocked(&intent.decision)?;
+            self.save_work_decision_unlocked(&intent.decision)
+                .map_err(|error| self.note_partial_commit(error))?;
         }
+        crash_process_if_stage("mutation_after_decision");
         if current_digest.as_deref() != Some(intent.next_item_digest.as_str()) {
             self.save_work_item_unlocked(&intent.item)
-                .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+                .map_err(|error| {
+                    self.note_partial_commit(OrchError::new(
+                        OrchErrorCode::Internal,
+                        error.to_string(),
+                    ))
+                })?;
         }
-        self.clear_work_mutation_intent_unlocked(&intent.intent_id)
+        crash_process_if_stage("mutation_after_item");
+        self.complete_bound_request_unlocked(
+            intent.request.as_ref(),
+            &mutation_response_value(intent),
+        )?;
+        crash_process_if_stage("mutation_after_receipt");
+        self.clear_work_mutation_intent_unlocked(&intent.intent_id)?;
+        crash_process_if_stage("mutation_after_commit");
+        Ok(())
     }
 
     fn recover_work_mutation_intents(&self) -> Result<(), OrchError> {
@@ -2154,9 +2287,31 @@ impl OrchStore {
     ) -> Result<(), OrchError> {
         let (current_item_digest, current_attempts) =
             self.preflight_work_lifecycle_intent_unlocked(intent)?;
-        self.write_work_lifecycle_attempt_updates_unlocked(intent, &current_attempts)?;
-        self.write_work_lifecycle_item_update_unlocked(intent, &current_item_digest)?;
-        self.clear_work_lifecycle_intent_unlocked(&intent.intent_id)
+        self.write_work_lifecycle_attempt_updates_unlocked(intent, &current_attempts)
+            .map_err(|error| self.note_partial_commit(error))?;
+        crash_process_if_stage("lifecycle_after_attempts");
+        self.write_work_lifecycle_item_update_unlocked(intent, &current_item_digest)
+            .map_err(|error| self.note_partial_commit(error))?;
+        crash_process_if_stage("lifecycle_after_item");
+        if intent.operation == "managed_finalization" {
+            self.settle_managed_finalization_unlocked(intent, Utc::now())
+                .map_err(|error| self.note_partial_commit(error))?;
+        }
+        // Apply receipts stay pending until the apply intent settles them.
+        // An intermediate snapshot must not publish success while the source
+        // effect is still recoverable, and must not block a later failure.
+        // Discard settles only on its terminal cancel, not on an apply
+        // snapshot the discard call may still reject.
+        if Self::lifecycle_settles_service_receipt(intent) {
+            self.complete_bound_request_unlocked(
+                intent.request.as_ref(),
+                &lifecycle_response_value(intent)?,
+            )?;
+        }
+        crash_process_if_stage("lifecycle_after_receipt");
+        self.clear_work_lifecycle_intent_unlocked(&intent.intent_id)?;
+        crash_process_if_stage("lifecycle_after_commit");
+        Ok(())
     }
 
     fn recover_work_lifecycle_intents(&self) -> Result<(), OrchError> {
@@ -2182,11 +2337,17 @@ impl OrchStore {
         // read_dir order is filesystem-dependent; managed-finalization envelopes
         // must converge only after every other queued lifecycle intent for the
         // same work item has been replayed.
+        // Revision order is the dependency order. A later transition's prior
+        // revision is the earlier transition's successor. Managed finalization
+        // still runs after other intents at the same revision, then intent id
+        // only breaks remaining ties. Directory order is not consulted.
         intents.sort_by(|left, right| {
             let left_managed = left.operation == "managed_finalization";
             let right_managed = right.operation == "managed_finalization";
-            left_managed
-                .cmp(&right_managed)
+            left.prior_item
+                .revision
+                .cmp(&right.prior_item.revision)
+                .then_with(|| left_managed.cmp(&right_managed))
                 .then_with(|| left.intent_id.cmp(&right.intent_id))
         });
         for intent in intents {
@@ -2203,9 +2364,38 @@ impl OrchStore {
         prior_attempts: Vec<WorkAttempt>,
         attempts: Vec<WorkAttempt>,
     ) -> Result<(), OrchError> {
-        let intent =
+        self.commit_lifecycle_with_request_unlocked(
+            operation,
+            prior_item,
+            item,
+            prior_attempts,
+            attempts,
+            None,
+        )
+    }
+
+    fn commit_lifecycle_with_request_unlocked(
+        &self,
+        operation: &str,
+        prior_item: WorkItem,
+        item: WorkItem,
+        prior_attempts: Vec<WorkAttempt>,
+        attempts: Vec<WorkAttempt>,
+        request: Option<WorkRequestBinding>,
+    ) -> Result<(), OrchError> {
+        let mut intent =
             WorkLifecycleIntent::new(operation, prior_item, item, prior_attempts, attempts)?;
+        if let Some(request) = request {
+            self.validate_bound_request_unlocked(
+                &request,
+                &intent.prior_item,
+                &intent.prior_attempts,
+                &intent.attempts,
+            )?;
+            intent.request = Some(request);
+        }
         self.persist_work_lifecycle_intent_unlocked(&intent)?;
+        crash_process_if_stage("lifecycle_after_intent");
         self.commit_work_lifecycle_intent_unlocked(&intent)
     }
 
@@ -3787,6 +3977,7 @@ impl OrchStore {
         assigned_agent_id: Option<String>,
         expected_revision: Option<u64>,
     ) -> Result<WorkItem, OrchError> {
+        let request = self.adopt_operation_request();
         let _guard = self.inner.lock.lock();
         let mut item = self
             .load_work_item_unlocked(work_id)
@@ -3811,12 +4002,13 @@ impl OrchStore {
         };
         item.validate()?;
         item.bump();
-        self.commit_work_lifecycle_snapshots_unlocked(
+        self.commit_lifecycle_with_request_unlocked(
             "assign",
             prior_item,
             item.clone(),
             prior_attempts.clone(),
             prior_attempts,
+            request,
         )?;
         Ok(item)
     }
@@ -4154,6 +4346,7 @@ impl OrchStore {
                 "decision reason is required",
             ));
         }
+        let request_binding = self.adopt_operation_request();
         let _guard = self.inner.lock.lock();
         let mut item = self
             .load_work_item_unlocked(request.work_id)
@@ -4189,8 +4382,18 @@ impl OrchStore {
         // The intent is the durable commit marker for this pair. Either file
         // may be missing after a crash; reopening the store replays the exact
         // decision and item only when the observed prior/next digests agree.
-        let intent = WorkMutationIntent::new(&prior_item, item.clone(), decision.clone())?;
+        let mut intent = WorkMutationIntent::new(&prior_item, item.clone(), decision.clone())?;
+        if let Some(request) = request_binding {
+            self.validate_bound_request_unlocked(
+                &request,
+                &prior_item,
+                &[] as &[WorkAttempt],
+                &[],
+            )?;
+            intent.request = Some(request);
+        }
         self.persist_work_mutation_intent_unlocked(&intent)?;
+        crash_process_if_stage("mutation_after_intent");
         self.commit_work_mutation_intent_unlocked(&intent)?;
         Ok((item, decision))
     }
@@ -5329,6 +5532,8 @@ impl OrchStore {
         now: chrono::DateTime<Utc>,
         stage: ManagedFinalizationStage,
     ) -> Result<Option<ManagedExecutionIntent>, OrchError> {
+        let request = self.adopt_operation_request();
+        self.refuse_closed_admission()?;
         let _guard = self.inner.lock.lock();
         let Some(intent) = self.load_managed_intent_unlocked(intent_id)? else {
             return Ok(None);
@@ -5409,7 +5614,7 @@ impl OrchStore {
             result,
             created_at: now,
         };
-        self.apply_managed_finalization_unlocked(&record, stage, now)?;
+        self.apply_managed_finalization_unlocked(&record, stage, now, request)?;
         self.load_managed_intent_unlocked(intent_id)
     }
 
@@ -5440,6 +5645,8 @@ impl OrchStore {
         now: chrono::DateTime<Utc>,
         stage: ManagedFinalizationStage,
     ) -> Result<Option<ManagedExecutionIntent>, OrchError> {
+        let request = self.adopt_operation_request();
+        self.refuse_closed_admission()?;
         let _guard = self.inner.lock.lock();
         let Some(intent) = self.load_managed_intent_unlocked(intent_id)? else {
             return Ok(None);
@@ -5533,7 +5740,7 @@ impl OrchStore {
             result,
             created_at: now,
         };
-        self.apply_managed_finalization_unlocked(&record, stage, now)?;
+        self.apply_managed_finalization_unlocked(&record, stage, now, request)?;
         self.load_managed_intent_unlocked(intent_id)
     }
 
@@ -5554,12 +5761,33 @@ impl OrchStore {
         for path in paths {
             let record: ManagedFinalizationRecord =
                 serde_json::from_str(&fs::read_to_string(&path)?)?;
-            self.apply_managed_finalization_unlocked(
-                &record,
-                ManagedFinalizationStage::Complete,
-                Utc::now(),
-            )
-            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+            let lifecycle_intent_id =
+                Self::managed_finalization_lifecycle_intent_id(&record.intent_id);
+            let lifecycle_path = self
+                .work_lifecycle_intent_path(&lifecycle_intent_id)
+                .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+            if lifecycle_path.is_file() {
+                // Lifecycle recovery commits this envelope first. A journal
+                // that still has its envelope is adopted, never re-derived.
+                self.apply_managed_finalization_unlocked(
+                    &record,
+                    ManagedFinalizationStage::Complete,
+                    Utc::now(),
+                    None,
+                )
+                .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+            } else if self
+                .managed_finalization_already_settled_unlocked(&record)
+                .map_err(|error| anyhow::anyhow!(error.to_string()))?
+            {
+                self.remove_managed_finalization_journal_unlocked(&record.intent_id)
+                    .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+            } else {
+                // Legacy journal with no sealed prior/successor. Keep the
+                // bytes, do not mint an outcome from later disk state.
+                self.quarantine_unbound_finalization_journal_unlocked(&path)
+                    .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+            }
             n += 1;
         }
         Ok(n)
@@ -5643,19 +5871,17 @@ impl OrchStore {
         record: &ManagedFinalizationRecord,
         stage: ManagedFinalizationStage,
         now: chrono::DateTime<Utc>,
+        request: Option<WorkRequestBinding>,
     ) -> Result<(), OrchError> {
         if stage == ManagedFinalizationStage::BeforeJournal {
             return Ok(());
         }
-        let path = self.managed_finalization_path(&record.intent_id)?;
-        atomic_write_json(&self.lease(), &path, record)
-            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
-        if stage == ManagedFinalizationStage::AfterJournal {
-            return Ok(());
-        }
         let lifecycle_intent_id = Self::managed_finalization_lifecycle_intent_id(&record.intent_id);
         let lifecycle_path = self.work_lifecycle_intent_path(&lifecycle_intent_id)?;
-        let intent = if lifecycle_path.is_file() {
+        // The envelope is the commit authority. Snapshot current disk only
+        // while creating it. A later reopen adopts this file and does not
+        // call prepare against whatever the disk says then.
+        let mut intent = if lifecycle_path.is_file() {
             let intent: WorkLifecycleIntent = serde_json::from_str(
                 &fs::read_to_string(&lifecycle_path)
                     .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?,
@@ -5674,9 +5900,34 @@ impl OrchStore {
                 next_attempts,
             )?
         };
-        self.persist_work_lifecycle_intent_unlocked(&intent)?;
+        if intent.request.is_none() {
+            if let Some(request) = request {
+                self.validate_bound_request_unlocked(
+                    &request,
+                    &intent.prior_item,
+                    &intent.prior_attempts,
+                    &intent.attempts,
+                )?;
+                intent.request = Some(request);
+            }
+        }
+        self.persist_work_lifecycle_intent_unlocked(&intent)
+            .map_err(|error| self.note_partial_commit(error))?;
+        crash_process_if_stage("managed_finalization_after_intent");
+        if stage == ManagedFinalizationStage::AfterIntent {
+            return Ok(());
+        }
+        let path = self.managed_finalization_path(&record.intent_id)?;
+        atomic_write_json(&self.lease(), &path, record).map_err(|error| {
+            self.note_partial_commit(OrchError::new(OrchErrorCode::Internal, error.to_string()))
+        })?;
+        crash_process_if_stage("managed_finalization_after_journal");
+        if stage == ManagedFinalizationStage::AfterJournal {
+            return Ok(());
+        }
         if stage == ManagedFinalizationStage::Complete {
             self.commit_work_lifecycle_intent_unlocked(&intent)?;
+            Ok(())
         } else {
             let (current_item_digest, current_attempts) =
                 self.preflight_work_lifecycle_intent_unlocked(&intent)?;
@@ -5688,20 +5939,412 @@ impl OrchStore {
             if stage == ManagedFinalizationStage::AfterWork {
                 return Ok(());
             }
+            Ok(())
         }
-        if let Some(mut intent) = self.load_managed_intent_unlocked(&record.intent_id)? {
-            // The existing finalization journal also closes the managed Grok
-            // Run. Recovery replays this before dropping the journal; a crash
-            // cannot leave a successful-looking orphan Run or redispatch it.
-            if intent.grok.is_some() {
-                if let Some(run_id) = intent.run_id.as_deref() {
-                    if let Some(mut run) = self.load_run_unlocked(run_id).map_err(|error| {
+    }
+
+    /// Install this thread's request binding. The guard's drop removes it if
+    /// the transaction did not take it. A second install on the same thread
+    /// is refused, so one operation cannot erase another.
+    pub fn bind_work_request(binding: WorkRequestBinding) -> Result<BoundWorkRequest, OrchError> {
+        let installed = OPERATION_REQUEST.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            if slot.is_some() {
+                return false;
+            }
+            *slot = Some(binding);
+            true
+        });
+        if !installed {
+            return Err(OrchError::new(
+                OrchErrorCode::Conflict,
+                "a work request binding is already active on this operation",
+            ));
+        }
+        wait_for_work_request_test_gate();
+        Ok(BoundWorkRequest { active: true })
+    }
+
+    /// Test rendezvous. The wait runs after a binding is installed and before
+    /// the store mutation takes the process lock. Production passes `None`.
+    ///
+    /// Background writers do not wait. An unbound racer calls
+    /// [`arrive_at_work_request_test_gate`](Self::arrive_at_work_request_test_gate)
+    /// on its own thread before the store call.
+    pub fn set_work_request_test_gate(gate: Option<Arc<Barrier>>) {
+        *WORK_REQUEST_TEST_GATE.lock() = gate;
+        WORK_REQUEST_TEST_GATE_GENERATION.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Join the current test gate once on this thread. Store operations do not
+    /// wait on their own, so a supervisor reconcile cannot consume a party.
+    pub fn arrive_at_work_request_test_gate() {
+        wait_for_work_request_test_gate();
+    }
+
+    fn adopt_operation_request(&self) -> Option<WorkRequestBinding> {
+        OPERATION_REQUEST.with(|slot| slot.borrow_mut().take())
+    }
+
+    fn validate_bound_request_unlocked(
+        &self,
+        request: &WorkRequestBinding,
+        prior_item: &WorkItem,
+        prior_attempts: &[WorkAttempt],
+        next_attempts: &[WorkAttempt],
+    ) -> Result<(), OrchError> {
+        const SHAPES: &[&str] = &[
+            "work_attempt",
+            "work_attempts",
+            "work_scope",
+            "decision",
+            "decision_scope",
+            "claim",
+            "lease_view",
+            "unblock",
+        ];
+        if !SHAPES.contains(&request.shape.as_str()) {
+            return Err(OrchError::new(
+                OrchErrorCode::Conflict,
+                "work request binding has an unknown response shape",
+            ));
+        }
+        if request.session_id != prior_item.session_id {
+            return Err(OrchError::new(
+                OrchErrorCode::ForbiddenScope,
+                "work request binding does not match the work session",
+            ));
+        }
+        if !bound_request_workspace_matches(request, &prior_item.workspace) {
+            return Err(OrchError::new(
+                OrchErrorCode::ForbiddenScope,
+                "work request binding does not match the work workspace",
+            ));
+        }
+        if request
+            .target_work_id
+            .as_deref()
+            .is_some_and(|work_id| work_id != prior_item.work_id)
+        {
+            return Err(OrchError::new(
+                OrchErrorCode::Conflict,
+                "work request binding names a different work item",
+            ));
+        }
+        if let Some(revision) = request.expected_revision {
+            if revision != prior_item.revision {
+                return Err(OrchError::new(
+                    OrchErrorCode::Conflict,
+                    "work request binding expected a different revision",
+                ));
+            }
+        }
+        if let Some(attempt_id) = request.target_attempt_id.as_deref() {
+            let present = prior_attempts
+                .iter()
+                .chain(next_attempts.iter())
+                .any(|attempt| attempt.attempt_id == attempt_id);
+            if !present {
+                return Err(OrchError::new(
+                    OrchErrorCode::Conflict,
+                    "work request binding names a missing attempt",
+                ));
+            }
+        }
+        let scope = IdempotencyScope {
+            owner_id: request.owner_id.clone(),
+            session_id: request.session_id,
+            workspace_digest: request.workspace_digest.clone(),
+        };
+        let receipt = self
+            .load_idempotency_unlocked(&scope, &request.request_id)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
+            .ok_or_else(|| {
+                OrchError::new(OrchErrorCode::Conflict, "idempotency claim is missing")
+            })?;
+        if receipt.owner_id != request.owner_id
+            || receipt.session_id != request.session_id
+            || receipt.workspace_digest != request.workspace_digest
+            || receipt.tool != request.tool
+            || receipt.payload_hash != request.payload_hash
+            || receipt.request_id != request.request_id
+        {
+            return Err(OrchError::new(
+                OrchErrorCode::Conflict,
+                "work request binding does not match its idempotency receipt",
+            ));
+        }
+        if receipt.status != "pending" {
+            return Err(OrchError::new(
+                OrchErrorCode::Conflict,
+                format!("idempotency claim is already {}", receipt.status),
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn ledger_admission_closed(&self) -> Option<String> {
+        self.inner.ledger_admission_closed.lock().clone()
+    }
+
+    fn note_partial_commit(&self, error: OrchError) -> OrchError {
+        if error.code == OrchErrorCode::Internal {
+            let message = "ledger admission is closed until the store is reopened".to_string();
+            *self.inner.ledger_admission_closed.lock() = Some(message.clone());
+            *self.inner.last_run_error.lock() = Some(message);
+        }
+        error
+    }
+
+    fn refuse_closed_admission(&self) -> Result<(), OrchError> {
+        if let Some(message) = self.ledger_admission_closed() {
+            return Err(OrchError::new(OrchErrorCode::Conflict, message));
+        }
+        Ok(())
+    }
+
+    fn mark_reconciliation_required(&self) {
+        *self.inner.ledger_admission_closed.lock() =
+            Some("ledger reconciliation is required".to_string());
+    }
+
+    /// Persist the refusal before any evidence move. The marker is the durable
+    /// admission authority. Quarantine files are a second authority for ledgers
+    /// that moved evidence and then died before the marker, and for a marker
+    /// that is missing while those files remain.
+    fn persist_ledger_reconciliation_marker_unlocked(&self) -> Result<(), OrchError> {
+        atomic_write_json(
+            &self.lease(),
+            &self.inner.root.join("ledger-reconciliation.json"),
+            &serde_json::json!({
+                "schemaVersion": 1,
+                "code": "unbound_managed_finalization"
+            }),
+        )
+        .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        self.mark_reconciliation_required();
+        Ok(())
+    }
+
+    fn load_ledger_reconciliation_marker(&self) -> Result<(), OrchError> {
+        let path = self.inner.root.join("ledger-reconciliation.json");
+        let evidence = self.unresolved_quarantine_evidence()?;
+        if path.is_file() {
+            self.mark_reconciliation_required();
+            if evidence {
+                // Finish directory durability if a previous process died after
+                // the rename and before its directory fsync.
+                self.fsync_directory(&self.inner.root.join("managed-finalization-quarantine"))?;
+                self.fsync_directory(&self.inner.root)?;
+            }
+            return Ok(());
+        }
+        if evidence {
+            self.persist_ledger_reconciliation_marker_unlocked()?;
+            self.fsync_directory(&self.inner.root.join("managed-finalization-quarantine"))?;
+        }
+        Ok(())
+    }
+
+    /// Any regular file under the quarantine directory is unresolved evidence.
+    /// A later Work state is not a resolution, and an unparseable file is not
+    /// discarded.
+    fn unresolved_quarantine_evidence(&self) -> Result<bool, OrchError> {
+        let dir = self.inner.root.join("managed-finalization-quarantine");
+        if !dir.is_dir() {
+            return Ok(false);
+        }
+        for entry in fs::read_dir(&dir)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
+        {
+            let path = entry
+                .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
+                .path();
+            if !path.is_file() {
+                continue;
+            }
+            fs::read(&path)
+                .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    fn fsync_directory(&self, path: &Path) -> Result<(), OrchError> {
+        crate::verified_change::fail_durable_write_if_armed(path)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        #[cfg(unix)]
+        {
+            fs::File::open(path)
+                .and_then(|file| file.sync_all())
+                .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        }
+        Ok(())
+    }
+
+    fn lifecycle_settles_service_receipt(intent: &WorkLifecycleIntent) -> bool {
+        match intent.request.as_ref().map(|request| request.tool.as_str()) {
+            Some("ptah_apply_verified_change") => false,
+            Some("ptah_discard_verified_change") => intent.operation == "discard-candidate",
+            _ => true,
+        }
+    }
+
+    fn complete_bound_request_unlocked(
+        &self,
+        request: Option<&WorkRequestBinding>,
+        response: &serde_json::Value,
+    ) -> Result<(), OrchError> {
+        let Some(request) = request else {
+            return Ok(());
+        };
+        if response.is_null() {
+            return Ok(());
+        }
+        let scope = IdempotencyScope {
+            owner_id: request.owner_id.clone(),
+            session_id: request.session_id,
+            workspace_digest: request.workspace_digest.clone(),
+        };
+        self.finish_idempotency_unlocked(
+            &scope,
+            &request.tool,
+            &request.request_id,
+            &request.payload_hash,
+            None,
+            response.clone(),
+            None,
+            "complete",
+        )
+        .map_err(|error| self.note_partial_commit(error))
+    }
+
+    fn managed_finalization_already_settled_unlocked(
+        &self,
+        record: &ManagedFinalizationRecord,
+    ) -> Result<bool, OrchError> {
+        let Some(managed) = self.load_managed_intent_unlocked(&record.intent_id)? else {
+            return Ok(false);
+        };
+        if managed.state != ManagedIntentState::Finalized
+            && managed.state != ManagedIntentState::Abandoned
+        {
+            return Ok(false);
+        }
+        let Some(item) = self
+            .load_work_item_unlocked(&record.work_id)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
+        else {
+            return Ok(false);
+        };
+        Ok(item.state == record.work_state)
+    }
+
+    fn remove_managed_finalization_journal_unlocked(
+        &self,
+        intent_id: &str,
+    ) -> Result<(), OrchError> {
+        let path = self.managed_finalization_path(intent_id)?;
+        if path.is_file() {
+            if let Ok(_write) = self.lease().begin("clearing a managed finalization intent") {
+                let _ = fs::remove_file(path);
+            }
+        }
+        Ok(())
+    }
+
+    fn quarantine_unbound_finalization_journal_unlocked(
+        &self,
+        path: &Path,
+    ) -> Result<(), OrchError> {
+        // The marker lands before the journal leaves the recovery scan. A
+        // failed marker write keeps the original bytes where reopen will see
+        // them. A failed move or directory fsync keeps the marker, so reopen
+        // stays refused even if the rename has not become durable.
+        crash_process_if_stage("quarantine_before_marker");
+        self.persist_ledger_reconciliation_marker_unlocked()?;
+        crash_process_if_stage("quarantine_after_marker");
+        let name = path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or("journal.json");
+        let dir = self.inner.root.join("managed-finalization-quarantine");
+        let destination = dir.join(format!("{name}.unbound-{}", Uuid::new_v4().simple()));
+        crate::verified_change::fail_durable_write_if_armed(&destination)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        fs::create_dir_all(&dir)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        fs::rename(path, &destination)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        crash_process_if_stage("quarantine_after_move");
+        if let Some(source_dir) = path.parent() {
+            self.fsync_directory(source_dir)?;
+        }
+        self.fsync_directory(&dir)?;
+        crash_process_if_stage("quarantine_after_durability");
+        Ok(())
+    }
+
+    /// Close the managed run, agent, and intent, then drop the journal.
+    /// The lifecycle envelope remains until the caller clears it.
+    fn settle_managed_finalization_unlocked(
+        &self,
+        lifecycle: &WorkLifecycleIntent,
+        now: chrono::DateTime<Utc>,
+    ) -> Result<(), OrchError> {
+        let Some(managed_id) = lifecycle
+            .intent_id
+            .strip_prefix("managed-finalization:")
+            .map(str::to_string)
+        else {
+            return Ok(());
+        };
+        let journal_path = self.managed_finalization_path(&managed_id)?;
+        let record = if journal_path.is_file() {
+            serde_json::from_str::<ManagedFinalizationRecord>(
+                &fs::read_to_string(&journal_path)
+                    .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?,
+            )
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
+        } else {
+            ManagedFinalizationRecord {
+                schema_version: MANAGED_FINALIZATION_SCHEMA_VERSION,
+                intent_id: managed_id.clone(),
+                work_id: lifecycle.work_id.clone(),
+                attempt_id: lifecycle
+                    .attempts
+                    .iter()
+                    .find(|attempt| attempt.state != AttemptState::Running)
+                    .map(|attempt| attempt.attempt_id.clone()),
+                outcome: match lifecycle.item.state {
+                    WorkState::Succeeded => ManagedFinalizationOutcome::Completed,
+                    WorkState::AwaitingApproval => ManagedFinalizationOutcome::AwaitingApproval,
+                    WorkState::Review => ManagedFinalizationOutcome::Review,
+                    WorkState::Queued => ManagedFinalizationOutcome::RetryQueued,
+                    WorkState::Cancelled => ManagedFinalizationOutcome::Cancelled,
+                    _ => ManagedFinalizationOutcome::Failed,
+                },
+                attempt_state: lifecycle
+                    .attempts
+                    .last()
+                    .map(|attempt| attempt.state)
+                    .unwrap_or(AttemptState::Failed),
+                work_state: lifecycle.item.state,
+                reason: "recovered managed finalization".into(),
+                result: lifecycle.item.result.clone(),
+                created_at: now,
+            }
+        };
+        if let Some(mut managed) = self.load_managed_intent_unlocked(&managed_id)? {
+            if managed.grok.is_some() {
+                if let Some(run_id) = managed.run_id.clone() {
+                    if let Some(mut run) = self.load_run_unlocked(&run_id).map_err(|error| {
                         OrchError::new(OrchErrorCode::Internal, error.to_string())
                     })? {
                         if !run.state.is_terminal() || record.work_state == WorkState::Cancelled {
                             let cancelled = record.work_state == WorkState::Cancelled;
                             let complete = !cancelled
-                                && intent.grok.as_ref().is_some_and(|grok| {
+                                && managed.grok.as_ref().is_some_and(|grok| {
                                     grok.final_state
                                         == Some(
                                             grokptah_agent_sdk::GrokBuildRunState::CompleteAdvisory,
@@ -5740,7 +6383,7 @@ impl OrchStore {
                                 .as_ref()
                                 .and_then(|result| result.failure.clone());
                             run.updated_at = now;
-                            if let Some(provider) = intent
+                            if let Some(provider) = managed
                                 .grok
                                 .as_ref()
                                 .and_then(|grok| grok.provider_evidence.as_ref())
@@ -5756,23 +6399,20 @@ impl OrchStore {
                                     .wire_attempts
                                     .saturating_sub(provider.responses_completed);
                             }
-                            let path = self.run_path(run_id)?;
+                            let path = self.run_path(&run_id)?;
                             atomic_write_json(&self.lease(), &path, &run).map_err(|error| {
                                 OrchError::new(OrchErrorCode::Internal, error.to_string())
                             })?;
                         }
                         if let Some(mut agent) = self
-                            .load_agent_unlocked(&intent.agent_id)
+                            .load_agent_unlocked(&managed.agent_id)
                             .map_err(|error| {
                                 OrchError::new(OrchErrorCode::Internal, error.to_string())
                             })?
                         {
-                            if agent.current_run_id.as_deref() == Some(run_id) {
+                            if agent.current_run_id.as_deref() == Some(run_id.as_str()) {
                                 agent.current_run_id = None;
-                                agent.last_run_id = Some(run_id.to_owned());
-                                // Run/Work retain failure or cancellation. The
-                                // idle persistent Agent can accept a separately
-                                // approved new assignment after either outcome.
+                                agent.last_run_id = Some(run_id);
                                 agent.state = AgentState::Waiting;
                                 agent.updated_at = now;
                                 atomic_write_json(
@@ -5788,20 +6428,15 @@ impl OrchStore {
                     }
                 }
             }
-            if intent.state != ManagedIntentState::Finalized
-                && intent.state != ManagedIntentState::Abandoned
+            if managed.state != ManagedIntentState::Finalized
+                && managed.state != ManagedIntentState::Abandoned
             {
-                intent.state = ManagedIntentState::Finalized;
-                intent.updated_at = now;
-                self.save_managed_intent_unlocked(&intent)?;
+                managed.state = ManagedIntentState::Finalized;
+                managed.updated_at = now;
+                self.save_managed_intent_unlocked(&managed)?;
             }
         }
-        if let Ok(_write) = self.lease().begin("clearing a managed finalization intent") {
-            // `_write` is a binding, not a discarded temporary, so the removal
-            // below happens *under* the authority rather than after it (#455).
-            let _ = fs::remove_file(path);
-        }
-        Ok(())
+        self.remove_managed_finalization_journal_unlocked(&managed_id)
     }
 
     pub fn seal_queued_managed_work(
@@ -5810,6 +6445,8 @@ impl OrchStore {
         reason: &str,
         now: chrono::DateTime<Utc>,
     ) -> Result<Option<WorkItem>, OrchError> {
+        let request = self.adopt_operation_request();
+        self.refuse_closed_admission()?;
         let _guard = self.inner.lock.lock();
         let Some(mut item) = self
             .load_work_item_unlocked(work_id)
@@ -5830,12 +6467,13 @@ impl OrchStore {
         item.state = WorkState::Failed;
         item.result = Some(Self::work_failure_result(reason, now));
         item.bump_at(now);
-        self.commit_work_lifecycle_snapshots_unlocked(
+        self.commit_lifecycle_with_request_unlocked(
             "seal_queued_managed",
             prior_item,
             item.clone(),
             prior_attempts.clone(),
             prior_attempts,
+            request,
         )?;
         Ok(Some(item))
     }
@@ -6004,6 +6642,7 @@ impl OrchStore {
         reason: &str,
         expected_revision: Option<u64>,
     ) -> Result<WorkItem, OrchError> {
+        let request = self.adopt_operation_request();
         let _guard = self.inner.lock.lock();
         let mut item = self
             .load_work_item_unlocked(work_id)
@@ -6036,12 +6675,13 @@ impl OrchStore {
         item.result = None;
         item.approval = None;
         item.bump();
-        self.commit_work_lifecycle_snapshots_unlocked(
+        self.commit_lifecycle_with_request_unlocked(
             "retry",
             prior_item,
             item.clone(),
             prior_attempts.clone(),
             prior_attempts,
+            request,
         )?;
         Ok(item)
     }
@@ -6065,6 +6705,7 @@ impl OrchStore {
             apply_bundle_digest: None,
         };
         approval.validate()?;
+        let request = self.adopt_operation_request();
         let _guard = self.inner.lock.lock();
         let mut item = self
             .load_work_item_unlocked(work_id)
@@ -6200,12 +6841,13 @@ impl OrchStore {
             item.approval = Some(bound);
             let approved_attempt = attempt.clone();
             item.bump();
-            self.commit_work_lifecycle_snapshots_unlocked(
+            self.commit_lifecycle_with_request_unlocked(
                 "approve-candidate",
                 prior_item,
                 item.clone(),
                 prior_attempts,
                 attempts.clone(),
+                request,
             )?;
             return Ok((item, approved_attempt));
         }
@@ -6213,12 +6855,13 @@ impl OrchStore {
         self.assign_work_succeeded_unlocked(&mut item, Some(attempt), None)?;
         let approved_attempt = attempt.clone();
         item.bump();
-        self.commit_work_lifecycle_snapshots_unlocked(
+        self.commit_lifecycle_with_request_unlocked(
             "approve",
             prior_item,
             item.clone(),
             prior_attempts,
             attempts.clone(),
+            request,
         )?;
         Ok((item, approved_attempt))
     }
@@ -7605,6 +8248,7 @@ impl OrchStore {
         expected_digest: &str,
         expected_revision: Option<u64>,
     ) -> Result<WorkItem, OrchError> {
+        let request = self.adopt_operation_request();
         let _guard = self.inner.lock.lock();
         let mut item = self
             .load_work_item_unlocked(work_id)
@@ -7754,12 +8398,13 @@ impl OrchStore {
             }
         }
         item.bump();
-        self.commit_work_lifecycle_snapshots_unlocked(
+        self.commit_lifecycle_with_request_unlocked(
             "discard-candidate",
             prior_item,
             item.clone(),
             prior_attempts,
             attempts,
+            request,
         )?;
         Ok(item)
     }
@@ -7976,6 +8621,10 @@ impl OrchStore {
         lease_secret: Option<&str>,
         managed_grok_fence: Option<&ManagedGrokClaimFence<'_>>,
     ) -> Result<WorkClaim, OrchError> {
+        let request = self.adopt_operation_request();
+        if let Some(message) = self.ledger_admission_closed() {
+            return Err(OrchError::new(OrchErrorCode::Conflict, message));
+        }
         let lease = lease_duration(lease_ms)?;
         if claimant_id.trim().is_empty() || claimant_id.len() > 256 {
             return Err(OrchError::new(
@@ -8082,12 +8731,13 @@ impl OrchStore {
         item.state = WorkState::Leased;
         item.bump();
         attempts.push(attempt.clone());
-        self.commit_work_lifecycle_snapshots_unlocked(
+        self.commit_lifecycle_with_request_unlocked(
             "claim",
             prior_item,
             item.clone(),
             prior_attempts,
             attempts,
+            request,
         )?;
         Ok(WorkClaim {
             work: item,
@@ -8136,6 +8786,7 @@ impl OrchStore {
         lease_ms: Option<u64>,
     ) -> Result<WorkAttempt, OrchError> {
         let lease = lease_duration(lease_ms)?;
+        let request = self.adopt_operation_request();
         let _guard = self.inner.lock.lock();
         let item = self
             .load_work_item_unlocked(work_id)
@@ -8153,12 +8804,13 @@ impl OrchStore {
         attempt.lease_expires_at = now + lease;
         attempt.updated_at = now;
         Self::replace_attempt_snapshot(&mut attempts, attempt.clone())?;
-        self.commit_work_lifecycle_snapshots_unlocked(
+        self.commit_lifecycle_with_request_unlocked(
             "renew_lease",
             prior_item,
             item,
             prior_attempts,
             attempts,
+            request,
         )?;
         Ok(attempt)
     }
@@ -8170,6 +8822,7 @@ impl OrchStore {
         lease_token: &str,
         run_id: &str,
     ) -> Result<WorkAttempt, OrchError> {
+        let request = self.adopt_operation_request();
         let _guard = self.inner.lock.lock();
         let item = self
             .load_work_item_unlocked(work_id)
@@ -8197,12 +8850,13 @@ impl OrchStore {
         }
         attempt.updated_at = now;
         Self::replace_attempt_snapshot(&mut attempts, attempt.clone())?;
-        self.commit_work_lifecycle_snapshots_unlocked(
+        self.commit_lifecycle_with_request_unlocked(
             "link_run",
             prior_item,
             item,
             prior_attempts,
             attempts,
+            request,
         )?;
         Ok(attempt)
     }
@@ -8214,6 +8868,7 @@ impl OrchStore {
         lease_token: &str,
         progress: WorkProgress,
     ) -> Result<(WorkItem, WorkAttempt), OrchError> {
+        let request = self.adopt_operation_request();
         let _guard = self.inner.lock.lock();
         let mut item = self
             .load_work_item_unlocked(work_id)
@@ -8235,12 +8890,13 @@ impl OrchStore {
         attempt.last_heartbeat_at = now;
         attempt.updated_at = now;
         Self::replace_attempt_snapshot(&mut attempts, attempt.clone())?;
-        self.commit_work_lifecycle_snapshots_unlocked(
+        self.commit_lifecycle_with_request_unlocked(
             "progress",
             prior_item,
             item.clone(),
             prior_attempts,
             attempts,
+            request,
         )?;
         Ok((item, attempt))
     }
@@ -8252,6 +8908,7 @@ impl OrchStore {
         lease_token: &str,
         reason: &str,
     ) -> Result<(WorkItem, WorkAttempt), OrchError> {
+        let request = self.adopt_operation_request();
         let _guard = self.inner.lock.lock();
         let mut item = self
             .load_work_item_unlocked(work_id)
@@ -8271,12 +8928,13 @@ impl OrchStore {
         item.state = WorkState::Queued;
         item.bump();
         Self::replace_attempt_snapshot(&mut attempts, attempt.clone())?;
-        self.commit_work_lifecycle_snapshots_unlocked(
+        self.commit_lifecycle_with_request_unlocked(
             "release",
             prior_item,
             item.clone(),
             prior_attempts,
             attempts,
+            request,
         )?;
         Ok((item, attempt))
     }
@@ -8289,6 +8947,7 @@ impl OrchStore {
         result: WorkResult,
     ) -> Result<(WorkItem, WorkAttempt), OrchError> {
         result.validate()?;
+        let request = self.adopt_operation_request();
         let _guard = self.inner.lock.lock();
         let mut item = self
             .load_work_item_unlocked(work_id)
@@ -8362,12 +9021,13 @@ impl OrchStore {
         }
         item.bump();
         Self::replace_attempt_snapshot(&mut attempts, attempt.clone())?;
-        self.commit_work_lifecycle_snapshots_unlocked(
+        self.commit_lifecycle_with_request_unlocked(
             "complete",
             prior_item,
             item.clone(),
             prior_attempts,
             attempts,
+            request,
         )?;
         Ok((item, attempt))
     }
@@ -8380,6 +9040,7 @@ impl OrchStore {
         result: WorkResult,
     ) -> Result<(WorkItem, WorkAttempt), OrchError> {
         result.validate()?;
+        let request = self.adopt_operation_request();
         let _guard = self.inner.lock.lock();
         let mut item = self
             .load_work_item_unlocked(work_id)
@@ -8407,12 +9068,13 @@ impl OrchStore {
         };
         item.bump();
         Self::replace_attempt_snapshot(&mut attempts, attempt.clone())?;
-        self.commit_work_lifecycle_snapshots_unlocked(
+        self.commit_lifecycle_with_request_unlocked(
             "fail",
             prior_item,
             item.clone(),
             prior_attempts,
             attempts,
+            request,
         )?;
         Ok((item, attempt))
     }
@@ -8431,6 +9093,7 @@ impl OrchStore {
         reason: &str,
         expected_revision: Option<u64>,
     ) -> Result<(WorkItem, Vec<WorkAttempt>), OrchError> {
+        let request = self.adopt_operation_request();
         let _guard = self.inner.lock.lock();
         let mut item = self
             .load_work_item_unlocked(work_id)
@@ -8469,12 +9132,13 @@ impl OrchStore {
             candidate_verification: None,
         });
         item.bump();
-        self.commit_work_lifecycle_snapshots_unlocked(
+        self.commit_lifecycle_with_request_unlocked(
             "cancel",
             prior_item,
             item.clone(),
             prior_attempts,
             attempts.clone(),
+            request,
         )?;
         Ok((item, attempts))
     }
@@ -9605,8 +10269,32 @@ impl OrchStore {
         error: Option<OrchError>,
         status: &str,
     ) -> Result<(), OrchError> {
-        let path = self.idemp_path(scope, request_id)?;
         let _g = self.inner.lock.lock();
+        self.finish_idempotency_unlocked(
+            scope,
+            tool,
+            request_id,
+            payload_hash,
+            run_id,
+            response,
+            error,
+            status,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn finish_idempotency_unlocked(
+        &self,
+        scope: &IdempotencyScope,
+        tool: &str,
+        request_id: &str,
+        payload_hash: &str,
+        run_id: Option<String>,
+        response: serde_json::Value,
+        error: Option<OrchError>,
+        status: &str,
+    ) -> Result<(), OrchError> {
+        let path = self.idemp_path(scope, request_id)?;
         if !path.is_file() {
             return Err(OrchError::new(
                 OrchErrorCode::Conflict,
@@ -10098,6 +10786,19 @@ fn remove_file_durable(lease: &crate::host_runtime::WriteLease, path: &Path) -> 
     Ok(())
 }
 
+fn bound_request_workspace_matches(request: &WorkRequestBinding, item_workspace: &str) -> bool {
+    if workspaces_match(item_workspace, &request.workspace_display) {
+        return true;
+    }
+    IdempotencyScope::new(
+        &request.owner_id,
+        request.session_id,
+        Path::new(item_workspace),
+    )
+    .ok()
+    .is_some_and(|scope| scope.workspace_digest == request.workspace_digest)
+}
+
 pub(crate) fn workspaces_match(left: &str, right: &str) -> bool {
     if left == right {
         return true;
@@ -10185,6 +10886,53 @@ fn receipt_path_matches_identity(path: &Path, receipt: &IdempotencyReceipt) -> b
 
 /// Every durable effect in this store funnels through here, so the authority
 /// check cannot be forgotten at a call site (#455).
+/// Persist the work-page MAC key beside the ledger. A present key of the
+/// wrong length fails open rather than being replaced, so a torn or edited
+/// authenticator cannot mint a fresh authority. The key is not JSON and is
+/// not written through the JSON helper, whose temp suffix assumes `.json`.
+fn load_or_create_page_mac_key(
+    lease: &crate::host_runtime::WriteLease,
+    root: &Path,
+) -> anyhow::Result<[u8; 32]> {
+    let path = root.join("page-mac.key");
+    if path.is_file() {
+        let bytes = fs::read(&path).context("read work page authenticator")?;
+        if bytes.len() != 32 {
+            anyhow::bail!("work page authenticator is corrupt");
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o600));
+        }
+        let mut key = [0u8; 32];
+        key.copy_from_slice(&bytes);
+        return Ok(key);
+    }
+    let mut key = [0u8; 32];
+    key[..16].copy_from_slice(Uuid::new_v4().as_bytes());
+    key[16..].copy_from_slice(Uuid::new_v4().as_bytes());
+    let _write = lease.begin("creating the work page authenticator")?;
+    let tmp = root.join("page-mac.key.tmp");
+    {
+        use std::io::Write;
+        let mut file = fs::File::create(&tmp)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            file.set_permissions(fs::Permissions::from_mode(0o600))?;
+        }
+        file.write_all(&key)?;
+        file.sync_all()?;
+    }
+    fs::rename(&tmp, &path)?;
+    #[cfg(unix)]
+    {
+        fs::File::open(root)?.sync_all()?;
+    }
+    Ok(key)
+}
+
 fn atomic_write_bytes(
     lease: &crate::host_runtime::WriteLease,
     path: &Path,
@@ -10206,6 +10954,121 @@ fn atomic_write_bytes(
         fs::File::open(parent)?.sync_all()?;
     }
     Ok(())
+}
+
+fn crash_process_if_stage(stage: &str) {
+    if std::env::var("GROKPTAH_CRASH_STAGE").ok().as_deref() == Some(stage) {
+        std::process::exit(86);
+    }
+}
+
+fn mutation_response_value(intent: &WorkMutationIntent) -> serde_json::Value {
+    let Some(request) = intent.request.as_ref() else {
+        return serde_json::Value::Null;
+    };
+    match request.shape.as_str() {
+        "decision" => serde_json::json!({
+            "work": intent.item,
+            "decision": intent.decision,
+        }),
+        "decision_scope" => serde_json::json!({
+            "work": intent.item,
+            "decision": intent.decision,
+            "sessionId": request.session_id,
+            "workspace": request.workspace_display,
+        }),
+        "work_scope" => serde_json::json!({
+            "work": intent.item,
+            "sessionId": request.session_id,
+            "workspace": request.workspace_display,
+        }),
+        "unblock" => {
+            let mut work = serde_json::json!({
+                "workId": intent.item.work_id,
+                "state": intent.item.state,
+                "revision": intent.item.revision,
+            });
+            if let Some(provenance) = intent.item.block_provenance {
+                work["blockProvenance"] = serde_json::json!(provenance);
+            }
+            serde_json::json!({
+                "work": work,
+                "sessionId": request.session_id,
+            })
+        }
+        _ => serde_json::Value::Null,
+    }
+}
+
+fn lifecycle_response_value(intent: &WorkLifecycleIntent) -> Result<serde_json::Value, OrchError> {
+    let Some(request) = intent.request.as_ref() else {
+        return Ok(serde_json::Value::Null);
+    };
+    match request.shape.as_str() {
+        "work_attempt" => {
+            let attempt = changed_lifecycle_attempt(intent)?;
+            Ok(serde_json::json!({
+                "work": intent.item,
+                "attempt": WorkAttemptView::from(attempt),
+            }))
+        }
+        "work_attempts" => {
+            let attempts = intent
+                .attempts
+                .iter()
+                .map(WorkAttemptView::from)
+                .collect::<Vec<_>>();
+            Ok(serde_json::json!({
+                "work": intent.item,
+                "attempts": attempts,
+            }))
+        }
+        "work_scope" => Ok(serde_json::json!({
+            "work": intent.item,
+            "sessionId": request.session_id,
+            "workspace": request.workspace_display,
+        })),
+        "claim" => {
+            let attempt = changed_lifecycle_attempt(intent)?;
+            Ok(serde_json::json!({
+                "work": intent.item,
+                "attempt": WorkAttemptView::from(attempt),
+                "sessionId": request.session_id,
+                "workspace": request.workspace_display,
+            }))
+        }
+        "lease_view" => {
+            let attempt = changed_lifecycle_attempt(intent)?;
+            Ok(serde_json::json!({
+                "workId": intent.work_id,
+                "attempt": WorkAttemptView::from(attempt),
+                "sessionId": request.session_id,
+                "workspace": request.workspace_display,
+            }))
+        }
+        _ => Ok(serde_json::Value::Null),
+    }
+}
+
+fn changed_lifecycle_attempt(intent: &WorkLifecycleIntent) -> Result<&WorkAttempt, OrchError> {
+    for attempt in &intent.attempts {
+        let next = OrchStore::attempt_digest(attempt)?;
+        let prior = intent
+            .prior_attempts
+            .iter()
+            .find(|prior| prior.attempt_id == attempt.attempt_id);
+        match prior {
+            None => return Ok(attempt),
+            Some(prior) if OrchStore::attempt_digest(prior)? != next => return Ok(attempt),
+            Some(_) => {}
+        }
+    }
+    intent.attempts.first().ok_or_else(|| {
+        OrchError::new(
+            OrchErrorCode::Internal,
+            "work attempt response has no attempt",
+        )
+    })
 }
 
 fn atomic_write_json<T: serde::Serialize>(
@@ -12730,6 +13593,7 @@ mod tests {
                     &record,
                     ManagedFinalizationStage::AfterJournal,
                     now,
+                    None,
                 )
                 .unwrap();
             let lifecycle_intent_id =

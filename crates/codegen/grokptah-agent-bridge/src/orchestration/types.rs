@@ -1612,6 +1612,9 @@ pub enum OrchErrorCode {
     CapacityExhausted,
     StaleVersion,
     CursorExpired,
+    /// The page continuation is authentic but the lane digest no longer matches.
+    /// The caller must drop the continuation and read from the start.
+    RestartRequired,
     Internal,
     /// Wall-clock / transport request deadline exceeded (maps to HTTP 504).
     Timeout,
@@ -1630,6 +1633,7 @@ impl OrchErrorCode {
             Self::CapacityExhausted => "capacity_exhausted",
             Self::StaleVersion => "stale_version",
             Self::CursorExpired => "cursor_expired",
+            Self::RestartRequired => "restart_required",
             Self::Internal => "internal",
             Self::Timeout => "timeout",
             Self::InvalidRequest => "invalid_request",
@@ -1837,8 +1841,11 @@ pub const CONTROL_TOOLS: &[&str] = &[
     "ptah_replan_manager_plan",
     "ptah_assign_work",
     "ptah_list_work",
+    "ptah_list_work_page",
     "ptah_get_work_graph",
+    "ptah_get_work_graph_page",
     "ptah_get_work",
+    "ptah_get_work_detail",
     "ptah_claim_work",
     "ptah_renew_work",
     "ptah_link_work_run",

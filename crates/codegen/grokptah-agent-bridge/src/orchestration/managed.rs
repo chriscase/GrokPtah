@@ -435,7 +435,10 @@ pub struct ManagedFinalizationRecord {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ManagedFinalizationStage {
+    /// No durable write. Reopen must not invent an outcome.
     BeforeJournal,
+    /// The lifecycle envelope is durable. The journal is not observable yet.
+    AfterIntent,
     AfterJournal,
     AfterAttempt,
     AfterWork,

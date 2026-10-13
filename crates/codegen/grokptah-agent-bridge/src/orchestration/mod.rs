@@ -16,6 +16,7 @@ mod service;
 mod store;
 mod supervisor;
 mod types;
+mod work_page;
 mod worker;
 mod workload;
 
@@ -83,7 +84,10 @@ pub use service::{
 };
 pub(crate) use store::workspaces_match;
 pub(crate) use store::AuditWriterStopReport;
-pub use store::{IdempotencyClaim, OrchStore, RetentionPolicy, RetentionReport};
+pub use store::{
+    BoundWorkRequest, IdempotencyClaim, OrchStore, RetentionPolicy, RetentionReport,
+    WorkRequestBinding,
+};
 pub use supervisor::{
     ManagerSupervisorReport, ManagerSupervisorStatus, RoutineSupervisor, RoutineSupervisorStatus,
     WorkloadSupervisor, WorkloadSupervisorStatus, DEFAULT_MANAGER_TICK_INTERVAL,
@@ -103,6 +107,17 @@ pub use types::{
     DEFAULT_PERSISTENT_AGENT_MAX_TOTAL_TOKENS, FORBIDDEN_TOOLS, LEGACY_DESKTOP_CLIENT_ID,
     LOCAL_DESKTOP_ORIGIN_ID, MAX_AGENT_CONTEXT_BYTES,
 };
+pub use work_page::{
+    attempt_content_fence, attempt_list_fence, encoded_tools_call_response, issue_cursor_for_tests,
+    issue_unknown_version_cursor_for_tests, lane_digest, legacy_payload_within_ceiling,
+    project_work_detail, select_work_graph_page, select_work_list_page, tools_call_response_len,
+    workspace_digest, WorkDetailPageV1, WorkDetailSection, WorkGraphPageV1, WorkListEntryV1,
+    WorkListPageV1, WorkPageFilter, WorkPageKind, WorkPageQuery, WorkPageReader,
+    ATTEMPT_CONSISTENCY, DEFAULT_WORK_DETAIL_LIMIT, DEFAULT_WORK_PAGE_LIMIT, MAX_WORK_CURSOR_CHARS,
+    MAX_WORK_DETAIL_LIMIT, MAX_WORK_PAGE_LIMIT, PREFERRED_WORK_PAGE_BYTES, WORK_DETAIL_KIND,
+    WORK_GRAPH_PAGE_KIND, WORK_LIST_PAGE_KIND, WORK_PAGE_CONSISTENCY, WORK_PAGE_CURSOR_TTL_SECS,
+    WORK_PAGE_ORDER_V1, WORK_PAGE_SCHEMA_VERSION, WORK_PAGE_TRANSPORT_CEILING_BYTES,
+};
 pub use worker::{
     reject_privilege_amplification, MeasuredCapability, WorkerHostKind, WorkerLivenessState,
     WorkerObservatoryProjection, WorkerPresence, WorkerProjection, DEFAULT_WORKER_STALE_AFTER_MS,
@@ -112,5 +127,6 @@ pub use workload::{
     AttemptState, BlockProvenance, WorkApproval, WorkArtifactRef, WorkAttempt, WorkAttemptView,
     WorkClaim, WorkDecision, WorkDecisionAction, WorkDependency, WorkItem, WorkItemSnapshot,
     WorkPolicy, WorkProgress, WorkResult, WorkRetryPolicy, WorkState, WorkloadReconciliationReport,
-    MAX_WORK_ALLOWED_FILES, MAX_WORK_ALLOWED_FILE_PATH_BYTES, WORKLOAD_SCHEMA_VERSION,
+    MAX_WORK_ALLOWED_FILES, MAX_WORK_ALLOWED_FILE_PATH_BYTES, MAX_WORK_ARTIFACTS,
+    MAX_WORK_ARTIFACT_BYTES, MAX_WORK_OBJECTIVE_BYTES, WORKLOAD_SCHEMA_VERSION,
 };

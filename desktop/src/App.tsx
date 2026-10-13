@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api } from "./lib/api";
+import { useWorkBoardPoll } from "./lib/useWorkBoardPoll";
 import {
   normalizeSessionUpdate,
   SLASH_COMMANDS,
@@ -14,10 +15,8 @@ import {
   type SubagentInfo,
   type TranscriptItem,
   type DurableRun,
-  type DurableWorkItem,
   type DurableRoutine,
   type LaneSummary,
-  type RemoteWorkSnapshot,
   type RemoteRoutineSnapshot,
   type RemoteSessionTarget,
   type RunOrigin,
@@ -365,11 +364,7 @@ export default function App() {
   const [runsError, setRunsError] = useState<string | null>(null);
   const [runsBusy, setRunsBusy] = useState(false);
   const [runsWatching, setRunsWatching] = useState(true);
-  const [workItems, setWorkItems] = useState<DurableWorkItem[]>([]);
-  const [selectedWorkId, setSelectedWorkId] = useState<string | null>(null);
-  const [workSnapshot, setWorkSnapshot] = useState<RemoteWorkSnapshot | null>(null);
-  const [workError, setWorkError] = useState<string | null>(null);
-  const [workBusy, setWorkBusy] = useState(false);
+  const refreshRoutinesRef = useRef<() => void>(() => {});
   const [routines, setRoutines] = useState<DurableRoutine[]>([]);
   const [selectedRoutineId, setSelectedRoutineId] = useState<string | null>(null);
   const [routineSnapshot, setRoutineSnapshot] = useState<RemoteRoutineSnapshot | null>(null);
@@ -943,6 +938,43 @@ export default function App() {
     executionTarget === "remote" && selectedRemoteLane
       ? selectedRemoteLane
       : activeLane;
+  const workBoardScope = useMemo(
+    () => ({
+      sessionId: workScopeLane?.session_id ?? activeSessionId,
+      workspace: workScopeLane?.cwd ?? null,
+      remote: executionTarget === "remote",
+      remoteConnected: remoteServiceStatus.connected,
+      remoteLanePresent: executionTarget !== "remote" || Boolean(selectedRemoteLane),
+    }),
+    [
+      activeSessionId,
+      executionTarget,
+      remoteServiceStatus.connected,
+      selectedRemoteLane,
+      workScopeLane,
+    ],
+  );
+  const workBoard = useWorkBoardPoll({
+    enabled: rightTab === "work",
+    scope: workBoardScope,
+    client: {
+      list: (scope, cursor) =>
+        scope.remote
+          ? api.remoteServiceWorkList(scope.sessionId ?? "", scope.workspace ?? "", cursor)
+          : api.workList(scope.sessionId ?? "", scope.workspace ?? "", cursor),
+      get: (scope, workId) =>
+        scope.remote
+          ? api.remoteServiceWorkGet(scope.sessionId ?? "", scope.workspace ?? "", workId)
+          : api.workGet(scope.sessionId ?? "", workId),
+    },
+    onRoutines: () => refreshRoutinesRef.current(),
+  });
+  const workItems = workBoard.view.items;
+  const selectedWorkId = workBoard.view.selectedWorkId;
+  const workSnapshot = workBoard.view.snapshot;
+  const workError = workBoard.view.error;
+  const workBusy = workBoard.view.busy;
+  const workTraversal = workBoard.view.traversal;
   const workScope = useMemo(
     () => ({
       laneId: workScopeLane?.id ?? activeSessionId,
@@ -957,9 +989,14 @@ export default function App() {
           ? remoteServiceStatus.connectionState ?? ("connected" as const)
           : ("connected" as const)),
       workspacePath: workScopeLane?.cwd ?? activeSummary?.cwd ?? activeTab?.cwd,
-      runLabel: workItems.length
-        ? `${workItems.length} durable Work Item${workItems.length === 1 ? "" : "s"}`
-        : "No durable Work",
+      runLabel:
+        workTraversal === "complete"
+          ? workItems.length
+            ? `${workItems.length} durable Work Item${workItems.length === 1 ? "" : "s"}`
+            : "No durable Work"
+          : workTraversal === "partial"
+            ? `${workItems.length} loaded`
+            : "Work list incomplete",
     }),
     [
       activeSessionId,
@@ -969,76 +1006,9 @@ export default function App() {
       remoteServiceStatus.connectionState,
       workItems.length,
       workScopeLane,
+      workTraversal,
     ],
   );
-  const refreshWorkItem = useCallback(
-    async (workId: string) => {
-      const lane =
-        executionTarget === "remote" && selectedRemoteLane
-          ? selectedRemoteLane
-          : activeLane;
-      const sessionId = lane?.session_id ?? activeSessionId;
-      const remoteTarget = executionTarget === "remote";
-      if (!sessionId) {
-        setWorkSnapshot(null);
-        return;
-      }
-      if (remoteTarget && (!selectedRemoteLane || !remoteServiceStatus.connected)) {
-        setWorkError("The remote service is disconnected. The last Work snapshot remains available.");
-        return;
-      }
-      try {
-        const snapshot =
-          executionTarget === "remote" && remoteServiceStatus.connected && lane
-            ? await api.remoteServiceWorkGet(sessionId, lane.cwd, workId)
-            : await api.workGet(sessionId, workId);
-        setWorkSnapshot(snapshot);
-        setWorkError(null);
-      } catch (error) {
-        setWorkSnapshot(null);
-        setWorkError(`Could not open durable Work Item: ${String(error)}`);
-      }
-    },
-    [activeLane, activeSessionId, executionTarget, remoteServiceStatus.connected, selectedRemoteLane],
-  );
-  const refreshWork = useCallback(async () => {
-    const lane =
-      executionTarget === "remote" && selectedRemoteLane
-        ? selectedRemoteLane
-        : activeLane;
-    const sessionId = lane?.session_id ?? activeSessionId;
-    const remoteTarget = executionTarget === "remote";
-    if (!sessionId) {
-      setWorkItems([]);
-      setSelectedWorkId(null);
-      setWorkSnapshot(null);
-      setWorkError(null);
-      return;
-    }
-    if (remoteTarget && (!selectedRemoteLane || !remoteServiceStatus.connected)) {
-      setWorkError("The remote service is disconnected. The last Work snapshot remains available.");
-      return;
-    }
-    setWorkBusy(true);
-    try {
-      const items =
-        executionTarget === "remote" && remoteServiceStatus.connected && lane
-          ? await api.remoteServiceWorkList(sessionId, lane.cwd)
-          : await api.workList(sessionId);
-      setWorkItems(items);
-      setSelectedWorkId((current) =>
-        current && items.some((item) => item.workId === current)
-          ? current
-          : items[0]?.workId ?? null,
-      );
-      setWorkError(null);
-    } catch (error) {
-      setWorkError(`Could not refresh durable Work Items: ${String(error)}`);
-    } finally {
-      setWorkBusy(false);
-    }
-  }, [activeLane, activeSessionId, executionTarget, remoteServiceStatus.connected, selectedRemoteLane]);
-
   const mutateWork = useCallback(
     async (action: (sessionId: string, workspace: string, remote: boolean) => Promise<void>) => {
       const lane =
@@ -1052,18 +1022,15 @@ export default function App() {
         throw new Error("The remote service is disconnected");
       }
       await action(sessionId, lane.cwd, remote);
-      await refreshWork();
-      if (selectedWorkId) await refreshWorkItem(selectedWorkId);
+      await workBoard.restart();
     },
     [
       activeLane,
       activeSessionId,
       executionTarget,
-      refreshWork,
-      refreshWorkItem,
       remoteServiceStatus.connected,
       selectedRemoteLane,
-      selectedWorkId,
+      workBoard.restart,
     ],
   );
 
@@ -1141,7 +1108,7 @@ export default function App() {
       await action(sessionId, lane.cwd, remote);
       await refreshRoutines();
       if (selectedRoutineId) await refreshRoutineItem(selectedRoutineId);
-      await refreshWork();
+      await workBoard.restart();
     },
     [
       activeLane,
@@ -1149,31 +1116,23 @@ export default function App() {
       executionTarget,
       refreshRoutineItem,
       refreshRoutines,
-      refreshWork,
       remoteServiceStatus.connected,
       selectedRemoteLane,
       selectedRoutineId,
+      workBoard.restart,
     ],
   );
+  refreshRoutinesRef.current = () => {
+    void refreshRoutines();
+  };
 
   useEffect(() => {
     if (rightTab !== "work" || !selectedWorkId) {
-      if (!selectedWorkId) setWorkSnapshot(null);
+      if (!selectedWorkId) workBoard.dismissDetail();
       return;
     }
-    void refreshWorkItem(selectedWorkId);
-  }, [refreshWorkItem, rightTab, selectedWorkId]);
-
-  useEffect(() => {
-    if (rightTab !== "work") return;
-    void refreshWork();
-    void refreshRoutines();
-    const timer = window.setInterval(() => {
-      void refreshWork();
-      void refreshRoutines();
-    }, 2500);
-    return () => window.clearInterval(timer);
-  }, [refreshRoutines, refreshWork, rightTab]);
+    void workBoard.refreshDetail(selectedWorkId);
+  }, [rightTab, selectedWorkId, workBoard.dismissDetail, workBoard.refreshDetail]);
 
   useEffect(() => {
     if (rightTab !== "work" || !selectedRoutineId) return;
@@ -2878,7 +2837,7 @@ export default function App() {
       if (tab === "plugins") setPlugins(await api.pluginsList());
       if (tab === "skills") setSkills(await api.skillsList());
       if (tab === "agents") await refreshPersistentAgents();
-      if (tab === "work") await refreshWork();
+      if (tab === "work") await workBoard.observe();
       if (tab === "tasks") {
         setSubagents(await api.subagentsList());
         setBgTasks(await api.backgroundTasks());
@@ -4431,6 +4390,15 @@ export default function App() {
             scope={workScope}
             busy={workBusy}
             error={workError}
+            traversalStatus={workTraversal}
+            pagesHeld={workBoard.view.freshness === "held"}
+            detailStatus={workBoard.view.detailStatus}
+            detailError={workBoard.view.detailError}
+            onRetryDetail={() => {
+              if (selectedWorkId) void workBoard.refreshDetail(selectedWorkId);
+            }}
+            onLoadMore={() => void workBoard.loadMore()}
+            onRetryTraversal={() => void workBoard.restart()}
             mutationsEnabled={Boolean(
               !activeLaneArchived &&
                 workScope.laneId &&
@@ -4442,10 +4410,9 @@ export default function App() {
                 ? `${runtimeTargetLabel(workScope.runtimeTarget ?? undefined)} · ${runtimeConnectionLabel(workScope.runtimeConnection ?? undefined)}`
                 : "Local durable store"
             }
-            onRefresh={() => void refreshWork()}
+            onRefresh={() => void workBoard.restart()}
             onSelect={(workId) => {
-              setSelectedWorkId(workId);
-              void refreshWorkItem(workId);
+              workBoard.select(workId);
             }}
             onCreate={(kind, objective, priority, requiresApproval) =>
               mutateWork((sessionId, workspace, remote) =>
