@@ -4278,6 +4278,9 @@ impl OrchestrationService {
                 return Err(error);
             }
         };
+        if let Some(message) = self.store.ledger_admission_closed() {
+            return Err(OrchError::new(OrchErrorCode::Conflict, message));
+        }
         let payload_hash = hash_payload(payload);
         if tool == "ptah_apply_verified_change" {
             if let Some(work_id) = payload.get("workId").and_then(serde_json::Value::as_str) {
@@ -5253,16 +5256,33 @@ impl OrchestrationService {
                 return Err(self.fail_claim(&mut lease, None, session_id, &claimed, error));
             }
         }
-        if let Err(error) = self.store.save_work_item(&item) {
-            return Err(self.fail_claim(
-                &mut lease,
-                Some(item.work_id.clone()),
-                session_id,
-                &claimed,
-                Self::map_work_ledger_error(error),
-            ));
-        }
-        let response = self.workload_value(item.clone(), false)?;
+        let _bound = self.bind_work_request(
+            &lease,
+            &claimed.display().to_string(),
+            "work_attempts",
+            None,
+            None,
+            None,
+        )?;
+        let response = match self.store.create_work_item(&item) {
+            Ok(response) => response,
+            Err(error) => {
+                if self.store.ledger_admission_closed().is_some() {
+                    // The durable intent may already own this outcome. Neither
+                    // fail_claim nor Drop may turn its pending receipt into a
+                    // refusal while restart still has a creation to finish.
+                    lease.leave_pending();
+                    return Err(error);
+                }
+                return Err(self.fail_claim(
+                    &mut lease,
+                    Some(item.work_id.clone()),
+                    session_id,
+                    &claimed,
+                    error,
+                ));
+            }
+        };
         lease
             .complete(Some(item.work_id.clone()), response.clone())
             .map_err(|error| {

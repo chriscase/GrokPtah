@@ -307,8 +307,12 @@ struct WorkLifecycleIntent {
     intent_id: String,
     operation: String,
     work_id: String,
-    prior_item: WorkItem,
+    // Version 1 always has a prior item. Version 2 is an authenticated create
+    // with an explicitly absent prior; it cannot masquerade as an update.
+    prior_item: Option<WorkItem>,
     item: WorkItem,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    creation_item_digest: Option<String>,
     prior_attempts: Vec<WorkAttempt>,
     attempts: Vec<WorkAttempt>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -316,6 +320,7 @@ struct WorkLifecycleIntent {
 }
 
 const WORK_LIFECYCLE_INTENT_SCHEMA_VERSION: u32 = 1;
+const WORK_CREATION_INTENT_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug, serde::Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -626,8 +631,9 @@ impl WorkLifecycleIntent {
             intent_id,
             operation: operation.to_string(),
             work_id: item.work_id.clone(),
-            prior_item,
+            prior_item: Some(prior_item),
             item,
+            creation_item_digest: None,
             prior_attempts,
             attempts,
             request: None,
@@ -637,23 +643,77 @@ impl WorkLifecycleIntent {
     }
 
     fn validate(&self) -> Result<(), OrchError> {
-        if self.schema_version != WORK_LIFECYCLE_INTENT_SCHEMA_VERSION
-            || self.intent_id.is_empty()
+        if self.intent_id.is_empty()
             || self.operation.trim().is_empty()
             || self.work_id.is_empty()
-            || self.prior_item.work_id != self.work_id
             || self.item.work_id != self.work_id
-            || self.prior_item.session_id != self.item.session_id
-            || self.prior_item.workspace != self.item.workspace
-            || self.prior_item.created_by != self.item.created_by
         {
             return Err(OrchError::new(
                 OrchErrorCode::InvalidRequest,
                 "work lifecycle intent schema or lane identity is invalid",
             ));
         }
-        self.prior_item.validate()?;
         self.item.validate()?;
+        if let Some(prior) = &self.prior_item {
+            if self.schema_version != WORK_LIFECYCLE_INTENT_SCHEMA_VERSION
+                || self.operation == "create"
+                || self.creation_item_digest.is_some()
+                || prior.work_id != self.work_id
+                || prior.session_id != self.item.session_id
+                || prior.workspace != self.item.workspace
+                || prior.created_by != self.item.created_by
+            {
+                return Err(OrchError::new(
+                    OrchErrorCode::InvalidRequest,
+                    "work lifecycle intent schema or lane identity is invalid",
+                ));
+            }
+            prior.validate()?;
+        } else {
+            let request = self.request.as_ref().ok_or_else(|| {
+                OrchError::new(
+                    OrchErrorCode::InvalidRequest,
+                    "work creation requires its original request",
+                )
+            })?;
+            if self.schema_version != WORK_CREATION_INTENT_SCHEMA_VERSION
+                || self.operation != "create"
+                || self.creation_item_digest.as_deref()
+                    != Some(OrchStore::work_digest(&self.item)?.as_str())
+                || request.tool != "ptah_create_work"
+                || request.shape != "work_attempts"
+                || request.target_work_id.is_some()
+                || request.target_attempt_id.is_some()
+                || request.expected_revision.is_some()
+                || request.session_id != self.item.session_id
+                || !bound_request_workspace_matches(request, &self.item.workspace)
+                || IdempotencyScope::new(
+                    &request.owner_id,
+                    request.session_id,
+                    Path::new(&self.item.workspace),
+                )?
+                .workspace_digest
+                    != request.workspace_digest
+                || self.item.state != WorkState::Queued
+                || self.item.revision != 1
+                || self.item.attempt_count != 0
+                || self.item.assignment_status != AssignmentStatus::Unassigned
+                || self.item.assigned_agent_id.is_some()
+                || self.item.is_container
+                || self.item.result.is_some()
+                || self.item.progress.is_some()
+                || self.item.approval.is_some()
+                || self.item.last_decision_id.is_some()
+                || self.item.created_at != self.item.updated_at
+                || !self.prior_attempts.is_empty()
+                || !self.attempts.is_empty()
+            {
+                return Err(OrchError::new(
+                    OrchErrorCode::InvalidRequest,
+                    "invalid sealed work creation",
+                ));
+            }
+        }
         validate_work_attempt_set(&self.work_id, &self.prior_attempts)?;
         validate_work_attempt_set(&self.work_id, &self.attempts)?;
         Ok(())
@@ -1030,8 +1090,11 @@ impl OrchStore {
         store.recover_finalization_intents()?;
         store.recover_routine_intents()?;
         store.recover_manager_creation_intents()?;
+        // An absent-prior creation must exist before a dependent update is
+        // recovered, and before pending receipts are classified as orphaned.
+        store.recover_work_lifecycle_intents(true)?;
         store.recover_work_mutation_intents()?;
-        store.recover_work_lifecycle_intents()?;
+        store.recover_work_lifecycle_intents(false)?;
         store.recover_apply_admissions()?;
         store.recover_apply_source_intents()?;
         store.recover_managed_finalization_intents()?;
@@ -1902,6 +1965,62 @@ impl OrchStore {
         self.save_work_item_unlocked(item)
     }
 
+    /// Admit an authenticated creation through the lifecycle transaction.
+    /// The intent owns both the original ID and its request outcome before
+    /// the first Work write. Ordinary fixture/import saves remain unbound.
+    pub fn create_work_item(&self, item: &WorkItem) -> Result<serde_json::Value, OrchError> {
+        let request = self.adopt_operation_request().ok_or_else(|| {
+            OrchError::new(
+                OrchErrorCode::Conflict,
+                "work creation request binding is missing",
+            )
+        })?;
+        let _guard = self.inner.lock.lock();
+        self.refuse_closed_admission()?;
+        if self
+            .load_work_item_unlocked(&item.work_id)
+            .map_err(Self::orch_error_from_anyhow)?
+            .is_some()
+        {
+            return Err(OrchError::new(
+                OrchErrorCode::Conflict,
+                "work creation ID already exists",
+            ));
+        }
+        self.validate_work_item_for_save_unlocked(item)
+            .map_err(Self::orch_error_from_anyhow)?;
+        self.validate_bound_request_unlocked(&request, item, &[], &[])?;
+        let intent = WorkLifecycleIntent {
+            schema_version: WORK_CREATION_INTENT_SCHEMA_VERSION,
+            intent_id: Uuid::new_v4().to_string(),
+            operation: "create".into(),
+            work_id: item.work_id.clone(),
+            prior_item: None,
+            item: item.clone(),
+            creation_item_digest: Some(Self::work_digest(item)?),
+            prior_attempts: Vec::new(),
+            attempts: Vec::new(),
+            request: Some(request),
+        };
+        intent.validate()?;
+        let response = lifecycle_response_value(&intent)?;
+        let path = self.work_lifecycle_intent_path(&intent.intent_id)?;
+        crash_process_if_stage("create_before_intent");
+        if let Err(error) = self.persist_work_lifecycle_intent_unlocked(&intent) {
+            // An fsync can fail after rename. Only proven absence permits an
+            // ordinary pre-admission refusal; uncertainty requires recovery.
+            return Err(if path.try_exists().unwrap_or(true) {
+                self.note_work_recovery_required(error)
+            } else {
+                error
+            });
+        }
+        crash_process_if_stage("lifecycle_after_intent");
+        self.commit_work_lifecycle_intent_unlocked(&intent)
+            .map_err(|error| self.note_work_recovery_required(error))?;
+        Ok(response)
+    }
+
     /// Import a pre-existing record for migration/fixture setup without
     /// re-validating edges against the rest of the ledger. Runtime mutation
     /// paths must use [`Self::save_work_item`].
@@ -2257,6 +2376,7 @@ impl OrchStore {
         &self,
         intent: &WorkLifecycleIntent,
     ) -> Result<(), OrchError> {
+        self.refuse_closed_admission()?;
         intent.validate()?;
         let path = self.work_lifecycle_intent_path(&intent.intent_id)?;
         atomic_write_json(&self.lease(), &path, intent)
@@ -2265,6 +2385,8 @@ impl OrchStore {
 
     fn clear_work_lifecycle_intent_unlocked(&self, intent_id: &str) -> Result<(), OrchError> {
         let path = self.work_lifecycle_intent_path(intent_id)?;
+        crate::verified_change::fail_durable_write_if_armed(&path)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
         remove_file_durable(&self.lease(), &path)
             .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))
     }
@@ -2293,6 +2415,9 @@ impl OrchStore {
         self.write_work_lifecycle_item_update_unlocked(intent, &current_item_digest)
             .map_err(|error| self.note_partial_commit(error))?;
         crash_process_if_stage("lifecycle_after_item");
+        if intent.prior_item.is_none() {
+            crash_process_if_stage("create_after_item");
+        }
         if intent.operation == "managed_finalization" {
             self.settle_managed_finalization_unlocked(intent, Utc::now())
                 .map_err(|error| self.note_partial_commit(error))?;
@@ -2314,7 +2439,7 @@ impl OrchStore {
         Ok(())
     }
 
-    fn recover_work_lifecycle_intents(&self) -> Result<(), OrchError> {
+    fn recover_work_lifecycle_intents(&self, creations_only: bool) -> Result<(), OrchError> {
         let _guard = self.inner.lock.lock();
         let dir = self.inner.root.join("work-lifecycle-intents");
         let mut intents = Vec::new();
@@ -2332,7 +2457,16 @@ impl OrchStore {
                     .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?,
             )
             .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
-            intents.push(intent);
+            intent.validate()?;
+            if path != self.work_lifecycle_intent_path(&intent.intent_id)? {
+                return Err(OrchError::new(
+                    OrchErrorCode::Conflict,
+                    "work lifecycle intent filename does not match its identity",
+                ));
+            }
+            if intent.prior_item.is_none() == creations_only {
+                intents.push(intent);
+            }
         }
         // read_dir order is filesystem-dependent; managed-finalization envelopes
         // must converge only after every other queued lifecycle intent for the
@@ -2345,8 +2479,9 @@ impl OrchStore {
             let left_managed = left.operation == "managed_finalization";
             let right_managed = right.operation == "managed_finalization";
             left.prior_item
-                .revision
-                .cmp(&right.prior_item.revision)
+                .as_ref()
+                .map(|item| item.revision)
+                .cmp(&right.prior_item.as_ref().map(|item| item.revision))
                 .then_with(|| left_managed.cmp(&right_managed))
                 .then_with(|| left.intent_id.cmp(&right.intent_id))
         });
@@ -2388,7 +2523,10 @@ impl OrchStore {
         if let Some(request) = request {
             self.validate_bound_request_unlocked(
                 &request,
-                &intent.prior_item,
+                intent
+                    .prior_item
+                    .as_ref()
+                    .expect("update constructor seals a prior item"),
                 &intent.prior_attempts,
                 &intent.attempts,
             )?;
@@ -2402,21 +2540,21 @@ impl OrchStore {
     fn preflight_work_lifecycle_intent_unlocked(
         &self,
         intent: &WorkLifecycleIntent,
-    ) -> Result<(String, Vec<WorkAttempt>), OrchError> {
+    ) -> Result<(Option<String>, Vec<WorkAttempt>), OrchError> {
         intent.validate()?;
         let current_item = self
             .load_work_item_unlocked(&intent.work_id)
-            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
-            .ok_or_else(|| {
-                OrchError::new(
-                    OrchErrorCode::Conflict,
-                    "work item disappeared during lifecycle recovery",
-                )
-            })?;
-        let prior_item_digest = Self::work_digest(&intent.prior_item)?;
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        let prior_item_digest = intent
+            .prior_item
+            .as_ref()
+            .map(Self::work_digest)
+            .transpose()?;
         let next_item_digest = Self::work_digest(&intent.item)?;
-        let current_item_digest = Self::work_digest(&current_item)?;
-        if current_item_digest != prior_item_digest && current_item_digest != next_item_digest {
+        let current_item_digest = current_item.as_ref().map(Self::work_digest).transpose()?;
+        if current_item_digest != prior_item_digest
+            && current_item_digest.as_deref() != Some(next_item_digest.as_str())
+        {
             return Err(OrchError::new(
                 OrchErrorCode::Conflict,
                 format!(
@@ -2434,6 +2572,35 @@ impl OrchStore {
         let current_attempts = self
             .list_work_attempts_unlocked(Some(&intent.work_id))
             .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        if intent.prior_item.is_none() {
+            let request = intent.request.as_ref().expect("validated creation request");
+            let receipt = self.load_bound_request_receipt_unlocked(request)?;
+            let response = lifecycle_response_value(intent)?;
+            let settled = receipt.status == "complete"
+                && receipt.response == response
+                && receipt.error.is_none()
+                && receipt.run_id.as_deref() == Some(intent.work_id.as_str())
+                && current_item_digest.as_deref() == Some(next_item_digest.as_str());
+            if receipt.status != "pending" && !settled {
+                return Err(OrchError::new(
+                    OrchErrorCode::Conflict,
+                    "creation receipt conflicts with its sealed outcome",
+                ));
+            }
+            if !self
+                .list_work_decisions_unlocked(&intent.work_id)?
+                .is_empty()
+            {
+                return Err(OrchError::new(
+                    OrchErrorCode::Conflict,
+                    "creation has an unexpected decision",
+                ));
+            }
+            // Reuse the same graph and lane-capacity authority on recovery;
+            // a matching already-written successor is not counted twice.
+            self.validate_work_item_for_save_unlocked(&intent.item)
+                .map_err(Self::orch_error_from_anyhow)?;
+        }
         let mut current_by_id = current_attempts
             .iter()
             .map(|attempt| (attempt.attempt_id.as_str(), attempt))
@@ -2521,10 +2688,10 @@ impl OrchStore {
     fn write_work_lifecycle_item_update_unlocked(
         &self,
         intent: &WorkLifecycleIntent,
-        current_item_digest: &str,
+        current_item_digest: &Option<String>,
     ) -> Result<(), OrchError> {
         let next_item_digest = Self::work_digest(&intent.item)?;
-        if current_item_digest != next_item_digest {
+        if current_item_digest.as_deref() != Some(next_item_digest.as_str()) {
             self.save_work_item_unlocked(&intent.item)
                 .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
         }
@@ -5904,7 +6071,12 @@ impl OrchStore {
             if let Some(request) = request {
                 self.validate_bound_request_unlocked(
                     &request,
-                    &intent.prior_item,
+                    intent.prior_item.as_ref().ok_or_else(|| {
+                        OrchError::new(
+                            OrchErrorCode::Conflict,
+                            "managed finalization requires an existing work item",
+                        )
+                    })?,
                     &intent.prior_attempts,
                     &intent.attempts,
                 )?;
@@ -6051,6 +6223,20 @@ impl OrchStore {
                 ));
             }
         }
+        let receipt = self.load_bound_request_receipt_unlocked(request)?;
+        if receipt.status != "pending" {
+            return Err(OrchError::new(
+                OrchErrorCode::Conflict,
+                format!("idempotency claim is already {}", receipt.status),
+            ));
+        }
+        Ok(())
+    }
+
+    fn load_bound_request_receipt_unlocked(
+        &self,
+        request: &WorkRequestBinding,
+    ) -> Result<IdempotencyReceipt, OrchError> {
         let scope = IdempotencyScope {
             owner_id: request.owner_id.clone(),
             session_id: request.session_id,
@@ -6074,13 +6260,7 @@ impl OrchStore {
                 "work request binding does not match its idempotency receipt",
             ));
         }
-        if receipt.status != "pending" {
-            return Err(OrchError::new(
-                OrchErrorCode::Conflict,
-                format!("idempotency claim is already {}", receipt.status),
-            ));
-        }
-        Ok(())
+        Ok(receipt)
     }
 
     pub fn ledger_admission_closed(&self) -> Option<String> {
@@ -6089,10 +6269,15 @@ impl OrchStore {
 
     fn note_partial_commit(&self, error: OrchError) -> OrchError {
         if error.code == OrchErrorCode::Internal {
-            let message = "ledger admission is closed until the store is reopened".to_string();
-            *self.inner.ledger_admission_closed.lock() = Some(message.clone());
-            *self.inner.last_run_error.lock() = Some(message);
+            return self.note_work_recovery_required(error);
         }
+        error
+    }
+
+    fn note_work_recovery_required(&self, error: OrchError) -> OrchError {
+        let message = "ledger admission is closed until the store is reopened".to_string();
+        *self.inner.ledger_admission_closed.lock() = Some(message.clone());
+        *self.inner.last_run_error.lock() = Some(message);
         error
     }
 
@@ -6211,7 +6396,9 @@ impl OrchStore {
             &request.tool,
             &request.request_id,
             &request.payload_hash,
-            None,
+            (request.tool == "ptah_create_work")
+                .then(|| response["work"]["workId"].as_str().map(str::to_string))
+                .flatten(),
             response.clone(),
             None,
             "complete",
@@ -10778,6 +10965,12 @@ fn remove_file_durable(lease: &crate::host_runtime::WriteLease, path: &Path) -> 
     let _write = lease.begin("removing a durable orchestration record")?;
     if path.is_file() {
         fs::remove_file(path)?;
+        if path
+            .parent()
+            .is_some_and(|parent| parent.ends_with("work-lifecycle-intents"))
+        {
+            crash_process_if_stage("lifecycle_after_intent_remove");
+        }
     }
     #[cfg(unix)]
     if let Some(parent) = path.parent() {
