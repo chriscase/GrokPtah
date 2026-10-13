@@ -578,6 +578,497 @@ impl ManagerCreationIntent {
     }
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ManagerWorkWrite {
+    // Absent only for a newly materialized child. Existing host writes carry
+    // their real predecessor, never a fabricated initial Work record.
+    prior: Option<WorkItem>,
+    item: WorkItem,
+}
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ManagerMessageWrite {
+    prior: Option<WorkMessage>,
+    message: WorkMessage,
+}
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ManagerSequenceWrite {
+    prior: Option<u64>,
+    next: u64,
+}
+
+/// Work observations and clocks used by the production coordinator. They
+/// allow recovery to verify derivation instead of trusting a changed checksum.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ManagerMutationObservation {
+    pub work_items: Vec<WorkItem>,
+    pub advanced_at: Option<chrono::DateTime<Utc>>,
+    pub notified_at: Option<chrono::DateTime<Utc>>,
+    pub actor: String,
+}
+
+/// Version 3 extends the existing manager journal for plan changes. Older
+/// creation-only readers cannot deserialize it as a root creation.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ManagerMutationIntent {
+    schema_version: u32,
+    intent_id: String,
+    operation: String,
+    prior_plan: ManagerPlan,
+    plan: ManagerPlan,
+    work_writes: Vec<ManagerWorkWrite>,
+    message_writes: Vec<ManagerMessageWrite>,
+    sequence: Option<ManagerSequenceWrite>,
+    observation: Option<ManagerMutationObservation>,
+    native_executor: Option<super::managed::NativeExecutorStatus>,
+    snapshot_digest: String,
+    request: Option<RelatedCreationRequest>,
+}
+impl ManagerMutationIntent {
+    fn digest(&self) -> Result<String, OrchError> {
+        related_snapshot_digest(&(
+            &self.operation,
+            &self.prior_plan,
+            &self.plan,
+            &self.work_writes,
+            &self.message_writes,
+            &self.sequence,
+            &self.native_executor,
+            &self.observation,
+        ))
+    }
+    fn response(&self) -> serde_json::Value {
+        if self.request.is_none() {
+            return serde_json::Value::Null;
+        }
+        let mut result = serde_json::json!({"plan":self.plan});
+        if self.operation != "replan" {
+            result["createdWork"] = serde_json::json!(self
+                .work_writes
+                .iter()
+                .map(|write| &write.item)
+                .collect::<Vec<_>>());
+        }
+        if self.operation == "tick" {
+            result["messages"] = serde_json::json!(self
+                .message_writes
+                .iter()
+                .map(|write| &write.message)
+                .collect::<Vec<_>>());
+            result["nativeExecutor"] = serde_json::json!(self.native_executor);
+        }
+        result
+    }
+    fn validate_observation(
+        &self,
+        observation: &ManagerMutationObservation,
+    ) -> Result<(), OrchError> {
+        if observation.work_items.len() > super::manager::MAX_MANAGER_STEPS
+            || observation.actor.is_empty()
+        {
+            return Err(related_creation_conflict(
+                "manager observation exceeds its bound",
+            ));
+        }
+        let mut ids = HashSet::new();
+        for item in &observation.work_items {
+            item.validate()?;
+            if item.session_id != self.plan.session_id
+                || item.workspace != self.plan.workspace
+                || !ids.insert(&item.work_id)
+            {
+                return Err(related_creation_conflict(
+                    "manager observation identity is invalid",
+                ));
+            }
+        }
+        if let Some(request) = &self.request {
+            if self.operation == "replan"
+                || observation.actor != request.actor
+                || (self.operation == "advance"
+                    && (observation.advanced_at.is_none() || observation.notified_at.is_some()))
+                || (self.operation == "tick" && observation.notified_at.is_none())
+            {
+                return Err(related_creation_conflict(
+                    "manager observation does not match its caller",
+                ));
+            }
+        } else if observation.actor != "manager-supervisor" {
+            return Err(related_creation_conflict(
+                "background manager observation has an unknown actor",
+            ));
+        }
+        if self.operation != "advance"
+            && observation.advanced_at.is_some()
+                != (self.prior_plan.state == super::manager::ManagerPlanState::Active)
+        {
+            return Err(related_creation_conflict(
+                "manager observation omitted its required advancement",
+            ));
+        }
+        let mut checked = self.prior_plan.clone();
+        let mut created = if let Some(now) = observation.advanced_at {
+            checked.advance(&observation.work_items, &observation.actor, now)?
+        } else {
+            Vec::new()
+        };
+        if created.len() != self.work_writes.len() {
+            return Err(related_creation_conflict(
+                "manager child batch differs from its observation",
+            ));
+        }
+        for (generated, write) in created.iter_mut().zip(&self.work_writes) {
+            if write.item.source_manager_step_id != generated.source_manager_step_id {
+                return Err(related_creation_conflict(
+                    "manager child order differs from its original derivation",
+                ));
+            }
+            let old_id = generated.work_id.clone();
+            generated.work_id = write.item.work_id.clone();
+            for step in &mut checked.steps {
+                if step.work_id.as_deref() == Some(old_id.as_str()) {
+                    step.work_id = Some(generated.work_id.clone());
+                }
+            }
+            if write.prior.is_some()
+                || related_snapshot_digest(generated)? != related_snapshot_digest(&write.item)?
+            {
+                return Err(related_creation_conflict(
+                    "manager child differs from its original derivation",
+                ));
+            }
+        }
+        let notifications = if observation.notified_at.is_some() {
+            checked.pending_notifications(&observation.work_items)
+        } else {
+            Vec::new()
+        };
+        if (self.request.is_some() && notifications.len() != self.message_writes.len())
+            || self.message_writes.len() > notifications.len()
+        {
+            return Err(related_creation_conflict(
+                "manager notifications differ from the observation",
+            ));
+        }
+        let mut delivered = Vec::new();
+        for (notification, write) in notifications.iter().zip(&self.message_writes) {
+            let message = &write.message;
+            let stable_id = format!(
+                "manager-message-{}",
+                &super::types::hash_payload(
+                    &serde_json::json!({"planId":checked.plan_id,"stepId":notification.step_id,"workRevision":notification.work_revision,"kind":notification.kind})
+                )[..32]
+            );
+            let mut expected = WorkMessage::new(
+                notification.kind,
+                &observation.actor,
+                None,
+                Some(checked.manager_agent_id.clone()),
+                checked.session_id,
+                checked.workspace.clone(),
+                Some(notification.work_id.clone()),
+                notification.body.clone(),
+                Some(notification.payload.clone()),
+                message.created_at,
+            )?;
+            expected.message_id = stable_id;
+            expected.seq = message.seq;
+            if let Some(prior) = &write.prior {
+                expected.acked_at = prior.acked_at;
+                expected.acked_by = prior.acked_by.clone();
+            }
+            if expected != *message {
+                return Err(related_creation_conflict(
+                    "manager notification differs from its original derivation",
+                ));
+            }
+            delivered.push((
+                notification.step_id.clone(),
+                notification.work_revision,
+                message.message_id.clone(),
+            ));
+        }
+        if let Some(now) = observation.notified_at {
+            checked.mark_notifications_sent(&delivered, now)?;
+        }
+        if related_snapshot_digest(&checked)? != related_snapshot_digest(&self.plan)? {
+            return Err(related_creation_conflict(
+                "manager plan differs from its original observation",
+            ));
+        }
+        Ok(())
+    }
+    fn validate(&self) -> Result<(), OrchError> {
+        self.prior_plan.validate()?;
+        self.plan.validate()?;
+        safe_id_filename(&self.intent_id)?;
+        let prior = &self.prior_plan;
+        let next = &self.plan;
+        if self.schema_version != 3
+            || !["advance", "tick", "replan", "background"].contains(&self.operation.as_str())
+            || self.snapshot_digest != self.digest()?
+            || prior.plan_id != next.plan_id
+            || prior.session_id != next.session_id
+            || prior.workspace != next.workspace
+            || prior.root_work_id != next.root_work_id
+            || prior.manager_agent_id != next.manager_agent_id
+            || prior.objective != next.objective
+            || prior.created_at != next.created_at
+            || prior.max_in_flight != next.max_in_flight
+            || prior.max_replans != next.max_replans
+            || prior.coordination != next.coordination
+            || next.revision < prior.revision
+            || self.work_writes.len() > super::manager::MAX_MANAGER_STEPS
+            || self.message_writes.len() > super::manager::MAX_MANAGER_STEPS
+        {
+            return Err(related_creation_conflict("invalid sealed manager mutation"));
+        }
+        let mut ids = HashSet::new();
+        for write in &self.work_writes {
+            let item = &write.item;
+            item.validate()?;
+            if !ids.insert(item.work_id.as_str())
+                || item.session_id != next.session_id
+                || item.workspace != next.workspace
+            {
+                return Err(related_creation_conflict(
+                    "manager Work batch identity is invalid",
+                ));
+            }
+            if let Some(prior) = &write.prior {
+                prior.validate()?;
+                if prior.work_id != item.work_id
+                    || prior.session_id != item.session_id
+                    || prior.workspace != item.workspace
+                {
+                    return Err(related_creation_conflict(
+                        "manager Work predecessor identity changed",
+                    ));
+                }
+            }
+        }
+        let mut message_ids = HashSet::new();
+        let mut seqs = HashSet::new();
+        for write in &self.message_writes {
+            let message = &write.message;
+            message.validate()?;
+            if !message_ids.insert(message.message_id.as_str())
+                || !seqs.insert(message.seq)
+                || message.seq == 0
+                || message.session_id != next.session_id
+                || message.workspace != next.workspace
+            {
+                return Err(related_creation_conflict(
+                    "manager message batch identity is invalid",
+                ));
+            }
+            if let Some(prior) = &write.prior {
+                prior.validate()?;
+                if prior != message {
+                    return Err(related_creation_conflict(
+                        "existing notification snapshot changed",
+                    ));
+                }
+            }
+        }
+        if self.message_writes.is_empty() != self.sequence.is_none() {
+            return Err(related_creation_conflict(
+                "manager message sequence evidence is missing",
+            ));
+        }
+        if let Some(sequence) = &self.sequence {
+            if sequence.next < sequence.prior.unwrap_or(0)
+                || self
+                    .message_writes
+                    .iter()
+                    .any(|write| write.message.seq > sequence.next)
+            {
+                return Err(related_creation_conflict(
+                    "manager message sequence evidence is invalid",
+                ));
+            }
+        }
+        if let Some(observation) = &self.observation {
+            self.validate_observation(observation)?;
+        } else if self.request.is_some() && self.operation != "replan" {
+            return Err(related_creation_conflict(
+                "manager mutation is missing original Work observations",
+            ));
+        }
+        if let Some(request) = &self.request {
+            let tool = match self.operation.as_str() {
+                "advance" => "ptah_advance_manager_plan",
+                "tick" => "ptah_tick_manager_plan",
+                "replan" => "ptah_replan_manager_plan",
+                _ => {
+                    return Err(related_creation_conflict(
+                        "background manager write acquired a foreground request",
+                    ))
+                }
+            };
+            request.validate(tool, "manager_mutation", prior.session_id, &prior.workspace)?;
+            if request.payload_digest != request.binding.payload_hash
+                || request.payload["planId"] != prior.plan_id
+            {
+                return Err(related_creation_conflict(
+                    "manager mutation input does not match its request",
+                ));
+            }
+            let revision = &request.payload["expectedRevision"];
+            if !revision.is_null() && revision.as_u64() != Some(prior.revision) {
+                return Err(related_creation_conflict(
+                    "manager request expected a different prior revision",
+                ));
+            }
+            let mut expected = serde_json::json!({"sessionId":prior.session_id,"workspace":request.payload["workspace"],"planId":prior.plan_id,"expectedRevision":revision});
+            if self.operation == "replan" {
+                expected["reason"] = request.payload["reason"].clone();
+                expected["steps"] = request.payload["steps"].clone();
+                let steps: Vec<super::manager::ManagerStepSpec> =
+                    serde_json::from_value(expected["steps"].clone()).map_err(|_| {
+                        related_creation_conflict("manager replan inputs are invalid")
+                    })?;
+                let reason = expected["reason"]
+                    .as_str()
+                    .ok_or_else(|| related_creation_conflict("manager replan reason is invalid"))?;
+                let mut checked = prior.clone();
+                checked.append_replan(reason.into(), steps, next.updated_at)?;
+                if related_snapshot_digest(&checked)? != related_snapshot_digest(next)?
+                    || !self.work_writes.is_empty()
+                    || !self.message_writes.is_empty()
+                {
+                    return Err(related_creation_conflict(
+                        "sealed replan does not match its original inputs",
+                    ));
+                }
+            } else if prior.replan_count != next.replan_count
+                || prior.steps.len() != next.steps.len()
+                || prior
+                    .steps
+                    .iter()
+                    .zip(&next.steps)
+                    .any(|(left, right)| left.as_spec() != right.as_spec())
+            {
+                return Err(related_creation_conflict(
+                    "manager observation changed its step definitions",
+                ));
+            }
+            if request.payload != expected
+                || (self.operation == "tick") != self.native_executor.is_some()
+                || (self.operation != "tick" && !self.message_writes.is_empty())
+            {
+                return Err(related_creation_conflict(
+                    "manager response shape or inputs are invalid",
+                ));
+            }
+            for write in &self.work_writes {
+                let item = &write.item;
+                let step = next
+                    .steps
+                    .iter()
+                    .find(|step| step.work_id.as_deref() == Some(item.work_id.as_str()))
+                    .ok_or_else(|| {
+                        related_creation_conflict("manager child is not in the sealed plan")
+                    })?;
+                let dependencies = step
+                    .dependencies
+                    .iter()
+                    .map(|id| {
+                        next.steps
+                            .iter()
+                            .find(|candidate| &candidate.step_id == id)
+                            .and_then(|candidate| candidate.work_id.as_ref())
+                            .map(|work_id| super::workload::WorkDependency {
+                                work_id: work_id.clone(),
+                                required_state: WorkState::Succeeded,
+                            })
+                            .ok_or_else(|| {
+                                related_creation_conflict("manager child dependency is missing")
+                            })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                if write.prior.is_some()
+                    || item.parent_work_id.as_deref() != Some(next.root_work_id.as_str())
+                    || item.source_manager_plan_id.as_deref() != Some(next.plan_id.as_str())
+                    || item.source_manager_step_id.as_deref() != Some(step.step_id.as_str())
+                    || item.created_by != request.actor
+                    || item.kind != step.kind
+                    || item.objective != step.objective
+                    || item.priority != step.priority
+                    || item.policy != step.policy
+                    || item.assigned_agent_id != step.assigned_agent_id
+                    || item.dependencies != dependencies
+                    || item.state != WorkState::Queued
+                    || item.revision != 1
+                    || item.attempt_count != 0
+                    || item.created_at != item.updated_at
+                    || item.result.is_some()
+                    || item.progress.is_some()
+                    || item.approval.is_some()
+                    || item.last_decision_id.is_some()
+                    || item.is_container
+                    || item.assignment_status
+                        != if item.assigned_agent_id.is_some() {
+                            AssignmentStatus::Accepted
+                        } else {
+                            AssignmentStatus::Unassigned
+                        }
+                {
+                    return Err(related_creation_conflict(
+                        "manager child is not its original initial snapshot",
+                    ));
+                }
+            }
+            for write in &self.message_writes {
+                let message = &write.message;
+                if message.from_actor != request.actor
+                    || message.to_agent_id.as_deref() != Some(next.manager_agent_id.as_str())
+                    || !next.steps.iter().any(|step| {
+                        step.last_notification_message_id.as_deref()
+                            == Some(message.message_id.as_str())
+                            && step.work_id == message.work_id
+                    })
+                {
+                    return Err(related_creation_conflict(
+                        "manager notification is not stamped onto its plan",
+                    ));
+                }
+            }
+        } else if self.operation != "background" || self.native_executor.is_some() {
+            return Err(related_creation_conflict(
+                "foreground manager mutation is missing its original request",
+            ));
+        }
+        Ok(())
+    }
+}
+
+enum ManagerIntent {
+    Creation(Box<ManagerCreationIntent>),
+    Mutation(Box<ManagerMutationIntent>),
+}
+impl ManagerIntent {
+    fn decode(bytes: &[u8]) -> Result<Self, OrchError> {
+        let value: serde_json::Value = serde_json::from_slice(bytes)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        if value["schemaVersion"] == 3 {
+            let intent: ManagerMutationIntent = serde_json::from_value(value)
+                .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+            intent.validate()?;
+            Ok(Self::Mutation(Box::new(intent)))
+        } else {
+            let intent: ManagerCreationIntent = serde_json::from_value(value)
+                .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+            intent.validate()?;
+            Ok(Self::Creation(Box::new(intent)))
+        }
+    }
+}
+
 /// Service receipt identity stored inside an existing work intent.
 ///
 /// Recovery completes this receipt from the sealed successor. The body is not
@@ -2765,8 +3256,381 @@ impl OrchStore {
             .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))
     }
 
+    /// Commit plan materialization and its original caller outcome through the
+    /// existing manager journal. Notifications are prepared, never published,
+    /// before the revision fence and graph/capacity checks succeed.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn commit_manager_mutation(
+        &self,
+        prior: &ManagerPlan,
+        plan: &ManagerPlan,
+        work_items: &[WorkItem],
+        messages: &[WorkMessage],
+        observation: Option<ManagerMutationObservation>,
+        operation: &str,
+        request: Option<RelatedCreationRequest>,
+        native_executor: Option<super::managed::NativeExecutorStatus>,
+    ) -> Result<serde_json::Value, OrchError> {
+        let _guard = self.inner.lock.lock();
+        self.refuse_closed_admission()?;
+        self.admit_manager_mutation_unlocked(
+            prior,
+            plan,
+            work_items,
+            messages,
+            observation,
+            operation,
+            request,
+            native_executor,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn admit_manager_mutation_unlocked(
+        &self,
+        prior: &ManagerPlan,
+        plan: &ManagerPlan,
+        work_items: &[WorkItem],
+        messages: &[WorkMessage],
+        observation: Option<ManagerMutationObservation>,
+        operation: &str,
+        request: Option<RelatedCreationRequest>,
+        native_executor: Option<super::managed::NativeExecutorStatus>,
+    ) -> Result<serde_json::Value, OrchError> {
+        let current = self
+            .read_manager_record_unlocked::<ManagerPlan>(&self.manager_plan_path(&plan.plan_id)?)?
+            .ok_or_else(|| OrchError::new(OrchErrorCode::InvalidRequest, "unknown plan_id"))?;
+        if related_snapshot_digest(&current)? != related_snapshot_digest(prior)? {
+            return Err(OrchError::new(
+                OrchErrorCode::StaleVersion,
+                "manager plan changed before admission",
+            ));
+        }
+        self.validate_work_items_for_save_unlocked(work_items)
+            .map_err(Self::orch_error_from_anyhow)?;
+        let work_writes = work_items
+            .iter()
+            .map(|item| {
+                Ok(ManagerWorkWrite {
+                    prior: self
+                        .read_manager_record_unlocked(&self.work_item_path(&item.work_id)?)?,
+                    item: item.clone(),
+                })
+            })
+            .collect::<Result<Vec<_>, OrchError>>()?;
+        let sequence_prior = if messages.is_empty() {
+            None
+        } else {
+            self.read_manager_sequence_unlocked()?
+        };
+        let mut highwater = sequence_prior.unwrap_or(0);
+        if !messages.is_empty() {
+            for message in self.list_messages_unlocked()? {
+                highwater = highwater.max(message.seq);
+            }
+        }
+        let mut message_writes = Vec::with_capacity(messages.len());
+        for message in messages {
+            message.validate()?;
+            self.require_optional_agent_in_scope_unlocked(
+                message.from_agent_id.as_deref(),
+                message.session_id,
+                &message.workspace,
+            )?;
+            self.require_optional_agent_in_scope_unlocked(
+                message.to_agent_id.as_deref(),
+                message.session_id,
+                &message.workspace,
+            )?;
+            let prior: Option<WorkMessage> =
+                self.read_manager_record_unlocked(&self.message_path(&message.message_id)?)?;
+            let mut next = message.clone();
+            if let Some(existing) = &prior {
+                // Clock-derived TTL belongs to the first observation. Compare
+                // every immutable field while preserving sequence and ack.
+                next.seq = existing.seq;
+                next.created_at = existing.created_at;
+                next.acked_at = existing.acked_at;
+                next.acked_by = existing.acked_by.clone();
+                next.expires_at = next
+                    .kind
+                    .default_ttl_ms()
+                    .map(|ms| existing.created_at + chrono::Duration::milliseconds(ms));
+                if &next != existing {
+                    return Err(related_creation_conflict(
+                        "stable manager message has conflicting content",
+                    ));
+                }
+            } else {
+                highwater = highwater
+                    .checked_add(1)
+                    .ok_or_else(|| related_creation_conflict("message sequence exhausted"))?;
+                next.seq = highwater;
+            }
+            message_writes.push(ManagerMessageWrite {
+                prior,
+                message: next,
+            });
+        }
+        let sequence = (!messages.is_empty()).then_some(ManagerSequenceWrite {
+            prior: sequence_prior,
+            next: highwater,
+        });
+        let mut intent = ManagerMutationIntent {
+            schema_version: 3,
+            intent_id: Uuid::new_v4().to_string(),
+            operation: operation.into(),
+            prior_plan: prior.clone(),
+            plan: plan.clone(),
+            work_writes,
+            message_writes,
+            sequence,
+            observation,
+            native_executor,
+            snapshot_digest: String::new(),
+            request,
+        };
+        intent.snapshot_digest = intent.digest()?;
+        self.preflight_manager_mutation_unlocked(&intent)?;
+        let path = self.manager_creation_intent_path(&intent.intent_id)?;
+        crash_process_if_stage("manager_mutation_before_intent");
+        self.persist_related_intent_unlocked(&path, &intent)?;
+        crash_process_if_stage("manager_mutation_after_intent");
+        self.commit_manager_mutation_unlocked(&intent)
+            .map_err(|error| self.note_work_recovery_required(error))?;
+        self.clear_related_intent_unlocked(&path)
+            .map_err(|error| self.note_work_recovery_required(error))?;
+        crash_process_if_stage("manager_mutation_after_commit");
+        self.prune_messages_unlocked()
+            .map_err(|error| self.note_work_recovery_required(error))?;
+        Ok(intent.response())
+    }
+
+    fn read_manager_record_unlocked<T: serde::de::DeserializeOwned>(
+        &self,
+        path: &Path,
+    ) -> Result<Option<T>, OrchError> {
+        let metadata = match fs::symlink_metadata(path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(OrchError::new(OrchErrorCode::Internal, error.to_string())),
+        };
+        if !metadata.file_type().is_file() {
+            return Err(related_creation_conflict(
+                "manager mutation found non-regular evidence",
+            ));
+        }
+        let bytes = fs::read(path)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        serde_json::from_slice(&bytes)
+            .map(Some)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))
+    }
+
+    fn manager_record_transition_unlocked<T: serde::de::DeserializeOwned + serde::Serialize>(
+        &self,
+        path: &Path,
+        prior: Option<&T>,
+        next: &T,
+    ) -> Result<bool, OrchError> {
+        let current: Option<T> = self.read_manager_record_unlocked(path)?;
+        match current {
+            Some(current)
+                if related_snapshot_digest(&current)? == related_snapshot_digest(next)? =>
+            {
+                Ok(true)
+            }
+            Some(current)
+                if prior.is_some_and(|prior| {
+                    related_snapshot_digest(&current).ok() == related_snapshot_digest(prior).ok()
+                }) =>
+            {
+                Ok(false)
+            }
+            None if prior.is_none() => Ok(false),
+            _ => Err(related_creation_conflict(
+                "manager mutation found conflicting prior or successor evidence",
+            )),
+        }
+    }
+
+    fn read_manager_sequence_unlocked(&self) -> Result<Option<u64>, OrchError> {
+        let path = self.inner.root.join("messages/seq");
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(OrchError::new(OrchErrorCode::Internal, error.to_string())),
+        };
+        if !metadata.file_type().is_file() {
+            return Err(related_creation_conflict(
+                "manager message sequence is non-regular evidence",
+            ));
+        }
+        let text = fs::read_to_string(path)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        text.trim()
+            .parse()
+            .map(Some)
+            .map_err(|_| related_creation_conflict("manager message sequence is malformed"))
+    }
+
+    fn preflight_manager_mutation_unlocked(
+        &self,
+        intent: &ManagerMutationIntent,
+    ) -> Result<(), OrchError> {
+        intent.validate()?;
+        if let Some(observation) = &intent.observation {
+            for item in &observation.work_items {
+                if !self
+                    .related_record_matches_unlocked(&self.work_item_path(&item.work_id)?, item)?
+                {
+                    return Err(related_creation_conflict(
+                        "manager observation Work disappeared",
+                    ));
+                }
+            }
+            // An unobserved adopted child is a conflicting writer, not a
+            // reason to materialize another child for that logical step.
+            for item in self
+                .list_work_items_unlocked()
+                .map_err(Self::orch_error_from_anyhow)?
+            {
+                if item.session_id == intent.plan.session_id
+                    && item.workspace == intent.plan.workspace
+                    && item.kind != "manager-decision"
+                    && intent.plan.steps.iter().any(|step| {
+                        item.source_manager_step_id.as_deref() == Some(step.step_id.as_str())
+                    })
+                    && item.source_manager_plan_id.as_deref() == Some(intent.plan.plan_id.as_str())
+                    && !observation
+                        .work_items
+                        .iter()
+                        .any(|known| known.work_id == item.work_id)
+                    && !intent
+                        .work_writes
+                        .iter()
+                        .any(|write| write.item.work_id == item.work_id)
+                {
+                    return Err(related_creation_conflict(
+                        "manager found an unobserved child",
+                    ));
+                }
+            }
+        }
+
+        let mut present = self.manager_record_transition_unlocked(
+            &self.manager_plan_path(&intent.plan.plan_id)?,
+            Some(&intent.prior_plan),
+            &intent.plan,
+        )?;
+        for write in &intent.work_writes {
+            present &= self.manager_record_transition_unlocked(
+                &self.work_item_path(&write.item.work_id)?,
+                write.prior.as_ref(),
+                &write.item,
+            )?;
+            if write.prior.is_none()
+                && (!self
+                    .list_work_attempts_unlocked(Some(&write.item.work_id))
+                    .map_err(Self::orch_error_from_anyhow)?
+                    .is_empty()
+                    || !self
+                        .list_work_decisions_unlocked(&write.item.work_id)?
+                        .is_empty())
+            {
+                return Err(related_creation_conflict(
+                    "new manager Work has unexpected attempts or decisions",
+                ));
+            }
+        }
+        let items = intent
+            .work_writes
+            .iter()
+            .map(|write| write.item.clone())
+            .collect::<Vec<_>>();
+        self.validate_work_items_for_save_unlocked(&items)
+            .map_err(Self::orch_error_from_anyhow)?;
+        for write in &intent.message_writes {
+            present &= self.manager_record_transition_unlocked(
+                &self.message_path(&write.message.message_id)?,
+                write.prior.as_ref(),
+                &write.message,
+            )?;
+            self.require_optional_agent_in_scope_unlocked(
+                write.message.from_agent_id.as_deref(),
+                write.message.session_id,
+                &write.message.workspace,
+            )?;
+            self.require_optional_agent_in_scope_unlocked(
+                write.message.to_agent_id.as_deref(),
+                write.message.session_id,
+                &write.message.workspace,
+            )?;
+        }
+        if let Some(sequence) = &intent.sequence {
+            let current = self.read_manager_sequence_unlocked()?;
+            if current != sequence.prior && current != Some(sequence.next) {
+                return Err(related_creation_conflict(
+                    "manager message sequence has conflicting evidence",
+                ));
+            }
+            present &= current == Some(sequence.next);
+        }
+        self.preflight_related_receipt_unlocked(
+            intent.request.as_ref(),
+            &intent.response(),
+            &intent.plan.plan_id,
+            present,
+        )
+    }
+
+    fn commit_manager_mutation_unlocked(
+        &self,
+        intent: &ManagerMutationIntent,
+    ) -> Result<(), OrchError> {
+        self.preflight_manager_mutation_unlocked(intent)?;
+        for (index, write) in intent.work_writes.iter().enumerate() {
+            self.write_work_item_unlocked(&write.item)
+                .map_err(Self::orch_error_from_anyhow)?;
+            if index == 0 {
+                crash_process_if_stage("manager_mutation_after_first_work");
+            }
+        }
+        crash_process_if_stage("manager_mutation_after_work");
+        if let Some(sequence) = &intent.sequence {
+            atomic_write_bytes(
+                &self.lease(),
+                &self.inner.root.join("messages/seq"),
+                sequence.next.to_string().as_bytes(),
+            )
+            .map_err(Self::orch_error_from_anyhow)?;
+            crash_process_if_stage("manager_mutation_after_sequence");
+        }
+        for (index, write) in intent.message_writes.iter().enumerate() {
+            atomic_write_json(
+                &self.lease(),
+                &self.message_path(&write.message.message_id)?,
+                &write.message,
+            )
+            .map_err(Self::orch_error_from_anyhow)?;
+            if index == 0 {
+                crash_process_if_stage("manager_mutation_after_first_message");
+            }
+        }
+        crash_process_if_stage("manager_mutation_after_messages");
+        self.save_manager_plan_unlocked(&intent.plan)?;
+        crash_process_if_stage("manager_mutation_after_plan");
+        self.complete_bound_request_unlocked(
+            intent.request.as_ref().map(|request| &request.binding),
+            &intent.response(),
+        )?;
+        crash_process_if_stage("manager_mutation_after_receipt");
+        Ok(())
+    }
+
     fn recover_manager_creation_intents(&self) -> Result<(), OrchError> {
         let _guard = self.inner.lock.lock();
+        let mut intents = Vec::new();
         for entry in fs::read_dir(self.inner.root.join("manager-intents"))
             .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
         {
@@ -2785,20 +3649,34 @@ impl OrchStore {
                     "manager intent is non-regular evidence",
                 ));
             }
-            let intent: ManagerCreationIntent = serde_json::from_str(
-                &fs::read_to_string(&path)
-                    .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?,
-            )
-            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
-            intent.validate()?;
-            if path != self.manager_creation_intent_path(&intent.plan.plan_id)? {
+            let intent =
+                ManagerIntent::decode(&fs::read(&path).map_err(|error| {
+                    OrchError::new(OrchErrorCode::Internal, error.to_string())
+                })?)?;
+            let (id, revision) = match &intent {
+                ManagerIntent::Creation(intent) => (&intent.plan.plan_id, 0),
+                ManagerIntent::Mutation(intent) => (&intent.intent_id, intent.prior_plan.revision),
+            };
+            if path != self.manager_creation_intent_path(id)? {
                 return Err(related_creation_conflict(
                     "manager intent filename does not match its identity",
                 ));
             }
-            self.commit_manager_creation_intent_unlocked(&intent)?;
+            intents.push((revision, path, intent));
+        }
+        intents.sort_by(|left, right| left.0.cmp(&right.0).then(left.1.cmp(&right.1)));
+        for (_, path, intent) in intents {
+            match intent {
+                ManagerIntent::Creation(intent) => {
+                    self.commit_manager_creation_intent_unlocked(&intent)?
+                }
+                ManagerIntent::Mutation(intent) => {
+                    self.commit_manager_mutation_unlocked(&intent)?
+                }
+            }
             self.clear_related_intent_unlocked(&path)?;
         }
+        self.prune_messages_unlocked()?;
         Ok(())
     }
 
@@ -3312,7 +4190,10 @@ impl OrchStore {
             self.write_work_item_unlocked(item)
                 .map_err(Self::orch_error_from_anyhow)?;
         }
-        self.save_manager_plan_unlocked(plan)
+        crash_process_if_stage("manager_mutation_after_work");
+        self.save_manager_plan_unlocked(plan)?;
+        crash_process_if_stage("manager_mutation_after_plan");
+        Ok(())
     }
 
     /// Compare-and-swap a plan revision and its newly materialized Work under
@@ -3336,15 +4217,17 @@ impl OrchStore {
                 "manager plan changed before the mutation could be committed",
             ));
         }
-        // Validate the full materialization batch before the first durable
-        // write so a refused graph cannot leave a partial manager adoption.
-        self.validate_work_items_for_save_unlocked(work_items)
-            .map_err(Self::orch_error_from_anyhow)?;
-        for item in work_items {
-            self.write_work_item_unlocked(item)
-                .map_err(Self::orch_error_from_anyhow)?;
-        }
-        self.save_manager_plan_unlocked(plan)
+        self.admit_manager_mutation_unlocked(
+            &current,
+            plan,
+            work_items,
+            &[],
+            None,
+            "background",
+            None,
+            None,
+        )?;
+        Ok(())
     }
 
     pub fn save_manager_plan_cas(
@@ -5672,6 +6555,7 @@ impl OrchStore {
 
     pub fn send_message(&self, mut message: WorkMessage) -> Result<WorkMessage, OrchError> {
         let _guard = self.inner.lock.lock();
+        self.refuse_closed_admission()?;
         self.send_message_unlocked(&mut message)
     }
 
@@ -5680,6 +6564,7 @@ impl OrchStore {
     /// durable observation.
     pub fn send_message_once(&self, mut message: WorkMessage) -> Result<WorkMessage, OrchError> {
         let _guard = self.inner.lock.lock();
+        self.refuse_closed_admission()?;
         if let Some(existing) = self.load_message_unlocked(&message.message_id)? {
             if existing.kind != message.kind
                 || existing.from_actor != message.from_actor
@@ -5746,6 +6631,7 @@ impl OrchStore {
         now: chrono::DateTime<Utc>,
     ) -> Result<WorkMessage, OrchError> {
         let _guard = self.inner.lock.lock();
+        self.refuse_closed_admission()?;
         self.ack_message_unlocked(message_id, actor_id, now, None)
     }
 
@@ -5760,6 +6646,7 @@ impl OrchStore {
         workspace: &str,
     ) -> Result<WorkMessage, OrchError> {
         let _guard = self.inner.lock.lock();
+        self.refuse_closed_admission()?;
         self.ack_message_unlocked(message_id, actor_id, now, Some((session_id, workspace)))
     }
 
@@ -7044,14 +7931,15 @@ impl OrchStore {
                             _ => return true,
                         }
                     }
-                    "manager-intents" => {
-                        match serde_json::from_slice::<ManagerCreationIntent>(&bytes) {
-                            Ok(intent) if intent.validate().is_ok() => {
-                                intent.request.map(|request| request.binding)
-                            }
-                            _ => return true,
+                    "manager-intents" => match ManagerIntent::decode(&bytes) {
+                        Ok(ManagerIntent::Creation(intent)) => {
+                            intent.request.map(|request| request.binding)
                         }
-                    }
+                        Ok(ManagerIntent::Mutation(intent)) => {
+                            intent.request.map(|request| request.binding)
+                        }
+                        _ => return true,
+                    },
                     "routine-intents" => {
                         match serde_json::from_slice::<RoutineFireIntent>(&bytes) {
                             Ok(intent) if intent.validate().is_ok() => {
@@ -7208,7 +8096,10 @@ impl OrchStore {
             &request.payload_hash,
             match request.tool.as_str() {
                 "ptah_create_work" => response["work"]["workId"].as_str().map(str::to_string),
-                "ptah_create_manager_plan" => {
+                "ptah_create_manager_plan"
+                | "ptah_advance_manager_plan"
+                | "ptah_tick_manager_plan"
+                | "ptah_replan_manager_plan" => {
                     response["plan"]["planId"].as_str().map(str::to_string)
                 }
                 "ptah_fire_routine" => response["routineId"].as_str().map(str::to_string),
@@ -11843,6 +12734,7 @@ fn remove_file_durable(lease: &crate::host_runtime::WriteLease, path: &Path) -> 
             }
             if parent.ends_with("manager-intents") {
                 crash_process_if_stage("manager_create_after_intent_remove");
+                crash_process_if_stage("manager_mutation_after_intent_remove");
             }
             if parent.ends_with("routine-intents") {
                 crash_process_if_stage("routine_fire_after_intent_remove");

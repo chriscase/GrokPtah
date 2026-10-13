@@ -695,8 +695,9 @@ impl OrchestrationService {
             .store
             .list_work_items()
             .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
-        let durable_revision = plan.revision;
-        let created = if plan.state == ManagerPlanState::Active {
+        let prior_plan = plan.clone();
+        let advanced_at = (plan.state == ManagerPlanState::Active).then_some(now);
+        let created = if advanced_at.is_some() {
             plan.advance(&work_items, "manager-supervisor", now)?
         } else {
             Vec::new()
@@ -707,21 +708,35 @@ impl OrchestrationService {
             .take(observation_budget.saturating_sub(created.len()))
             .collect::<Vec<_>>();
         let mut delivered = Vec::new();
+        let mut messages = Vec::new();
         for notification in &notifications {
             let message =
-                self.persist_manager_notification(&plan, notification, "manager-supervisor", now)?;
+                self.prepare_manager_notification(&plan, notification, "manager-supervisor", now)?;
             delivered.push((
                 notification.step_id.clone(),
                 notification.work_revision,
-                message.message_id,
+                message.message_id.clone(),
             ));
+            messages.push(message);
         }
         plan.mark_notifications_sent(&delivered, now)?;
-        match self
-            .store
-            .save_manager_plan_with_work_cas(&plan, durable_revision, &created)
-        {
-            Ok(()) => {
+        match self.store.commit_manager_mutation(
+            &prior_plan,
+            &plan,
+            &created,
+            &messages,
+            Some(Self::manager_mutation_observation(
+                &prior_plan,
+                &work_items,
+                "manager-supervisor",
+                advanced_at,
+                Some(now),
+            )),
+            "background",
+            None,
+            None,
+        ) {
+            Ok(_) => {
                 report.work_created += created.len();
                 report.messages_created += delivered.len();
             }
@@ -738,7 +753,40 @@ impl OrchestrationService {
         Ok(notifications.len().saturating_add(created.len()).max(1))
     }
 
-    fn persist_manager_notification(
+    fn manager_mutation_observation(
+        plan: &ManagerPlan,
+        items: &[WorkItem],
+        actor: &str,
+        advanced_at: Option<chrono::DateTime<Utc>>,
+        notified_at: Option<chrono::DateTime<Utc>>,
+    ) -> super::store::ManagerMutationObservation {
+        super::store::ManagerMutationObservation {
+            work_items: items
+                .iter()
+                .filter(|item| {
+                    item.session_id == plan.session_id
+                        && item.workspace == plan.workspace
+                        && ((item.kind != "manager-decision"
+                            && item.source_manager_plan_id.as_deref()
+                                == Some(plan.plan_id.as_str())
+                            && plan.steps.iter().any(|step| {
+                                item.source_manager_step_id.as_deref()
+                                    == Some(step.step_id.as_str())
+                            }))
+                            || plan
+                                .steps
+                                .iter()
+                                .any(|step| step.work_id.as_deref() == Some(item.work_id.as_str())))
+                })
+                .cloned()
+                .collect(),
+            advanced_at,
+            notified_at,
+            actor: actor.into(),
+        }
+    }
+
+    fn prepare_manager_notification(
         &self,
         plan: &ManagerPlan,
         notification: &super::manager::ManagerNotification,
@@ -767,7 +815,7 @@ impl OrchestrationService {
             now,
         )?;
         message.message_id = stable_id;
-        self.store.send_message_once(message)
+        Ok(message)
     }
 
     fn converge_manager_decision(
@@ -4924,7 +4972,7 @@ impl OrchestrationService {
                 return Err(self.fail_claim(&mut lease, None, session_id, &claimed, error))
             }
         };
-        let durable_revision = plan.revision;
+        let prior_plan = plan.clone();
         if let Err(error) = plan.require_revision(expected_revision) {
             return Err(self.fail_claim(
                 &mut lease,
@@ -4955,7 +5003,8 @@ impl OrchestrationService {
                 ))
             }
         };
-        let created = match plan.advance(&work_items, &auth.token_id, Utc::now()) {
+        let now = Utc::now();
+        let created = match plan.advance(&work_items, &auth.token_id, now) {
             Ok(created) => created,
             Err(error) => {
                 return Err(self.fail_claim(
@@ -4967,19 +5016,45 @@ impl OrchestrationService {
                 ));
             }
         };
-        if let Err(error) =
-            self.store
-                .save_manager_plan_with_work_cas(&plan, durable_revision, &created)
-        {
-            return Err(self.fail_claim(
-                &mut lease,
-                Some(plan_id.into()),
-                session_id,
-                &claimed,
-                error,
-            ));
-        }
-        let response = json!({ "plan": plan, "createdWork": created });
+        let request = super::store::RelatedCreationRequest::new(
+            super::store::WorkRequestBinding::bound(
+                &lease.scope,
+                claimed.display().to_string(),
+                lease.request_id.clone(),
+                lease.tool.clone(),
+                lease.payload_hash.clone(),
+                "manager_mutation",
+            ),
+            payload,
+            auth.token_id.clone(),
+        );
+        let response = match self.store.commit_manager_mutation(
+            &prior_plan,
+            &plan,
+            &created,
+            &[],
+            Some(Self::manager_mutation_observation(
+                &prior_plan,
+                &work_items,
+                &auth.token_id,
+                Some(now),
+                None,
+            )),
+            "advance",
+            Some(request),
+            None,
+        ) {
+            Ok(response) => response,
+            Err(error) => {
+                return Err(self.fail_claim(
+                    &mut lease,
+                    Some(plan_id.into()),
+                    session_id,
+                    &claimed,
+                    error,
+                ))
+            }
+        };
         lease
             .complete(Some(plan_id.to_string()), response.clone())
             .map_err(|error| {
@@ -5030,7 +5105,7 @@ impl OrchestrationService {
                 return Err(self.fail_claim(&mut lease, None, session_id, &claimed, error))
             }
         };
-        let durable_revision = plan.revision;
+        let prior_plan = plan.clone();
         if let Err(error) = plan.require_revision(expected_revision) {
             return Err(self.fail_claim(
                 &mut lease,
@@ -5062,7 +5137,8 @@ impl OrchestrationService {
             }
         };
         let now = Utc::now();
-        let created = if plan.state == super::manager::ManagerPlanState::Active {
+        let advanced_at = (plan.state == super::manager::ManagerPlanState::Active).then_some(now);
+        let created = if advanced_at.is_some() {
             match plan.advance(&work_items, &auth.token_id, now) {
                 Ok(created) => created,
                 Err(error) => {
@@ -5080,9 +5156,9 @@ impl OrchestrationService {
         };
         let notifications = plan.pending_notifications(&work_items);
         let mut delivered = Vec::with_capacity(notifications.len());
-        let mut message_values = Vec::with_capacity(notifications.len());
+        let mut messages = Vec::with_capacity(notifications.len());
         for notification in notifications {
-            let message = match self.persist_manager_notification(
+            let message = match self.prepare_manager_notification(
                 &plan,
                 &notification,
                 &auth.token_id,
@@ -5104,9 +5180,10 @@ impl OrchestrationService {
                 notification.work_revision,
                 message.message_id.clone(),
             ));
-            message_values.push(json!(message));
+            messages.push(message);
         }
-        if let Err(error) = plan.mark_notifications_sent(&delivered, Utc::now()) {
+        let notified_at = Utc::now();
+        if let Err(error) = plan.mark_notifications_sent(&delivered, notified_at) {
             return Err(self.fail_claim(
                 &mut lease,
                 Some(plan_id.into()),
@@ -5115,24 +5192,45 @@ impl OrchestrationService {
                 error,
             ));
         }
-        if let Err(error) =
-            self.store
-                .save_manager_plan_with_work_cas(&plan, durable_revision, &created)
-        {
-            return Err(self.fail_claim(
-                &mut lease,
-                Some(plan_id.into()),
-                session_id,
-                &claimed,
-                error,
-            ));
-        }
-        let response = json!({
-            "plan": plan,
-            "createdWork": created,
-            "messages": message_values,
-            "nativeExecutor": self.native_executor_status(),
-        });
+        let request = super::store::RelatedCreationRequest::new(
+            super::store::WorkRequestBinding::bound(
+                &lease.scope,
+                claimed.display().to_string(),
+                lease.request_id.clone(),
+                lease.tool.clone(),
+                lease.payload_hash.clone(),
+                "manager_mutation",
+            ),
+            payload,
+            auth.token_id.clone(),
+        );
+        let response = match self.store.commit_manager_mutation(
+            &prior_plan,
+            &plan,
+            &created,
+            &messages,
+            Some(Self::manager_mutation_observation(
+                &prior_plan,
+                &work_items,
+                &auth.token_id,
+                advanced_at,
+                Some(notified_at),
+            )),
+            "tick",
+            Some(request),
+            Some(self.native_executor_status()),
+        ) {
+            Ok(response) => response,
+            Err(error) => {
+                return Err(self.fail_claim(
+                    &mut lease,
+                    Some(plan_id.into()),
+                    session_id,
+                    &claimed,
+                    error,
+                ))
+            }
+        };
         lease
             .complete(Some(plan_id.to_string()), response.clone())
             .map_err(|error| {
@@ -5187,7 +5285,7 @@ impl OrchestrationService {
                 return Err(self.fail_claim(&mut lease, None, session_id, &claimed, error))
             }
         };
-        let durable_revision = plan.revision;
+        let prior_plan = plan.clone();
         if let Err(error) = plan.require_revision(expected_revision) {
             return Err(self.fail_claim(
                 &mut lease,
@@ -5215,16 +5313,39 @@ impl OrchestrationService {
                 error,
             ));
         }
-        if let Err(error) = self.store.save_manager_plan_cas(&plan, durable_revision) {
-            return Err(self.fail_claim(
-                &mut lease,
-                Some(plan_id.into()),
-                session_id,
-                &claimed,
-                error,
-            ));
-        }
-        let response = json!({ "plan": plan });
+        let request = super::store::RelatedCreationRequest::new(
+            super::store::WorkRequestBinding::bound(
+                &lease.scope,
+                claimed.display().to_string(),
+                lease.request_id.clone(),
+                lease.tool.clone(),
+                lease.payload_hash.clone(),
+                "manager_mutation",
+            ),
+            payload,
+            auth.token_id.clone(),
+        );
+        let response = match self.store.commit_manager_mutation(
+            &prior_plan,
+            &plan,
+            &[],
+            &[],
+            None,
+            "replan",
+            Some(request),
+            None,
+        ) {
+            Ok(response) => response,
+            Err(error) => {
+                return Err(self.fail_claim(
+                    &mut lease,
+                    Some(plan_id.into()),
+                    session_id,
+                    &claimed,
+                    error,
+                ))
+            }
+        };
         lease
             .complete(Some(plan_id.to_string()), response.clone())
             .map_err(|error| {

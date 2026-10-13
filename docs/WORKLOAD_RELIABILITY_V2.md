@@ -226,3 +226,47 @@ malformed unexpected attempts and decisions; this test-only expansion passes
 separately after the 59-test run, with final strict all-target Clippy qualification.
 The earlier broad local library/integration failures and their baseline
 comparisons remain recorded; this milestone does not erase those limitations.
+
+
+## Manager mutation admission and replay
+
+Authenticated advance, tick (children), replan, and tick (notification) each
+reproduced a lost original request after a real process cut. The existing
+manager journal now has a schema-3 mutation envelope with the actual prior and
+successor plan, per-Work and per-message prior/successor evidence, durable
+message sequence, original Work observations and clocks, and explicit original
+request inputs/identity. Tick also seals its captured native executor status.
+Schema-1/2 manager creation envelopes retain their existing recovery rules.
+An older creation-only binary refuses a pending schema-3 mutation; downgrade
+requires settling it first. Public plan, Work, message and receipt schemas are
+unchanged.
+
+The production service prepares notifications without publishing them. One
+store lock fences the original plan, validates the entire graph/capacity batch
+and receipt, resolves existing stable notifications, assigns sequence numbers,
+and persists the intent before changing any dependent record. Recovery checks
+all records before writing, derives the plan/children/notification content from
+the original observations, accepts only exact priors or successors, settles the
+original response, and durably removes the intent. It does not build that
+response from a newer plan or native status. Message pruning follows settlement
+and cleanup and also runs on store reopen, preserving the 500-message bound.
+An existing question keeps its original identity, sequence, expiration and ack.
+
+The autonomous supervisor uses the same transaction with explicit absent
+foreground request and native status. Revision-CAS plan bookkeeping also
+journals its honest current plan with no foreground binding. The historical
+non-CAS `save_manager_plan_with_work` API remains an unbound low-level fixture
+writer; source inventory finds only two integration-test call sites. It does
+not capture or settle a caller receipt. Manager decision and managed external
+execution/apply authorities retain their existing boundaries.
+
+Admitted uncertainty closes live manager/Work admission and message send/ack
+writers. The original matching lease leaves its pending or completed receipt
+for reopen; another caller cannot acquire that binding. Before admission,
+capacity or intent-write refusal has no child/message/plan effect and remains
+an ordinary replayable refusal. Conflicting recovery evidence is retained.
+
+See the named manager tests and qualification phases in the evidence document.
+The remaining production assignment/lifecycle process matrix, derived Verified
+Change composition, whole-slice supported/hosted validation and independent
+review are still pending. Both tracking issues remain open.

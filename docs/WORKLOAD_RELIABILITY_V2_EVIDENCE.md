@@ -79,7 +79,7 @@ continue to settle at their existing external-effect boundaries.
 | Flow | Existing authority | Status |
 |---|---|---|
 | `create_manager_plan` | Schema-2 `ManagerCreationIntent`, absent plan/root priors, exact snapshots and original outer request; receipt settles before cleanup | Actual MCP Work-write crash reproduced orphan failure; process/write/cleanup/corruption/capacity proofs are in the related-creation target |
-| Manager adoption/materialization | Existing manager plan, graph and Work writers | Full admission/replay audit pending; no generic creation shortcut |
+| Manager adoption/materialization, advance/tick/replan | Schema-3 mutation in the existing manager journal; prior/successor plan/Work/messages/sequence, original observations and caller response | Four actual service crash reproductions repaired; process, corruption, write fault, capacity and background proofs below |
 | Manual `fire_routine` | Schema-2 `RoutineFireIntent` seals absent Work/activation priors, prior/successor routine, activation/dedupe, redacted input and original outer request | Actual MCP Work-write crash reproduced orphan failure; receipt, backoff, redaction and scheduled-absence proofs are in the related-creation target |
 | `prepare_verified_change` | Readiness/projection | Does not create Work and is not a creation receipt gap |
 | `start_verified_change` | Calls `create_manager_plan` with derived `:plan` request ID, then established managed workflow | Manager creation repair must compose with this entry point; preserve readiness and authorization |
@@ -215,12 +215,12 @@ resolving_dead_oneshot_does_not_unpark_on_recovery,
 failed_permission_respond_then_recovery_does_not_unpark}`. The store cases pass in
 the selected 46-test native target; all six focused MCP cases pass on the final sources (`work/v2-related-permission-preservation.log`). The seven idempotency/legacy compatibility library cases also pass (`work/v2-related-compatibility-final.log`). Remaining managed acceptance is still open.
 
-`advance_manager_plan` is the next concrete source-backed adjacent boundary:
-`plan.advance` creates children, `save_manager_plan_with_work_cas` writes them
-and the plan, then the service completes its outer receipt. Existing tests prove
-adoption after a child write, not recovery of that original outer caller result.
-Its real crash/replay reproduction and any corresponding intent extension remain
-pending, including tick/replan variants and the derived Verified Change flow.
+The four manager mutation caller boundaries reproduced orphan receipt failure
+on checkpoint `026f537001dd60292bd8cbf8871e162399b00ab4` plus only the process-cut
+instrumentation (`work/v2-manager-mutation-red-2.log`). They are now implemented
+through the existing manager-intents authority. The `start_verified_change`
+derived `:plan` and `:advance` entry flow uses these repaired callers; the full
+real Verified Change composition proof remains pending.
 
 
 The final corrupt-evidence expansion adds valid and malformed unexpected attempt
@@ -230,3 +230,73 @@ production sources. The 59-test run precedes this test-only expansion, which
 is separately covered by `work/v2-related-extra-evidence-final.log` and the final
 all-target Clippy run. The older 129-test selected run precedes the last canonical
 inspector correction; its exact phase is preserved in task-owned results.
+
+
+## Manager mutation production evidence
+
+`manager_mutation_recovery.rs` invokes authenticated production service callers,
+with real child-process death, isolated homes and synthetic inputs. Its bounded
+read checks call the same scoped service entry points used by MCP. The final
+capacity case also walks the entire recovered lane and reads child detail over
+authenticated MCP HTTP. Other caller cuts use direct service transport; existing
+manager MCP and supervisor transport preservation is qualified separately. Each admitted cut or write
+fault reopens three processes and compares the original sealed response,
+original request identity/subject, exact Work IDs, plan/message snapshots,
+sequence and retained records. Partial page counts never substitute for a whole
+lane traversal.
+
+| Named test | Falsifiable evidence |
+|---|---|
+| `advance_child_written_cut_replays_the_original_request`, `tick_child_written_cut_replays_the_original_request`, `replan_written_cut_replays_the_original_request`, `tick_notification_written_cut_replays_the_original_request` | Four actual original-request red cases now replay their sealed result; root/container Work stays unchanged |
+| `manager_mutation_cut_matrix_preserves_sealed_responses` | Thirty-two operation/cut combinations: admitted intent, first/all children, sequence, first/all messages, plan, receipt, intent unlink and completed cleanup; three fresh process replays |
+| `manager_mutation_recovery_refuses_conflicting_evidence_without_rewriting_records` | Thirty-six operation/evidence combinations: plan, child, message, counter, original receipt, missing/linked receipt, digest/schema/filename/request; three refused opens preserve bytes |
+| `recomputed_manager_seals_cannot_substitute_an_original_derivation` | Changed child objective/order/prior, plan state, notification content/identity, original observation or replan input refuses even after a recomputed snapshot checksum |
+| `pre_intent_manager_process_death_has_no_mutation_effect` | Four original pending requests interrupted before intent admission become replayable refusals, with no child/message/plan effect |
+| `manager_mutation_write_faults_preserve_original_claim_and_close_admission` | Twenty-two admitted/pre-admission operation/write combinations; partial child batch, sequence/message, plan, receipt and cleanup; later manager/send/ack writes refuse after uncertainty |
+| `background_manager_materialization_has_explicitly_no_foreground_receipt` | Eight supervisor operation/cut combinations with explicit null request/native status; recover before a new supervisor starts, no ordinary request minted |
+| `original_manager_response_stays_original_after_a_newer_plan_observation` | A separate actual cancel and manager advance produce newer state; original advance/tick still returns its original response without overwriting that state |
+| `manager_child_batch_capacity_is_admitted_before_any_effect` | A two-child batch fills exactly 4,096 Work after first-child process death; full authenticated MCP bounded list/graph and child-detail reads, plus two further ID/receipt reopens; overflow refuses the entire batch and leaves prior plan |
+| `recovered_tick_preserves_retention_and_existing_question_identity` | Counter/message/unlink cuts retain exactly 500 messages and sequence 501; adopting an existing question preserves its original ID, TTL, sequence and ack instead of comparing a fresh server clock |
+
+The initial four-case repaired target passed 5/5 including its child entry point.
+The expanded first full matrix passed 8/8 before the observation derivation
+extension. Later final-source run `work/v2-manager-final-matrix-1.log` passed
+11/12, with only a background fixture assertion failing: a newly started
+supervisor legitimately created decision Work after recovery. The fixture now
+asserts recovery on store open before starting another supervisor. The final
+focused run `work/v2-manager-final-targeted.log` passes that correction and the
+new retention/question test (2/2), completing named coverage of thirteen tests
+on these production sources. This is phase-specific evidence, not a claimed
+single 13/13 full-target run. A clock-corruption fixture was corrected to alter
+the notification clock used in the final output; altering an intermediate clock
+that the notification overwrites does not substitute the outcome.
+
+Final ordering probe `work/v2-manager-child-order-red.log` demonstrates that
+recomputing the digest after reversing the child array could substitute response
+order. Validation now compares that order with the original derivation.
+`work/v2-manager-last-correction.log` passes the ten derivation corruption variants
+and four pre-intent process cases (2 named tests); its new MCP detail assertion
+used the wrong response field and failed after successful full list/graph walks.
+The corrected detail assertion uses the existing `body` contract. Final capacity
+MCP proof passes (`work/v2-manager-capacity-mcp-final.log`, 1/1), including the
+complete 4,096-item lane and child summary. Named manager coverage is now fourteen
+tests across the recorded phases, with no claimed single 14/14 full-target run.
+
+Selected preservation completed 128/128 (`work/v2-manager-preservation-3.log`),
+before the final child-order derivation correction. Final manager MCP/store/
+supervisor consumers separately pass 9/9 after that correction
+(`work/v2-manager-final-consumers.log`). Strict all-target Clippy passes on final
+sources (`work/v2-manager-clippy-final.log`); fmt and diff checks pass. Initial
+MCP preservation hit localhost bind `Operation not permitted`; current-turn
+network permission permitted the isolated servers. An initial preservation
+command used incorrect target names and ran no tests. These infrastructure/
+command failures remain recorded and do not qualify product behavior.
+
+The compatible family launcher dry-run still resolves the existing shared
+cache namespace (`work/v2-manager-cache-dry-run.log`). The earlier repeated Cargo
+compiler-probe refusal remains documented; normal Rust 1.92 direct task-owned
+qualification uses locked/offline, wrappers unset and the unchanged debug profile.
+No cache, socket, daemon, hold or sandbox policy was changed. Prior broad local
+sandbox failures remain retained. No hosted v2 CI, draft handoff, complete caller
+matrix or independent CLEAN acceptance is claimed by this checkpoint.
+#520 and #521 were freshly reverified open after the checks.
