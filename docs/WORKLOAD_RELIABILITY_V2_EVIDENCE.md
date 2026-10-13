@@ -54,7 +54,7 @@ alone is not complete proof of every caller/cut combination.
 | `cancel_work` | `work_attempts`; lifecycle then managed authority cancellation | Real Work/receipt/cleanup fault cases replay through three host lifetimes; managed external cancellation ordering remains a separate acceptance row |
 | `retry_work` | `work_item_mutation`, `work_scope` | Retry state and receipt replay across all relevant cuts |
 | `approve_work` | `work_item_attempt_mutation`, `work_attempt` | Caller expected revision is hashed and checked by store; explicitly qualify binding and original result |
-| `resolve_work_input` | Synchronous service entry; deeper audit pending | Classify its actual durable boundary before including or excluding |
+| `resolve_work_input` | Live permission ID; existing managed Parked/Resolving intent plus host receiver, then unbound Work lifecycle update | Has no request ID or ordinary authenticated idempotency claim. Preserve managed permission/effect authority; scope, receiver-gone, failed respond and restart tests are named below |
 | Managed seal/finalization/reconciliation | Existing managed intent, finalization, quarantine and recovery protocols | Preserve #584 F1/F5 and external-effect settlement; inventory all relevant caller cuts |
 
 Real cancellation and reprioritization write/receipt faults reproduce the
@@ -78,9 +78,9 @@ continue to settle at their existing external-effect boundaries.
 
 | Flow | Existing authority | Status |
 |---|---|---|
-| `create_manager_plan` | `ManagerCreationIntent` seals root Work and manager plan; outer service receipt completes afterward | Potential equivalent receipt gap. Reproduce using actual service; extend this protocol rather than replace it |
+| `create_manager_plan` | Schema-2 `ManagerCreationIntent`, absent plan/root priors, exact snapshots and original outer request; receipt settles before cleanup | Actual MCP Work-write crash reproduced orphan failure; process/write/cleanup/corruption/capacity proofs are in the related-creation target |
 | Manager adoption/materialization | Existing manager plan, graph and Work writers | Full admission/replay audit pending; no generic creation shortcut |
-| Manual `fire_routine` | `RoutineFireIntent` seals routine/activation/Work/dedupe; outer service receipt completes afterward | Potential equivalent receipt gap; preserve routine dedupe and scheduled/background callers with explicit absence of foreground binding |
+| Manual `fire_routine` | Schema-2 `RoutineFireIntent` seals absent Work/activation priors, prior/successor routine, activation/dedupe, redacted input and original outer request | Actual MCP Work-write crash reproduced orphan failure; receipt, backoff, redaction and scheduled-absence proofs are in the related-creation target |
 | `prepare_verified_change` | Readiness/projection | Does not create Work and is not a creation receipt gap |
 | `start_verified_change` | Calls `create_manager_plan` with derived `:plan` request ID, then established managed workflow | Manager creation repair must compose with this entry point; preserve readiness and authorization |
 | Verified Change apply/discard | Existing sealed admission, source effect, cleanup and managed evidence | Must settle at the external-effect boundary, never from an intermediate Work snapshot |
@@ -146,3 +146,87 @@ store (20). Its library retains the known local baseline: 748 pass, 11 failed,
 11 ignored. This run is not green. The final non-mutating inspection is separately
 qualified by the final 14 caller tests, six legacy/idempotency units and Clippy;
 no full hosted v2 qualification or independent review is claimed.
+
+
+## Related creation production evidence
+
+`work_related_creation_recovery.rs` calls the real authenticated MCP manager and
+routine tools. Its scheduled case calls the actual `fire_due_routines_at` writer
+after creating its definition through MCP. Fixtures use isolated homes,
+synthetic credentials and synthetic capacity records.
+
+| Named test / family | Falsifiable evidence |
+|---|---|
+| `manager_creation_replays_after_work_write`, `routine_creation_replays_after_work_write` | Original pending receipt fails on the prior milestone plus only two cut hooks; repair returns the original result in three fresh processes |
+| `related_creation_cut_matrix_replays_exact_outcomes_in_three_processes` | Manager: intent, plan, receipt, unlink, cleanup; routine: intent, routine, activation, dedupe, receipt, unlink, cleanup. Work cuts are the two original reproduction tests. Disk status is asserted before reopen |
+| `pre_intent_crashes_have_no_created_work_or_guessed_success` | No admitted intent or new Work; three processes replay the orphan refusal rather than fabricate success |
+| `admitted_write_and_cleanup_faults_keep_receipts_and_close_admission` | Manager Work/plan/receipt/cleanup and routine Work/activation/dedupe/receipt/cleanup faults preserve pending/complete original receipts; later MCP mutation and scheduled writer refuse; pre-intent faults remain ordinary refusals |
+| `related_creation_corruptions_refuse_without_overwriting_evidence` | Nineteen variants in each family, three fresh refused processes each: snapshot, schema, owner, session, workspace, hash, input projection, failed/missing/malformed/conflicting receipt, filename, foreign Work/related record, malformed intent, valid and malformed unexpected attempts/decisions; complete JSON evidence bytes retained |
+| `pending_related_receipt_conflicts_are_preserved_before_any_recovery_write` | Injected pending response/error/subject reproduced an overwrite on the first repair; all six family/field cases now refuse three processes with unchanged evidence |
+| `related_creation_refuses_full_capacity_before_intent_admission` | Actual callers at 4,096 synthetic lane items leave no admitted intent, plan or activation, and a replayable capacity refusal |
+| `recovered_related_creation_occupies_the_final_slot_once_and_remains_pageable` | Each actual caller occupies slot 4,096, dies after Work write, then replays in three processes; complete authenticated list/graph walks agree in ID set and order without duplication |
+| `routine_non_work_and_backoff_outcomes_recover_without_an_extra_failure_increment` | Disabled and missing-agent manual callers at intent/routine/activation/receipt cuts replay exact activation, with zero Work and a failure counter incremented once |
+| `routine_backoff_write_fault_leaves_its_prior_and_original_receipt_recoverable` | Routine-write fault retains the prior routine and pending caller; three processes install the successor and increment once |
+| `routine_intent_and_replayed_activation_keep_existing_secret_redaction` | Neither sealed ledger nor replayed activation persists synthetic nested secrets; original hash binding survives |
+| `legacy_unbound_related_envelopes_recover_without_inventing_an_authenticated_outcome` | Old-field projection fixture converges effects; unknown original caller stays failed. No invented binding or guessed successful outcome |
+| `scheduled_writer_recovers_under_its_dedupe_authority_without_a_foreground_receipt` | Explicit absent request, exact original Work/activation across three processes, and no foreground request minted |
+| `manual_routine_from_a_canonical_alias_replays_the_original_response_workspace` | An input workspace path alias canonicalizes under existing authorization and keeps the original canonical response display; the record itself remains in its existing canonical scope |
+
+Initial related repair passed 3 new process tests plus manager MCP 2, routine MCP
+1 and routine store 10. Expanded initial matrix passed 12/12 before the pending
+receipt and canonical-alias probes. The definitive original receipt-loss red
+log is `work/v2-related-creation-red-final.log`; first compile and loopback
+infrastructure attempts are not reproductions. Pending-field red logs are
+`work/v2-related-pending-red.log` and `work/v2-creation-pending-red.log`.
+Final selected preservation passed 129/129 before the canonical creation receipt
+inspection correction. The final correction separately passes 59/59: related
+creation 16, ordinary creation recovery 8/conformance 2, caller replay 14,
+manager MCP 2/store 6 and routine MCP 1/store 10. Strict fmt and all-target
+Clippy pass on these final sources. The initial capacity proof walked every
+full lane in all three replay processes; the final test retains the first full
+list/graph walk and two further ID/receipt reopens without repeating that
+expensive traversal. Whole-slice
+hosted CI, manager adoption audit and full caller cut acceptance remain open.
+
+
+The additional ordinary-creation inspector test has two real admitted caller
+fixtures: a linked canonical receipt path and a conflicting owner-layout legacy
+receipt. Both reproduce side effects during recovery inspection (accepting the
+link or moving the legacy evidence before the hash refusal). The new canonical
+inspector is shared only by new sealed creations. It refuses either fixture
+across three opens without writing Work, moving evidence or replacing the link;
+ordinary legacy claim/read migration remains under its original authority.
+Logs: `work/v2-creation-receipt-inspection-red.log`,
+`work/v2-creation-receipt-inspection-red-2.log`, and the final 59-test qualification.
+
+The first alias probe changed the stored routine workspace and was correctly
+refused by the existing exact routine scope rule. That fixture was corrected to
+supply an alias as the caller input while preserving the canonical stored
+record; no production authority was broadened. `work/v2-related-alias-red.log`
+is a rejected fixture, not an introduced product defect.
+
+Managed permission preservation references:
+`native_executor_store::{resolve_permission_requires_parked_scope_and_updates_attempt,
+resolve_stale_non_parked_and_denial_do_not_mutate_wrongly}`;
+`native_executor_mcp::{resolve_work_input_requires_parked_scope,
+permission_from_run_b_does_not_park_work_a, resolve_work_input_uses_real_host_pending,
+resolve_work_input_fails_after_restart_without_host_pending,
+resolving_dead_oneshot_does_not_unpark_on_recovery,
+failed_permission_respond_then_recovery_does_not_unpark}`. The store cases pass in
+the selected 46-test native target; all six focused MCP cases pass on the final sources (`work/v2-related-permission-preservation.log`). The seven idempotency/legacy compatibility library cases also pass (`work/v2-related-compatibility-final.log`). Remaining managed acceptance is still open.
+
+`advance_manager_plan` is the next concrete source-backed adjacent boundary:
+`plan.advance` creates children, `save_manager_plan_with_work_cas` writes them
+and the plan, then the service completes its outer receipt. Existing tests prove
+adoption after a child write, not recovery of that original outer caller result.
+Its real crash/replay reproduction and any corresponding intent extension remain
+pending, including tick/replan variants and the derived Verified Change flow.
+
+
+The final corrupt-evidence expansion adds valid and malformed unexpected attempt
+and decision records to both related families (nineteen variants each). That
+named test passes on the final fixture source, with the same unchanged final
+production sources. The 59-test run precedes this test-only expansion, which
+is separately covered by `work/v2-related-extra-evidence-final.log` and the final
+all-target Clippy run. The older 129-test selected run precedes the last canonical
+inspector correction; its exact phase is preserved in task-owned results.

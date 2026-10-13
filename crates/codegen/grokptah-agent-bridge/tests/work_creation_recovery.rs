@@ -455,6 +455,9 @@ fn creation_recovery_refuses_conflicting_evidence_without_writing_work() {
         "workspace_digest",
         "payload",
         "failed_receipt",
+        "pending_response",
+        "pending_error",
+        "pending_subject",
         "missing_receipt",
         "corrupt_receipt",
         "schema",
@@ -486,6 +489,19 @@ fn creation_recovery_refuses_conflicting_evidence_without_writing_work() {
             }
             "failed_receipt" => {
                 receipt["status"] = json!("failed");
+                write_json(&receipt_path, &receipt);
+            }
+            "pending_response" | "pending_error" | "pending_subject" => {
+                match corruption {
+                    "pending_response" => {
+                        receipt["response"] = json!({"foreign":"pending response"})
+                    }
+                    "pending_error" => {
+                        receipt["error"] =
+                            json!({"code":"internal","message":"foreign pending error"})
+                    }
+                    _ => receipt["runId"] = json!("foreign pending subject"),
+                }
                 write_json(&receipt_path, &receipt);
             }
             "missing_receipt" => std::fs::remove_file(&receipt_path).unwrap(),
@@ -556,5 +572,53 @@ fn committed_creation_replays_the_original_request_after_process_death() {
         assert_eq!(records(&root.path().join("ledger/work-items")), original);
         assert!(records(&root.path().join("ledger/work-attempts")).is_empty());
         assert!(records(&root.path().join("ledger/work-decisions")).is_empty());
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn creation_recovery_does_not_follow_receipt_links_or_adopt_conflicting_legacy_evidence() {
+    for variant in ["legacy-conflict", "receipt-link"] {
+        let root = tempfile::tempdir().unwrap();
+        assert_exit(&child(root.path(), "create", "lifecycle_after_intent"), 86);
+        let canonical = receipt_path(root.path());
+        let evidence = if variant == "receipt-link" {
+            let target = root.path().join("foreign-receipt.json");
+            std::fs::rename(&canonical, &target).unwrap();
+            std::os::unix::fs::symlink(&target, &canonical).unwrap();
+            target
+        } else {
+            let legacy = canonical
+                .parent()
+                .unwrap()
+                .parent()
+                .unwrap()
+                .join(canonical.file_name().unwrap());
+            let mut value = read_json(&canonical);
+            value["payloadHash"] = json!("foreign legacy hash");
+            write_json(&canonical, &value);
+            std::fs::rename(&canonical, &legacy).unwrap();
+            legacy
+        };
+        let bytes = std::fs::read(&evidence).unwrap();
+        let intent = intent_paths(root.path()).remove(0);
+        let sealed = std::fs::read(&intent).unwrap();
+        for _ in 0..3 {
+            assert!(
+                OrchStore::open(root.path().join("ledger")).is_err(),
+                "{variant} must refuse"
+            );
+            assert_eq!(std::fs::read(&evidence).unwrap(), bytes);
+            assert_eq!(std::fs::read(&intent).unwrap(), sealed);
+            if variant == "receipt-link" {
+                assert!(std::fs::symlink_metadata(&canonical)
+                    .unwrap()
+                    .file_type()
+                    .is_symlink());
+            } else {
+                assert!(!canonical.exists());
+            }
+            assert!(records(&root.path().join("ledger/work-items")).is_empty());
+        }
     }
 }

@@ -58,7 +58,7 @@ The original receipt's Work ID and response survive completion before cleanup.
   matrix also covers pre-intent refusal and cuts after intent, attempts, Work,
   receipt, intent unlink and completed cleanup.
 - Four same-process write/cleanup faults distinguish pre-admission refusal
-  from admitted recovery. Ten conflicting/corrupt evidence variants refuse
+  from admitted recovery. Thirteen conflicting/corrupt evidence variants refuse
   three opens while retaining their original bytes.
 - At 4,096 items, recovered creation remains readable through complete
   authenticated MCP list and graph traversals. Every ID appears once, both
@@ -67,7 +67,9 @@ The original receipt's Work ID and response survive completion before cleanup.
 - Creation concurrency, request conflict and canonical path conformance
   pass. Two distinct requests competing for the final capacity slot produce
   exactly one success and one replayable capacity refusal. The full new
-  creation battery passes nine tests, including its child-process entry point.
+  initial creation battery passed nine tests, including its child-process entry point.
+  The canonical receipt inspection case adds an eighth recovery test; current
+  ordinary creation qualification is eight recovery plus two conformance tests.
 - Pending: complete source-backed production caller/response/cut matrix,
   including adjacent manager/routine/Verified Change creation protocols;
   fix demonstrated omissions without changing external-effect authority.
@@ -153,3 +155,74 @@ store (20). Its library retains the known local baseline: 748 pass, 11 failed,
 11 ignored. This run is not green. The final non-mutating inspection is separately
 qualified by the final 14 caller tests, six legacy/idempotency units and Clippy;
 no full hosted v2 qualification or independent review is claimed.
+
+
+## Related manager and routine creation
+
+Actual authenticated MCP calls reproduce the same original-receipt loss for
+manager roots and manual routine Work. A process exits after its Work write;
+the legacy intent recovers that Work, but generic orphan cleanup then fails the
+original authenticated request. Both original errors and receipt identities are
+captured in the red evidence. These tests never manually claim or arm a receipt.
+
+The existing `manager-intents` and `routine-intents` protocols now use version-2
+envelopes. Manager creation explicitly has absent prior plan/root records.
+Routine activation explicitly has absent prior activation/Work, plus the prior
+routine snapshot. Original IDs and snapshot digests are sealed before any write.
+Every existing dependent record and the original canonical receipt is preflighted
+before recovery can write. An absent record or exact successor can converge;
+foreign, malformed, non-regular or contradictory evidence is retained and
+refused. Capacity validation happens before admission and again on recovery,
+without counting a matching already-written Work twice.
+
+Foreground calls pass their own explicit owner/session/canonical-workspace,
+request/tool/hash, response shape, input projection and actor. Manager input
+is checked against the sealed plan/root. Routine input retains the existing
+redaction policy; its projection digest is separate from the original raw-input
+hash in the authenticated receipt binding. Recovery does not reconstruct that
+original hash from redacted fields. No raw payload secret or lease token is
+added to the intent. Scheduled writers explicitly pass no foreground request
+and retain their occurrence/dedupe authority.
+
+All effects land before the exact original response and subject settle; durable
+intent removal follows receipt settlement. Live admitted uncertainty closes
+admission, protects the matching receipt from lease failure/destruction, and
+prevents later manager materialization and scheduled firing. Routine failure
+counters/backoff/circuit changes now seal both routine snapshots before writing,
+so a recovered failure does not increment the counter again.
+
+Version-1 unbound envelopes still decode and recover their known effects without
+inventing an authenticated caller or successful receipt. The compatibility test
+projects the old fields from an actual new caller's intent; it is not evidence
+from an old deployed producer. Do not downgrade a ledger with pending version-2
+intents: old binaries do not understand the new authenticated settlement fields.
+Public Work, activation, plan, attempt and receipt schemas remain unchanged.
+
+The pending receipt has its own invariant: no subject, response or error exists
+yet. Additional red probes reproduced overwrite of injected pending outcomes
+in both ordinary and related creation. Such evidence now refuses recovery
+before any dependent record write. Successful complete receipts must match the
+exact sealed original response/subject and already-present effects.
+
+The new related-creation target includes real process cuts, same-process write
+faults, full-lane bounded readers, corruption/pending-evidence refusal, backoff,
+redaction, legacy compatibility and scheduled creation. The broader production
+caller process matrix, manager adoption/materialization audit, Verified Change
+composition and hosted final qualification remain pending. This is writer
+evidence, and #520/#521 remain open for separate acceptance.
+
+
+The final related target passes 16 tests. The selected preservation run passes
+129 tests before the final ordinary-creation inspector correction, and the
+correction passes 59 focused related/ordinary/caller/manager/routine tests.
+Strict formatting and all-target Clippy pass. New sealed creation inspection
+uses canonical regular-file evidence and cannot migrate a legacy receipt before
+its proof; existing ordinary legacy lookup/claim migration remains intact.
+This is a qualified local milestone, not final whole-slice or hosted acceptance.
+
+Seven idempotency/legacy compatibility units and all six focused managed
+permission MCP cases also pass. The final corruption row includes valid and
+malformed unexpected attempts and decisions; this test-only expansion passes
+separately after the 59-test run, with final strict all-target Clippy qualification.
+The earlier broad local library/integration failures and their baseline
+comparisons remain recorded; this milestone does not erase those limitations.

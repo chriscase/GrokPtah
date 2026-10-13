@@ -39,8 +39,8 @@ use super::types::{
 use super::worker::{WorkerHostKind, WorkerPresence, WorkerProjection};
 use super::workload::{
     lease_duration, AssignmentStatus, AttemptState, BlockProvenance, WorkApproval, WorkAttempt,
-    WorkAttemptView, WorkClaim, WorkDecision, WorkDecisionAction, WorkItem, WorkProgress,
-    WorkResult, WorkState, WorkloadReconciliationReport, WORKLOAD_SCHEMA_VERSION,
+    WorkAttemptView, WorkClaim, WorkDecision, WorkDecisionAction, WorkItem, WorkPolicy,
+    WorkProgress, WorkResult, WorkState, WorkloadReconciliationReport, WORKLOAD_SCHEMA_VERSION,
 };
 use super::{assemble_continuation_context, ContinuationContext, ContinuationInputSnapshot};
 use crate::completion::{evidence_authorizes_success, CompletionEvidence};
@@ -197,20 +197,385 @@ struct RoutineDedupeRecord {
     created_at: chrono::DateTime<Utc>,
 }
 
+// Schema 1 is the original unbound envelope. Schema 2 admits new records
+// with absent priors and seals the original authenticated caller when present.
+fn legacy_related_creation_schema() -> u32 {
+    1
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct RelatedCreationRequest {
+    pub binding: WorkRequestBinding,
+    pub payload: serde_json::Value,
+    payload_digest: String,
+    pub actor: String,
+}
+
+impl RelatedCreationRequest {
+    pub(crate) fn new(
+        binding: WorkRequestBinding,
+        payload: serde_json::Value,
+        actor: String,
+    ) -> Self {
+        let payload_digest = super::types::hash_payload(&payload);
+        Self {
+            binding,
+            payload,
+            payload_digest,
+            actor,
+        }
+    }
+    fn validate(
+        &self,
+        tool: &str,
+        shape: &str,
+        session: Uuid,
+        workspace: &str,
+    ) -> Result<(), OrchError> {
+        let binding = &self.binding;
+        let input_workspace = self.payload["workspace"]
+            .as_str()
+            .ok_or_else(|| related_creation_conflict("creation input workspace is missing"))?;
+        if binding.tool != tool
+            || binding.shape != shape
+            || binding.target_work_id.is_some()
+            || binding.target_attempt_id.is_some()
+            || binding.expected_revision.is_some()
+            || binding.session_id != session
+            || binding.workspace_display != workspace
+            || self.payload["sessionId"] != serde_json::json!(session)
+            || !bound_request_workspace_matches(binding, workspace)
+            || !workspaces_match(input_workspace, workspace)
+            || IdempotencyScope::new(&binding.owner_id, session, Path::new(workspace))?
+                .workspace_digest
+                != binding.workspace_digest
+            || super::types::hash_payload(&self.payload) != self.payload_digest
+            || (tool == "ptah_create_manager_plan" && self.payload_digest != binding.payload_hash)
+            || self.actor.is_empty()
+        {
+            return Err(related_creation_conflict(
+                "related creation request identity is invalid",
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn related_creation_conflict(message: &str) -> OrchError {
+    OrchError::new(OrchErrorCode::Conflict, message)
+}
+/// A new authenticated claim has no subject or outcome yet. An injected
+/// result/error/subject is conflicting evidence, even when status is pending.
+fn creation_receipt_is_pending(receipt: &IdempotencyReceipt) -> bool {
+    receipt.status == "pending"
+        && receipt.response.is_null()
+        && receipt.error.is_none()
+        && receipt.run_id.is_none()
+}
+
+fn related_snapshot_digest(value: &impl serde::Serialize) -> Result<String, OrchError> {
+    serde_json::to_value(value)
+        .map(|value| super::types::hash_payload(&value))
+        .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct RoutineFireIntent {
+    #[serde(default = "legacy_related_creation_schema")]
+    schema_version: u32,
     routine: RoutineRecord,
     activation: ActivationRecord,
     work: Option<WorkItem>,
     dedupe: Option<RoutineDedupeRecord>,
+    #[serde(default)]
+    prior_routine: Option<RoutineRecord>,
+    #[serde(default)]
+    prior_activation: Option<ActivationRecord>,
+    #[serde(default)]
+    prior_work: Option<WorkItem>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    snapshot_digest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    request: Option<RelatedCreationRequest>,
+}
+
+impl RoutineFireIntent {
+    fn digest(&self) -> Result<String, OrchError> {
+        related_snapshot_digest(&(
+            &self.prior_routine,
+            &self.routine,
+            &self.activation,
+            &self.work,
+            &self.dedupe,
+        ))
+    }
+    fn response(&self) -> serde_json::Value {
+        serde_json::json!({"activation":self.activation,"routineId":self.routine.routine_id,"sessionId":self.routine.session_id,"workspace":self.routine.workspace})
+    }
+    fn validate(&self) -> Result<(), OrchError> {
+        self.routine.validate()?;
+        self.activation.validate()?;
+        if self.activation.routine_id != self.routine.routine_id
+            || self.activation.routine_revision != self.routine.revision
+        {
+            return Err(related_creation_conflict(
+                "routine activation identity does not match its routine",
+            ));
+        }
+        if let Some(work) = &self.work {
+            work.validate()?;
+            if self.activation.disposition != ActivationDisposition::CreatedWork
+                || self.activation.work_id.as_deref() != Some(work.work_id.as_str())
+                || work.source_activation_id.as_deref()
+                    != Some(self.activation.activation_id.as_str())
+                || work.source_routine_id.as_deref() != Some(self.routine.routine_id.as_str())
+                || work.session_id != self.routine.session_id
+                || work.workspace != self.routine.workspace
+                || work.state != WorkState::Queued
+                || work.revision != 1
+                || work.attempt_count != 0
+                || work.assignment_status != AssignmentStatus::Accepted
+                || work.assigned_agent_id.as_deref() != Some(self.routine.agent_id.as_str())
+                || work.result.is_some()
+                || work.progress.is_some()
+                || work.approval.is_some()
+                || work.is_container
+                || work.last_decision_id.is_some()
+                || work.created_at != self.activation.fired_at
+                || work.updated_at != work.created_at
+                || work.kind != self.routine.work_template.kind
+                || work.objective != self.routine.work_template.objective
+                || work.priority != self.routine.work_template.priority
+                || work.policy != self.activation.captured_policy.work_policy
+                || work.created_by != format!("routine:{}", self.routine.routine_id)
+                || work.parent_work_id.is_some()
+                || !work.dependencies.is_empty()
+                || work.deadline.is_some()
+                || work.blocked_reason.is_some()
+                || work.block_provenance.is_some()
+                || work.source_manager_plan_id.is_some()
+                || work.source_manager_step_id.is_some()
+            {
+                return Err(related_creation_conflict(
+                    "routine creation snapshot is inconsistent",
+                ));
+            }
+        } else if self.activation.work_id.is_some()
+            || self.activation.disposition == ActivationDisposition::CreatedWork
+        {
+            return Err(related_creation_conflict(
+                "routine intent has a missing Work snapshot",
+            ));
+        }
+        if let Some(dedupe) = &self.dedupe {
+            if dedupe.activation_id != self.activation.activation_id
+                || dedupe.dedupe_key != self.activation.dedupe_key
+                || dedupe.work_id != self.activation.work_id
+                || dedupe.disposition != Some(self.activation.disposition)
+                || dedupe.created_at != self.activation.fired_at
+            {
+                return Err(related_creation_conflict(
+                    "routine dedupe snapshot is inconsistent",
+                ));
+            }
+        }
+        match self.schema_version {
+            1 if self.request.is_none()
+                && self.snapshot_digest.is_none()
+                && self.prior_routine.is_none()
+                && self.prior_activation.is_none()
+                && self.prior_work.is_none() => {}
+            2 if self.prior_activation.is_none()
+                && self.prior_work.is_none()
+                && self.snapshot_digest.as_deref() == Some(self.digest()?.as_str()) =>
+            {
+                let prior = self.prior_routine.as_ref().ok_or_else(|| {
+                    related_creation_conflict("routine intent is missing its prior routine")
+                })?;
+                prior.validate()?;
+                if prior.routine_id != self.routine.routine_id
+                    || prior.session_id != self.routine.session_id
+                    || prior.workspace != self.routine.workspace
+                    || prior.revision != self.routine.revision
+                {
+                    return Err(related_creation_conflict(
+                        "routine prior identity is invalid",
+                    ));
+                }
+                if self.dedupe.is_none() {
+                    return Err(related_creation_conflict(
+                        "routine creation requires its dedupe snapshot",
+                    ));
+                }
+                if related_snapshot_digest(prior)? != related_snapshot_digest(&self.routine)? {
+                    let mut expected = prior.clone();
+                    expected.consecutive_failures = expected.consecutive_failures.saturating_add(1);
+                    if expected.consecutive_failures >= expected.retry.circuit_failures {
+                        expected.circuit_open = true;
+                        expected.lifecycle = RoutineLifecycle::Paused;
+                        expected.next_fire_at = None;
+                    } else {
+                        expected.next_fire_at = Some(
+                            self.activation.fired_at
+                                + expected.retry.delay_after(expected.consecutive_failures),
+                        );
+                    }
+                    expected.updated_at = self.activation.fired_at;
+                    let disposition = if expected.circuit_open {
+                        ActivationDisposition::CircuitOpen
+                    } else {
+                        ActivationDisposition::Backoff
+                    };
+                    if self.activation.disposition != disposition
+                        || self.activation.error.is_none()
+                        || related_snapshot_digest(&expected)?
+                            != related_snapshot_digest(&self.routine)?
+                    {
+                        return Err(related_creation_conflict(
+                            "routine successor does not match its failure transition",
+                        ));
+                    }
+                }
+                if let Some(request) = &self.request {
+                    request.validate(
+                        "ptah_fire_routine",
+                        "routine_activation",
+                        self.routine.session_id,
+                        &self.routine.workspace,
+                    )?;
+                    let expected = serde_json::json!({"sessionId":self.routine.session_id,"workspace":request.payload["workspace"],"routineId":self.routine.routine_id,"payload":self.activation.payload});
+                    if self.activation.trigger_kind != "manual"
+                        || self.activation.created_by != request.actor
+                        || self.activation.dedupe_key
+                            != super::routine::manual_dedupe_key(
+                                &self.routine.routine_id,
+                                &request.binding.request_id,
+                            )
+                        || request.payload != expected
+                    {
+                        return Err(related_creation_conflict(
+                            "routine request does not match the activation",
+                        ));
+                    }
+                }
+            }
+            _ => {
+                return Err(related_creation_conflict(
+                    "unsupported or invalid routine creation intent",
+                ))
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ManagerCreationIntent {
+    #[serde(default = "legacy_related_creation_schema")]
+    schema_version: u32,
     plan: ManagerPlan,
     root_work: WorkItem,
+    #[serde(default)]
+    prior_plan: Option<ManagerPlan>,
+    #[serde(default)]
+    prior_root_work: Option<WorkItem>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    snapshot_digest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    request: Option<RelatedCreationRequest>,
+}
+
+impl ManagerCreationIntent {
+    fn digest(&self) -> Result<String, OrchError> {
+        related_snapshot_digest(&(&self.plan, &self.root_work))
+    }
+    fn response(&self) -> serde_json::Value {
+        serde_json::json!({"plan":self.plan,"rootWork":self.root_work})
+    }
+    fn validate(&self) -> Result<(), OrchError> {
+        self.plan.validate()?;
+        self.root_work.validate()?;
+        if !self.root_work.is_container
+            || self.root_work.work_id != self.plan.root_work_id
+            || self.root_work.session_id != self.plan.session_id
+            || self.root_work.workspace != self.plan.workspace
+        {
+            return Err(related_creation_conflict(
+                "manager root Work does not match its plan",
+            ));
+        }
+        match self.schema_version {
+            1 if self.request.is_none()
+                && self.snapshot_digest.is_none()
+                && self.prior_plan.is_none()
+                && self.prior_root_work.is_none() => {}
+            2 if self.prior_plan.is_none()
+                && self.prior_root_work.is_none()
+                && self.snapshot_digest.as_deref() == Some(self.digest()?.as_str()) =>
+            {
+                if self.plan.revision != 1
+                    || self.plan.replan_count != 0
+                    || self.plan.state != super::manager::ManagerPlanState::Active
+                    || self.root_work.state != WorkState::Blocked
+                    || self.root_work.revision != 2
+                    || self.root_work.attempt_count != 0
+                    || self.root_work.assignment_status != AssignmentStatus::Unassigned
+                    || self.root_work.assigned_agent_id.is_some()
+                    || self.root_work.result.is_some()
+                    || self.root_work.progress.is_some()
+                    || self.root_work.approval.is_some()
+                    || self.root_work.last_decision_id.is_some()
+                    || self.root_work.kind != "manager-plan"
+                    || self.root_work.priority != 0
+                    || self.root_work.parent_work_id.is_some()
+                    || !self.root_work.dependencies.is_empty()
+                    || self.root_work.deadline.is_some()
+                    || self.root_work.block_provenance.is_some()
+                    || self.root_work.source_manager_plan_id.is_some()
+                    || self.root_work.source_manager_step_id.is_some()
+                    || self.root_work.source_routine_id.is_some()
+                    || self.root_work.source_activation_id.is_some()
+                    || self.root_work.policy != WorkPolicy::default()
+                    || self.root_work.blocked_reason.as_deref()
+                        != Some("manager plan container; execute its child Work items")
+                    || self.plan.steps.iter().any(|step| {
+                        step.state != super::manager::ManagerStepState::Pending
+                            || step.work_id.is_some()
+                    })
+                {
+                    return Err(related_creation_conflict(
+                        "manager creation snapshot is not initial state",
+                    ));
+                }
+                if let Some(request) = &self.request {
+                    request.validate(
+                        "ptah_create_manager_plan",
+                        "manager_plan",
+                        self.plan.session_id,
+                        &self.plan.workspace,
+                    )?;
+                    let expected = serde_json::json!({"sessionId":self.plan.session_id,"workspace":request.payload["workspace"],"managerAgentId":self.plan.manager_agent_id,"objective":self.plan.objective,"steps":self.plan.steps.iter().map(|step|step.as_spec()).collect::<Vec<_>>(),"maxInFlight":self.plan.max_in_flight,"maxReplans":self.plan.max_replans,"autonomous":self.plan.coordination.autonomous()});
+                    if request.payload != expected
+                        || self.root_work.created_by != request.actor
+                        || self.root_work.objective != self.plan.objective
+                    {
+                        return Err(related_creation_conflict(
+                            "manager request does not match its plan",
+                        ));
+                    }
+                }
+            }
+            _ => {
+                return Err(related_creation_conflict(
+                    "unsupported or invalid manager creation intent",
+                ))
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Service receipt identity stored inside an existing work intent.
@@ -2184,46 +2549,225 @@ impl OrchStore {
         plan: &ManagerPlan,
         root_work: &WorkItem,
     ) -> Result<(), OrchError> {
+        self.save_manager_creation_with_request(plan, root_work, None)
+    }
+
+    pub(crate) fn save_manager_creation_with_request(
+        &self,
+        plan: &ManagerPlan,
+        root_work: &WorkItem,
+        request: Option<RelatedCreationRequest>,
+    ) -> Result<(), OrchError> {
         let _guard = self.inner.lock.lock();
-        plan.validate()?;
-        root_work
-            .validate()
-            .map_err(|error| OrchError::new(OrchErrorCode::InvalidRequest, error.message))?;
-        if !root_work.is_container
-            || root_work.work_id != plan.root_work_id
-            || root_work.session_id != plan.session_id
-            || root_work.workspace != plan.workspace
-        {
-            return Err(OrchError::new(
-                OrchErrorCode::InvalidRequest,
-                "manager root Work does not match its plan",
-            ));
-        }
-        let intent = ManagerCreationIntent {
+        self.refuse_closed_admission()?;
+        let mut intent = ManagerCreationIntent {
+            schema_version: 2,
             plan: plan.clone(),
             root_work: root_work.clone(),
+            prior_plan: None,
+            prior_root_work: None,
+            snapshot_digest: None,
+            request,
         };
-        let intent_path = self.manager_creation_intent_path(&plan.plan_id)?;
-        atomic_write_json(&self.lease(), &intent_path, &intent)
+        intent.snapshot_digest = Some(intent.digest()?);
+        intent.validate()?;
+        if self
+            .manager_plan_path(&plan.plan_id)?
+            .try_exists()
+            .map_err(|e| OrchError::new(OrchErrorCode::Internal, e.to_string()))?
+            || self
+                .work_item_path(&root_work.work_id)?
+                .try_exists()
+                .map_err(|e| OrchError::new(OrchErrorCode::Internal, e.to_string()))?
+        {
+            return Err(related_creation_conflict(
+                "manager creation requires absent prior records",
+            ));
+        }
+        self.preflight_manager_creation_unlocked(&intent)?;
+        let path = self.manager_creation_intent_path(&plan.plan_id)?;
+        crash_process_if_stage("manager_create_before_intent");
+        self.persist_related_intent_unlocked(&path, &intent)?;
+        crash_process_if_stage("manager_create_after_intent");
+        self.commit_manager_creation_intent_unlocked(&intent)
+            .map_err(|error| self.note_work_recovery_required(error))?;
+        self.clear_related_intent_unlocked(&path)
+            .map_err(|error| self.note_work_recovery_required(error))?;
+        crash_process_if_stage("manager_create_after_commit");
+        Ok(())
+    }
+
+    /// Preflight every dependent record before the first write. A schema-2
+    /// create has no predecessor; exact successors permit idempotent recovery.
+    fn related_record_matches_unlocked<T: serde::de::DeserializeOwned + serde::Serialize>(
+        &self,
+        path: &Path,
+        expected: &T,
+    ) -> Result<bool, OrchError> {
+        let metadata = match fs::symlink_metadata(path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(OrchError::new(OrchErrorCode::Internal, error.to_string())),
+        };
+        if !metadata.file_type().is_file() {
+            return Err(related_creation_conflict(
+                "creation found non-regular record evidence",
+            ));
+        }
+        let actual: T = serde_json::from_slice(
+            &fs::read(path)
+                .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?,
+        )
+        .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        if related_snapshot_digest(&actual)? != related_snapshot_digest(expected)? {
+            return Err(related_creation_conflict(
+                "creation found a conflicting successor record",
+            ));
+        }
+        Ok(true)
+    }
+
+    fn preflight_related_work_unlocked(&self, item: &WorkItem) -> Result<bool, OrchError> {
+        let present =
+            self.related_record_matches_unlocked(&self.work_item_path(&item.work_id)?, item)?;
+        if !self
+            .list_work_attempts_unlocked(Some(&item.work_id))
+            .map_err(Self::orch_error_from_anyhow)?
+            .is_empty()
+            || !self.list_work_decisions_unlocked(&item.work_id)?.is_empty()
+        {
+            return Err(related_creation_conflict(
+                "new Work has unexpected attempts or decisions",
+            ));
+        }
+        self.validate_work_item_for_save_unlocked(item)
+            .map_err(Self::orch_error_from_anyhow)?;
+        Ok(present)
+    }
+
+    /// New sealed creations own a canonical claim. Inspection cannot follow
+    /// links or adopt an unrelated legacy file before proving the outcome.
+    fn inspect_creation_request_receipt_unlocked(
+        &self,
+        request: &WorkRequestBinding,
+    ) -> Result<IdempotencyReceipt, OrchError> {
+        let binding = request;
+        let scope = IdempotencyScope {
+            owner_id: binding.owner_id.clone(),
+            session_id: binding.session_id,
+            workspace_digest: binding.workspace_digest.clone(),
+        };
+        let path = self.idemp_path(&scope, &binding.request_id)?;
+        let metadata = fs::symlink_metadata(&path)
             .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
-        self.commit_manager_creation_intent_unlocked(&intent)?;
-        remove_file_durable(&self.lease(), &intent_path)
-            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))
+        if !metadata.file_type().is_file() {
+            return Err(related_creation_conflict(
+                "creation receipt is non-regular evidence",
+            ));
+        }
+        let receipt: IdempotencyReceipt = serde_json::from_slice(
+            &fs::read(path)
+                .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?,
+        )
+        .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        if !receipt.is_in_scope(&scope)
+            || receipt.tool != binding.tool
+            || receipt.request_id != binding.request_id
+            || receipt.payload_hash != binding.payload_hash
+        {
+            return Err(related_creation_conflict(
+                "creation receipt does not match the authenticated request",
+            ));
+        }
+        Ok(receipt)
+    }
+
+    fn preflight_related_receipt_unlocked(
+        &self,
+        request: Option<&RelatedCreationRequest>,
+        response: &serde_json::Value,
+        subject_id: &str,
+        effects_present: bool,
+    ) -> Result<(), OrchError> {
+        let Some(request) = request else {
+            return Ok(());
+        };
+        let receipt = self.inspect_creation_request_receipt_unlocked(&request.binding)?;
+        let complete = receipt.status == "complete"
+            && receipt.error.is_none()
+            && receipt.response == *response
+            && receipt.run_id.as_deref() == Some(subject_id)
+            && effects_present;
+        if !creation_receipt_is_pending(&receipt) && !complete {
+            return Err(related_creation_conflict(
+                "related creation receipt conflicts with its sealed outcome",
+            ));
+        }
+        Ok(())
+    }
+
+    fn preflight_manager_creation_unlocked(
+        &self,
+        intent: &ManagerCreationIntent,
+    ) -> Result<(), OrchError> {
+        intent.validate()?;
+        let work_present = self.preflight_related_work_unlocked(&intent.root_work)?;
+        let plan_present = self.related_record_matches_unlocked(
+            &self.manager_plan_path(&intent.plan.plan_id)?,
+            &intent.plan,
+        )?;
+        self.preflight_related_receipt_unlocked(
+            intent.request.as_ref(),
+            &intent.response(),
+            &intent.plan.plan_id,
+            work_present && plan_present,
+        )
     }
 
     fn commit_manager_creation_intent_unlocked(
         &self,
         intent: &ManagerCreationIntent,
     ) -> Result<(), OrchError> {
-        self.save_work_item_unlocked(&intent.root_work)
+        self.preflight_manager_creation_unlocked(intent)?;
+        self.write_work_item_unlocked(&intent.root_work)
+            .map_err(Self::orch_error_from_anyhow)?;
+        crash_process_if_stage("manager_create_after_work");
+        self.save_manager_plan_unlocked(&intent.plan)?;
+        crash_process_if_stage("manager_create_after_plan");
+        self.complete_bound_request_unlocked(
+            intent.request.as_ref().map(|request| &request.binding),
+            &intent.response(),
+        )?;
+        crash_process_if_stage("manager_create_after_receipt");
+        Ok(())
+    }
+
+    fn persist_related_intent_unlocked(
+        &self,
+        path: &Path,
+        intent: &impl serde::Serialize,
+    ) -> Result<(), OrchError> {
+        self.refuse_closed_admission()?;
+        atomic_write_json(&self.lease(), path, intent).map_err(|error| {
+            let error = OrchError::new(OrchErrorCode::Internal, error.to_string());
+            if path.try_exists().unwrap_or(true) {
+                self.note_work_recovery_required(error)
+            } else {
+                error
+            }
+        })
+    }
+
+    fn clear_related_intent_unlocked(&self, path: &Path) -> Result<(), OrchError> {
+        crate::verified_change::fail_durable_write_if_armed(path)
             .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
-        self.save_manager_plan_unlocked(&intent.plan)
+        remove_file_durable(&self.lease(), path)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))
     }
 
     fn recover_manager_creation_intents(&self) -> Result<(), OrchError> {
         let _guard = self.inner.lock.lock();
-        let dir = self.inner.root.join("manager-intents");
-        for entry in fs::read_dir(&dir)
+        for entry in fs::read_dir(self.inner.root.join("manager-intents"))
             .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
         {
             let path = entry
@@ -2232,16 +2776,28 @@ impl OrchStore {
             if path.extension().and_then(|value| value.to_str()) != Some("json") {
                 continue;
             }
+            if !fs::symlink_metadata(&path)
+                .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
+                .file_type()
+                .is_file()
+            {
+                return Err(related_creation_conflict(
+                    "manager intent is non-regular evidence",
+                ));
+            }
             let intent: ManagerCreationIntent = serde_json::from_str(
                 &fs::read_to_string(&path)
                     .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?,
             )
             .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
-            intent.plan.validate()?;
-            intent.root_work.validate()?;
+            intent.validate()?;
+            if path != self.manager_creation_intent_path(&intent.plan.plan_id)? {
+                return Err(related_creation_conflict(
+                    "manager intent filename does not match its identity",
+                ));
+            }
             self.commit_manager_creation_intent_unlocked(&intent)?;
-            remove_file_durable(&self.lease(), &path)
-                .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+            self.clear_related_intent_unlocked(&path)?;
         }
         Ok(())
     }
@@ -2592,14 +3148,14 @@ impl OrchStore {
             .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
         if intent.prior_item.is_none() {
             let request = intent.request.as_ref().expect("validated creation request");
-            let receipt = self.load_bound_request_receipt_unlocked(request)?;
+            let receipt = self.inspect_creation_request_receipt_unlocked(request)?;
             let response = lifecycle_response_value(intent)?;
             let settled = receipt.status == "complete"
                 && receipt.response == response
                 && receipt.error.is_none()
                 && receipt.run_id.as_deref() == Some(intent.work_id.as_str())
                 && current_item_digest.as_deref() == Some(next_item_digest.as_str());
-            if receipt.status != "pending" && !settled {
+            if !creation_receipt_is_pending(&receipt) && !settled {
                 return Err(OrchError::new(
                     OrchErrorCode::Conflict,
                     "creation receipt conflicts with its sealed outcome",
@@ -2739,6 +3295,7 @@ impl OrchStore {
 
     pub fn save_manager_plan(&self, plan: &ManagerPlan) -> Result<(), OrchError> {
         let _guard = self.inner.lock.lock();
+        self.refuse_closed_admission()?;
         self.save_manager_plan_unlocked(plan)
     }
 
@@ -2748,6 +3305,7 @@ impl OrchStore {
         work_items: &[WorkItem],
     ) -> Result<(), OrchError> {
         let _guard = self.inner.lock.lock();
+        self.refuse_closed_admission()?;
         self.validate_work_items_for_save_unlocked(work_items)
             .map_err(Self::orch_error_from_anyhow)?;
         for item in work_items {
@@ -2768,6 +3326,7 @@ impl OrchStore {
         work_items: &[WorkItem],
     ) -> Result<(), OrchError> {
         let _guard = self.inner.lock.lock();
+        self.refuse_closed_admission()?;
         let current = self
             .load_manager_plan_unlocked(&plan.plan_id)?
             .ok_or_else(|| OrchError::new(OrchErrorCode::InvalidRequest, "unknown plan_id"))?;
@@ -2863,6 +3422,7 @@ impl OrchStore {
         work: &WorkItem,
     ) -> Result<(), OrchError> {
         let _guard = self.inner.lock.lock();
+        self.refuse_closed_admission()?;
         decision.validate()?;
         if let Some(existing) = self
             .load_work_item_unlocked(&work.work_id)
@@ -2885,6 +3445,7 @@ impl OrchStore {
 
     pub fn save_manager_decision(&self, decision: &ManagerDecisionRecord) -> Result<(), OrchError> {
         let _guard = self.inner.lock.lock();
+        self.refuse_closed_admission()?;
         self.save_manager_decision_unlocked(decision)
     }
 
@@ -3041,7 +3602,27 @@ impl OrchStore {
         now: chrono::DateTime<Utc>,
     ) -> Result<ActivationRecord, OrchError> {
         let _guard = self.inner.lock.lock();
-        self.activate_routine_unlocked(routine_id, request, server_ceiling, now)
+        self.refuse_closed_admission()?;
+        self.activate_routine_unlocked(routine_id, request, server_ceiling, now, None)
+    }
+
+    pub(crate) fn activate_routine_with_request(
+        &self,
+        routine_id: &str,
+        request: ActivationRequest,
+        server_ceiling: &RunBounds,
+        now: chrono::DateTime<Utc>,
+        original_request: RelatedCreationRequest,
+    ) -> Result<ActivationRecord, OrchError> {
+        let _guard = self.inner.lock.lock();
+        self.refuse_closed_admission()?;
+        self.activate_routine_unlocked(
+            routine_id,
+            request,
+            server_ceiling,
+            now,
+            Some(original_request),
+        )
     }
 
     pub fn fire_due_routines_at(
@@ -3049,6 +3630,7 @@ impl OrchStore {
         now: chrono::DateTime<Utc>,
     ) -> Result<RoutineFireReport, OrchError> {
         let _guard = self.inner.lock.lock();
+        self.refuse_closed_admission()?;
         let routines = self.list_routines_unlocked()?;
         let ceiling = RunBounds::default();
         let mut report = RoutineFireReport {
@@ -3076,6 +3658,7 @@ impl OrchStore {
                 continue;
             }
             for scheduled_at in &due {
+                self.refuse_closed_admission()?;
                 let request = ActivationRequest {
                     cause: ActivationCause::Scheduled,
                     dedupe_key: occurrence_dedupe_key(&routine.routine_id, *scheduled_at),
@@ -3084,7 +3667,13 @@ impl OrchStore {
                     payload: None,
                     created_by: format!("routine:{}", routine.routine_id),
                 };
-                match self.activate_routine_unlocked(&routine.routine_id, request, &ceiling, now) {
+                match self.activate_routine_unlocked(
+                    &routine.routine_id,
+                    request,
+                    &ceiling,
+                    now,
+                    None,
+                ) {
                     Ok(activation) => match activation.disposition {
                         ActivationDisposition::CreatedWork => report.created_work += 1,
                         ActivationDisposition::Deduplicated => report.deduplicated += 1,
@@ -3096,6 +3685,7 @@ impl OrchStore {
                     Err(_) => report.rejected += 1,
                 }
             }
+            self.refuse_closed_admission()?;
             if let Ok(Some(mut current)) = self.load_routine_unlocked(&routine.routine_id) {
                 if current.lifecycle.allows_scheduled_fire() && !current.circuit_open {
                     current.next_fire_at =
@@ -3120,10 +3710,19 @@ impl OrchStore {
             if path.extension().and_then(|value| value.to_str()) != Some("json") {
                 continue;
             }
+            if !fs::symlink_metadata(&path)?.file_type().is_file() {
+                return Err(anyhow::anyhow!("routine intent is non-regular evidence"));
+            }
             let intent: RoutineFireIntent = serde_json::from_str(&fs::read_to_string(&path)?)?;
+            intent.validate()?;
+            if path != self.routine_intent_path(&intent.activation.activation_id)? {
+                return Err(anyhow::anyhow!(
+                    "routine intent filename does not match its identity"
+                ));
+            }
             self.commit_routine_intent_unlocked(&intent)
                 .map_err(|error| anyhow::anyhow!(error.to_string()))?;
-            remove_file_durable(&self.lease(), &path)?;
+            self.clear_related_intent_unlocked(&path)?;
         }
         Ok(())
     }
@@ -3311,6 +3910,7 @@ impl OrchStore {
         request: ActivationRequest,
         server_ceiling: &RunBounds,
         now: chrono::DateTime<Utc>,
+        original_request: Option<RelatedCreationRequest>,
     ) -> Result<ActivationRecord, OrchError> {
         let mut routine = self
             .load_routine_unlocked(routine_id)?
@@ -3336,6 +3936,8 @@ impl OrchStore {
                         Some("activation expired before it could create work"),
                         server_ceiling,
                         now,
+                        original_request,
+                        None,
                     );
                 }
             }
@@ -3355,6 +3957,8 @@ impl OrchStore {
                 None,
                 server_ceiling,
                 now,
+                original_request,
+                None,
             );
         }
         let inflight = in_flight_count(
@@ -3372,6 +3976,8 @@ impl OrchStore {
                 Some("routine already has the maximum in-flight Work items"),
                 server_ceiling,
                 now,
+                original_request,
+                None,
             );
         }
         let agent = self
@@ -3387,6 +3993,7 @@ impl OrchStore {
                     "owning agent is unknown",
                     server_ceiling,
                     now,
+                    original_request,
                 );
             }
         };
@@ -3399,6 +4006,7 @@ impl OrchStore {
                     "agent source workspace does not match the routine workspace",
                     server_ceiling,
                     now,
+                    original_request,
                 );
             }
         }
@@ -3418,6 +4026,7 @@ impl OrchStore {
                     &error.message,
                     server_ceiling,
                     now,
+                    original_request,
                 );
             }
         };
@@ -3439,6 +4048,7 @@ impl OrchStore {
                     &error.message,
                     server_ceiling,
                     now,
+                    original_request,
                 );
             }
         };
@@ -3468,7 +4078,13 @@ impl OrchStore {
             created_by: request.created_by.clone(),
         };
         activation.validate()?;
-        let intent = RoutineFireIntent {
+        let mut intent = RoutineFireIntent {
+            schema_version: 2,
+            prior_activation: None,
+            prior_work: None,
+            snapshot_digest: None,
+            request: original_request,
+            prior_routine: Some(routine.clone()),
             routine: routine.clone(),
             activation: activation.clone(),
             work: Some(work.clone()),
@@ -3480,9 +4096,16 @@ impl OrchStore {
                 created_at: now,
             }),
         };
+        intent.snapshot_digest = Some(intent.digest()?);
+        self.preflight_routine_intent_unlocked(&intent)?;
+        crash_process_if_stage("routine_fire_before_intent");
         self.persist_routine_intent_unlocked(&intent)?;
-        self.commit_routine_intent_unlocked(&intent)?;
-        self.clear_routine_intent_unlocked(&activation_id)?;
+        crash_process_if_stage("routine_fire_after_intent");
+        self.commit_routine_intent_unlocked(&intent)
+            .map_err(|error| self.note_work_recovery_required(error))?;
+        self.clear_routine_intent_unlocked(&activation_id)
+            .map_err(|error| self.note_work_recovery_required(error))?;
+        crash_process_if_stage("routine_fire_after_commit");
         self.prune_activations_unlocked(routine_id)?;
         Ok(activation)
     }
@@ -3497,6 +4120,8 @@ impl OrchStore {
         error: Option<&str>,
         server_ceiling: &RunBounds,
         now: chrono::DateTime<Utc>,
+        original_request: Option<RelatedCreationRequest>,
+        prior_routine: Option<RoutineRecord>,
     ) -> Result<ActivationRecord, OrchError> {
         let captured = CapturedActivationPolicy::capture(
             routine.revision,
@@ -3533,7 +4158,13 @@ impl OrchStore {
             created_by: request.created_by.clone(),
         };
         activation.validate()?;
-        let intent = RoutineFireIntent {
+        let mut intent = RoutineFireIntent {
+            schema_version: 2,
+            prior_activation: None,
+            prior_work: None,
+            snapshot_digest: None,
+            request: original_request,
+            prior_routine: Some(prior_routine.unwrap_or_else(|| routine.clone())),
             routine: routine.clone(),
             activation: activation.clone(),
             work: None,
@@ -3545,9 +4176,16 @@ impl OrchStore {
                 created_at: now,
             }),
         };
+        intent.snapshot_digest = Some(intent.digest()?);
+        self.preflight_routine_intent_unlocked(&intent)?;
+        crash_process_if_stage("routine_fire_before_intent");
         self.persist_routine_intent_unlocked(&intent)?;
-        self.commit_routine_intent_unlocked(&intent)?;
-        self.clear_routine_intent_unlocked(&activation.activation_id)?;
+        crash_process_if_stage("routine_fire_after_intent");
+        self.commit_routine_intent_unlocked(&intent)
+            .map_err(|error| self.note_work_recovery_required(error))?;
+        self.clear_routine_intent_unlocked(&activation.activation_id)
+            .map_err(|error| self.note_work_recovery_required(error))?;
+        crash_process_if_stage("routine_fire_after_commit");
         self.prune_activations_unlocked(&routine.routine_id)?;
         Ok(activation)
     }
@@ -3561,7 +4199,9 @@ impl OrchStore {
         message: &str,
         server_ceiling: &RunBounds,
         now: chrono::DateTime<Utc>,
+        original_request: Option<RelatedCreationRequest>,
     ) -> Result<ActivationRecord, OrchError> {
+        let prior_routine = routine.clone();
         routine.consecutive_failures = routine.consecutive_failures.saturating_add(1);
         if routine.consecutive_failures >= routine.retry.circuit_failures {
             routine.circuit_open = true;
@@ -3572,7 +4212,6 @@ impl OrchStore {
                 Some(now + routine.retry.delay_after(routine.consecutive_failures));
         }
         routine.updated_at = now;
-        self.save_routine_unlocked(routine)?;
         self.record_non_work_activation(
             routine,
             request,
@@ -3585,39 +4224,112 @@ impl OrchStore {
             Some(message),
             server_ceiling,
             now,
+            original_request,
+            Some(prior_routine),
+        )
+    }
+
+    fn preflight_routine_intent_unlocked(
+        &self,
+        intent: &RoutineFireIntent,
+    ) -> Result<(), OrchError> {
+        intent.validate()?;
+        if !fs::symlink_metadata(self.routine_path(&intent.routine.routine_id)?)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
+            .file_type()
+            .is_file()
+        {
+            return Err(related_creation_conflict(
+                "routine predecessor is non-regular evidence",
+            ));
+        }
+        let current = self
+            .load_routine_unlocked(&intent.routine.routine_id)?
+            .ok_or_else(|| related_creation_conflict("routine creation is missing its routine"))?;
+        let current_digest = related_snapshot_digest(&current)?;
+        let next_digest = related_snapshot_digest(&intent.routine)?;
+        let prior_digest = intent
+            .prior_routine
+            .as_ref()
+            .map(related_snapshot_digest)
+            .transpose()?;
+        if current_digest != next_digest && prior_digest.as_deref() != Some(current_digest.as_str())
+        {
+            return Err(related_creation_conflict(
+                "routine recovery found a conflicting routine snapshot",
+            ));
+        }
+        let work_present = match &intent.work {
+            Some(work) => self.preflight_related_work_unlocked(work)?,
+            None => true,
+        };
+        let activation_present = self.related_record_matches_unlocked(
+            &self.routine_activation_path(
+                &intent.activation.routine_id,
+                &intent.activation.activation_id,
+            )?,
+            &intent.activation,
+        )?;
+        let dedupe_present = match &intent.dedupe {
+            Some(dedupe) => self.related_record_matches_unlocked(
+                &self.routine_dedupe_path(&intent.routine.routine_id, &dedupe.dedupe_key)?,
+                dedupe,
+            )?,
+            None => true,
+        };
+        self.preflight_related_receipt_unlocked(
+            intent.request.as_ref(),
+            &intent.response(),
+            &intent.routine.routine_id,
+            work_present && activation_present && dedupe_present && current_digest == next_digest,
         )
     }
 
     fn persist_routine_intent_unlocked(&self, intent: &RoutineFireIntent) -> Result<(), OrchError> {
-        let path = self.routine_intent_path(&intent.activation.activation_id)?;
-        atomic_write_json(&self.lease(), &path, intent)
-            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))
+        intent.validate()?;
+        self.persist_related_intent_unlocked(
+            &self.routine_intent_path(&intent.activation.activation_id)?,
+            intent,
+        )
     }
 
     fn commit_routine_intent_unlocked(&self, intent: &RoutineFireIntent) -> Result<(), OrchError> {
+        self.preflight_routine_intent_unlocked(intent)?;
         if let Some(work) = &intent.work {
-            self.save_work_item_unlocked(work)
-                .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+            self.write_work_item_unlocked(work)
+                .map_err(Self::orch_error_from_anyhow)?;
+            crash_process_if_stage("routine_fire_after_work");
         }
+        if let Some(prior) = &intent.prior_routine {
+            if related_snapshot_digest(prior)? != related_snapshot_digest(&intent.routine)? {
+                self.save_routine_unlocked(&intent.routine)?;
+            }
+        }
+        crash_process_if_stage("routine_fire_after_routine");
         let path = self.routine_activation_path(
             &intent.activation.routine_id,
             &intent.activation.activation_id,
         )?;
         atomic_write_json(&self.lease(), &path, &intent.activation)
             .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        crash_process_if_stage("routine_fire_after_activation");
         if let Some(dedupe) = &intent.dedupe {
-            let dedupe_path =
+            let path =
                 self.routine_dedupe_path(&intent.activation.routine_id, &dedupe.dedupe_key)?;
-            atomic_write_json(&self.lease(), &dedupe_path, dedupe)
+            atomic_write_json(&self.lease(), &path, dedupe)
                 .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
         }
+        crash_process_if_stage("routine_fire_after_dedupe");
+        self.complete_bound_request_unlocked(
+            intent.request.as_ref().map(|request| &request.binding),
+            &intent.response(),
+        )?;
+        crash_process_if_stage("routine_fire_after_receipt");
         Ok(())
     }
 
     fn clear_routine_intent_unlocked(&self, activation_id: &str) -> Result<(), OrchError> {
-        let path = self.routine_intent_path(activation_id)?;
-        remove_file_durable(&self.lease(), &path)
-            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))
+        self.clear_related_intent_unlocked(&self.routine_intent_path(activation_id)?)
     }
 
     fn prune_activations_unlocked(&self, routine_id: &str) -> Result<(), OrchError> {
@@ -6301,7 +7013,12 @@ impl OrchStore {
             return false;
         }
         let _guard = self.inner.lock.lock();
-        for directory in ["work-intents", "work-lifecycle-intents"] {
+        for directory in [
+            "work-intents",
+            "work-lifecycle-intents",
+            "manager-intents",
+            "routine-intents",
+        ] {
             let Ok(entries) = fs::read_dir(self.inner.root.join(directory)) else {
                 return true;
             };
@@ -6316,16 +7033,34 @@ impl OrchStore {
                 let Ok(bytes) = fs::read(path) else {
                     return true;
                 };
-                let request = if directory == "work-intents" {
-                    match serde_json::from_slice::<WorkMutationIntent>(&bytes) {
+                let request = match directory {
+                    "work-intents" => match serde_json::from_slice::<WorkMutationIntent>(&bytes) {
                         Ok(intent) if intent.validate().is_ok() => intent.request,
                         _ => return true,
+                    },
+                    "work-lifecycle-intents" => {
+                        match serde_json::from_slice::<WorkLifecycleIntent>(&bytes) {
+                            Ok(intent) if intent.validate().is_ok() => intent.request,
+                            _ => return true,
+                        }
                     }
-                } else {
-                    match serde_json::from_slice::<WorkLifecycleIntent>(&bytes) {
-                        Ok(intent) if intent.validate().is_ok() => intent.request,
-                        _ => return true,
+                    "manager-intents" => {
+                        match serde_json::from_slice::<ManagerCreationIntent>(&bytes) {
+                            Ok(intent) if intent.validate().is_ok() => {
+                                intent.request.map(|request| request.binding)
+                            }
+                            _ => return true,
+                        }
                     }
+                    "routine-intents" => {
+                        match serde_json::from_slice::<RoutineFireIntent>(&bytes) {
+                            Ok(intent) if intent.validate().is_ok() => {
+                                intent.request.map(|request| request.binding)
+                            }
+                            _ => return true,
+                        }
+                    }
+                    _ => unreachable!("fixed intent directory list"),
                 };
                 if request.is_some_and(|request| {
                     request.owner_id == scope.owner_id
@@ -6471,9 +7206,14 @@ impl OrchStore {
             &request.tool,
             &request.request_id,
             &request.payload_hash,
-            (request.tool == "ptah_create_work")
-                .then(|| response["work"]["workId"].as_str().map(str::to_string))
-                .flatten(),
+            match request.tool.as_str() {
+                "ptah_create_work" => response["work"]["workId"].as_str().map(str::to_string),
+                "ptah_create_manager_plan" => {
+                    response["plan"]["planId"].as_str().map(str::to_string)
+                }
+                "ptah_fire_routine" => response["routineId"].as_str().map(str::to_string),
+                _ => None,
+            },
             response.clone(),
             None,
             "complete",
@@ -11097,11 +11837,16 @@ fn remove_file_durable(lease: &crate::host_runtime::WriteLease, path: &Path) -> 
     let _write = lease.begin("removing a durable orchestration record")?;
     if path.is_file() {
         fs::remove_file(path)?;
-        if path
-            .parent()
-            .is_some_and(|parent| parent.ends_with("work-lifecycle-intents"))
-        {
-            crash_process_if_stage("lifecycle_after_intent_remove");
+        if let Some(parent) = path.parent() {
+            if parent.ends_with("work-lifecycle-intents") {
+                crash_process_if_stage("lifecycle_after_intent_remove");
+            }
+            if parent.ends_with("manager-intents") {
+                crash_process_if_stage("manager_create_after_intent_remove");
+            }
+            if parent.ends_with("routine-intents") {
+                crash_process_if_stage("routine_fire_after_intent_remove");
+            }
         }
     }
     #[cfg(unix)]

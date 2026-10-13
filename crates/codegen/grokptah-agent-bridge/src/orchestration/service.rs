@@ -4848,7 +4848,22 @@ impl OrchestrationService {
                 error,
             ));
         }
-        if let Err(error) = self.store.save_manager_plan_with_root(&plan, &root) {
+        let request = super::store::RelatedCreationRequest::new(
+            super::store::WorkRequestBinding::bound(
+                &lease.scope,
+                claimed.display().to_string(),
+                lease.request_id.clone(),
+                lease.tool.clone(),
+                lease.payload_hash.clone(),
+                "manager_plan",
+            ),
+            payload,
+            auth.token_id.clone(),
+        );
+        if let Err(error) =
+            self.store
+                .save_manager_creation_with_request(&plan, &root, Some(request))
+        {
             return Err(self.fail_claim(
                 &mut lease,
                 Some(plan.plan_id.clone()),
@@ -7111,10 +7126,30 @@ impl OrchestrationService {
             created_by: auth.token_id.clone(),
         };
         let ceiling = self.config.lock().bounds.clone();
-        let activation = match self
-            .store
-            .activate_routine(routine_id, request, &ceiling, now)
-        {
+        // Keep only the existing redacted activation input in the intent;
+        // the receipt retains the original authenticated request hash.
+        let mut projected_payload = idempotency_payload;
+        projected_payload["payload"] =
+            super::routine::redact_activation_payload(&projected_payload["payload"]);
+        let original_request = super::store::RelatedCreationRequest::new(
+            super::store::WorkRequestBinding::bound(
+                &lease.scope,
+                claimed.display().to_string(),
+                lease.request_id.clone(),
+                lease.tool.clone(),
+                lease.payload_hash.clone(),
+                "routine_activation",
+            ),
+            projected_payload,
+            auth.token_id.clone(),
+        );
+        let activation = match self.store.activate_routine_with_request(
+            routine_id,
+            request,
+            &ceiling,
+            now,
+            original_request,
+        ) {
             Ok(activation) => activation,
             Err(error) => {
                 return Err(self.fail_claim(&mut lease, None, session_id, &claimed, error))
