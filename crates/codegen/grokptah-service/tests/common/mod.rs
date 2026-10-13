@@ -326,13 +326,34 @@ pub fn flood_journal(host: &AgentHostHandle, count: usize) {
             session_id: flood_sid,
             text: format!("journal-flood-{i}"),
         });
-        // Keep this cursor-retention fixture below the asynchronous journal
-        // writer's bounded queue. The scenario is exercising in-memory
-        // retention/expiry, not intentionally injecting a persistence gap;
-        // an induced gap correctly makes HostRuntime retain its lock and
-        // would preclude the restart half of this test.
-        if i % 32 == 31 {
-            std::thread::sleep(Duration::from_millis(1));
+        // This exercises retention/expiry with a healthy durable journal.
+        // Observe the writer after each small batch; a fixed sleep can fill
+        // its bounded queue under load and correctly prevent healthy restart.
+        if i % 32 == 31 || i + 1 == count {
+            let through = host.event_bus().current_seq();
+            let journal = host
+                .runtime_home()
+                .orchestration_root()
+                .join("event_journal.jsonl");
+            let deadline = std::time::Instant::now() + Duration::from_secs(30);
+            loop {
+                assert_eq!(host.event_bus().last_persistence_error(), None);
+                let reached = std::fs::read_to_string(&journal)
+                    .unwrap_or_default()
+                    .lines()
+                    .rev()
+                    .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                    .filter_map(|entry| entry["seq"].as_u64())
+                    .any(|seq| seq >= through);
+                if reached {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "durable journal did not reach sequence {through}"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
         }
     }
 }

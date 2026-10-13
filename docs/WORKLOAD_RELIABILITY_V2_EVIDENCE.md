@@ -83,7 +83,7 @@ continue to settle at their existing external-effect boundaries.
 | Manager adoption/materialization, advance/tick/replan | Schema-3 mutation in the existing manager journal; prior/successor plan/Work/messages/sequence, original observations and caller response | Four actual service crash reproductions repaired; process, corruption, write fault, capacity and background proofs below |
 | Manual `fire_routine` | Schema-2 `RoutineFireIntent` seals absent Work/activation priors, prior/successor routine, activation/dedupe, redacted input and original outer request | Actual MCP Work-write crash reproduced orphan failure; receipt, backoff, redaction and scheduled-absence proofs are in the related-creation target |
 | `prepare_verified_change` | Readiness/projection | Does not create Work and is not a creation receipt gap |
-| `start_verified_change` | Calls `create_manager_plan` with derived `:plan` request ID, then established managed workflow | Manager creation repair must compose with this entry point; preserve readiness and authorization |
+| `start_verified_change` | Original derived `:plan`, `:advance`, `:authorize` callers, then established managed workflow | Real readiness/service process matrix proves creation/materialization/authorization composition; dispatch is held at the existing test boundary, external effects retain their separate qualification |
 | Verified Change apply/discard | Existing sealed admission, source effect, cleanup and managed evidence | Must settle at the external-effect boundary, never from an intermediate Work snapshot |
 
 ## Qualification and issue disposition
@@ -118,9 +118,10 @@ sources are unchanged; their final landing qualification passed before v2.
 #520 still requires separate issue-level acceptance. Its read contract is
 implemented by #584; this slice adds recovered-write/public-read composition
 evidence without claiming that partial page counts are whole-lane totals.
-#521 remains open for the unfinished caller and adjacent-creation matrix,
-negative/replay checks, complete supported qualification and independent review.
-A draft PR is not yet prepared; this document intentionally records pending rows.
+#521 remains open for complete supported/hosted qualification, managed external
+effect acceptance, and independent review. The ordinary and adjacent creation
+matrices are complete as recorded below. Neither issue is closed by this slice;
+a draft and writer testing do not provide independent issue-level acceptance.
 
 ## Current qualification exception
 
@@ -220,8 +221,8 @@ The four manager mutation caller boundaries reproduced orphan receipt failure
 on checkpoint `026f537001dd60292bd8cbf8871e162399b00ab4` plus only the process-cut
 instrumentation (`work/v2-manager-mutation-red-2.log`). They are now implemented
 through the existing manager-intents authority. The `start_verified_change`
-derived `:plan` and `:advance` entry flow uses these repaired callers; the full
-real Verified Change composition proof remains pending.
+derived `:plan` and `:advance` entry flow uses these repaired callers; the real
+creation/materialization/authorization composition proof is recorded below.
 
 
 The final corrupt-evidence expansion adds valid and malformed unexpected attempt
@@ -384,3 +385,85 @@ MCP cases pass (`work/v2-callers-permission-preservation.log`). Prior broad loca
 sandbox failures remain retained. Derived Verified Change composition and final
 whole-slice supported/hosted qualification plus one draft handoff remain pending.
 Both issues stay open; this remains writer testing.
+
+
+## Derived Verified Change creation proof
+
+`tests/verified_creation_recovery.rs` passes its complete five-test target
+(`work/v2-verified-matrix-3.log`) on the final fixture source. No further
+production repair was needed: the manager creation/mutation and ordinary
+receipt preflight changes compose with the actual `start_verified_change`
+entry point. The original service derives its own request IDs/hashes, resolves
+its real profile and readiness, and writes its own authority/envelope. The test
+never arms an operation-local binding by hand.
+
+| Named test | Falsifiable scope |
+|---|---|
+| `derived_manager_creation_and_materialization_replay_original_receipts` | Twelve admitted component cuts, three fresh replays each; original sealed/completed plan and child bodies, one root/child pair, exact original derived receipts |
+| `derived_authorization_replays_without_launching_or_minting_attempts` | Five decision cuts, three fresh replays each; original decision/body/subject and bound authority/envelope, no attempts/Runs/managed intents |
+| `derived_pre_admission_cuts_do_not_create_successors` | Three component pre-intent cuts preserve zero, one or two prior Work records respectively; original pending request becomes a stable refusal |
+| `changed_profile_after_a_creation_cut_refuses_without_new_work` | Admitted original root settles on open; changed profile conflicts with its original derived hash without creating a child or attempt |
+
+Each success sequence also refuses a changed objective without rewriting the
+original outcomes. The first replay walks authenticated `ptah_list_work_page`
+and `ptah_get_work_graph_page` with limit1, follows `continuation` to `complete`,
+and reads `ptah_get_work_detail` section `summary`. Complete traversals agree on
+the two unique recovered IDs, and actual JSON pages stay below 32 KiB. Two
+further replays preserve the entire receipt/Work/plan/decision inventory bytes.
+The source Git head and bytes remain unchanged; the synthetic CLI records only
+`inspect --json`, never worker launch.
+
+This fixture uses the existing compatibility lease resolver and real profile
+revision1 from the production workflow fixtures. It does not qualify production
+private confinement revision2 or provider/apply/discard. The existing drive hold
+and stopped background writers isolate the prefix before dispatch, without
+altering readiness, Work policy, managed authority or external settlement.
+The generic manager unlink hook first fires in creation here; materialization
+cleanup uses the separate post-commit cut plus the standalone manager unlink proof.
+
+Retained fixture iterations include an unavailable control-server shutdown
+method, incorrect authorization response projection and page/detail field names.
+They were corrected to the existing contracts before the five-test green run;
+none are claimed product reproductions. Localhost bind initially returned EPERM;
+current-turn network permission allowed the isolated MCP servers. No sandbox
+policy, compiler cache, daemon/socket, owner hold or production credential changed.
+
+## Final whole-slice qualification
+
+Final bridge strict all-target Clippy passes (`work/v2-final-clippy.log`).
+Desktop typecheck and all61files/459tests pass on the unchanged F3/F6 consumers
+(`work/v2-final-desktop-typecheck.log`, `work/v2-final-desktop-tests.log`).
+The complete supported bridge run uses `--no-fail-fast` to retain every target's
+result, normal Rust1.92 debug, locked/offline, task target and isolated home.
+Its terminal results are below; hosted qualification remains required.
+Earlier broad sandbox failures are retained above, not relabeled as success.
+
+
+The final complete bridge run ends exit101: library748pass/11fail/11ignore,
+46integration targets526pass/103fail/3ignore, and one ignored doctest. All68
+new named tests pass in the seven recovery targets. The twenty-caller target now
+has a complete9/9 final-source run; the earlier precise phase qualifications
+remain historical evidence. Manager mutation14/14, ordinary creation8+2,
+related creation16/16, MCP/legacy caller14/14 and composed VerifiedChange5/5
+pass on the same production sources. The five failed targets retain the local
+confinement limitation: library11, adapter11, managed executor1, self-host CU1,
+Verified Change90. This is not full green or a blanket untouched-main proof for
+every failed case; prior representative main reproductions remain separate.
+
+Final headless service fmt/strict Clippy and complete21/21 pass
+(`work/v2-final-service-clippy-corrected.log`,
+`work/v2-final-service-tests-corrected.log`). Its initial two complete runs each
+passed20 and failed the journal-flood restart case; untouched main's complete
+conformance target also failed that exact case (`work/v2-final-service-baseline-full.log`),
+although a focused main run passed. The test-only `flood_journal` now observes
+appended journal sequence after each32events (and final partial batch), with
+an explicit no-persistence-error assertion and bounded wait. It retains all
+5,000events, expiry, disconnect, replay and restart assertions. Queue256, journal
+limits, fail-closed shutdown/lock retention and production code are unchanged.
+This fixes the fixture's timing assumption, not the Work transaction authority.
+
+Gateway fmt/strict Clippy and17tests including doctest pass
+(`work/v2-final-gateway-{clippy,tests}.log`). Desktop61files/459tests and typecheck
+pass. Task-owned terminal result rows and original failure logs are retained.
+The draft's exact-head hosted workflow and independent review remain the next
+acceptance gates. Issues#520/#521 remain OPEN by explicit instruction.

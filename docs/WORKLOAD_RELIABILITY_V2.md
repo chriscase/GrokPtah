@@ -49,7 +49,7 @@ recording an ordinary refusal from `fail_claim` or its lease destructor.
 Conflicting/corrupt recovery evidence is retained and prevents successful open.
 The original receipt's Work ID and response survive completion before cleanup.
 
-## Qualification in progress
+## Initial creation milestone qualification
 
 - Red: original real-service create, crash after Work write, fresh authenticated
   replay failed as an orphan while the Work item existed.
@@ -70,9 +70,9 @@ The original receipt's Work ID and response survive completion before cleanup.
   initial creation battery passed nine tests, including its child-process entry point.
   The canonical receipt inspection case adds an eighth recovery test; current
   ordinary creation qualification is eight recovery plus two conformance tests.
-- Pending: complete source-backed production caller/response/cut matrix,
-  including adjacent manager/routine/Verified Change creation protocols;
-  fix demonstrated omissions without changing external-effect authority.
+- Complete: source-backed ordinary caller/response/cut matrix and adjacent
+  manager/routine/Verified Change creation composition; named evidence below
+  distinguishes these checks from managed external-effect qualification.
 - Pending: full supported validation, hosted checks and separate independent
   adversarial review. Writer testing is not an independent CLEAN sign-off.
 
@@ -267,9 +267,9 @@ capacity or intent-write refusal has no child/message/plan effect and remains
 an ordinary replayable refusal. Conflicting recovery evidence is retained.
 
 See the named manager tests and qualification phases in the evidence document.
-The remaining production assignment/lifecycle process matrix, derived Verified
-Change composition, whole-slice supported/hosted validation and independent
-review are still pending. Both tracking issues remain open.
+The ordinary caller matrix and derived Verified Change creation composition
+are complete. Whole-slice supported/hosted qualification and independent review
+remain pending. Both tracking issues remain open.
 
 
 ## Ordinary update receipt proof
@@ -291,5 +291,70 @@ The existing apply/discard settlement predicate and managed external-effect
 protocols remain in force.
 
 The evidence document records twenty-caller process/fault coverage and explicit
-single-record/no-op exclusions. Derived Verified Change composition and final
-whole-slice supported/hosted acceptance are still pending; issues remain open.
+single-record/no-op exclusions. Derived Verified Change composition is covered
+below. Whole-slice supported/hosted acceptance is pending; issues remain open.
+
+
+## Verified Change creation composition
+
+`start_verified_change` now has real production entry-point coverage across its
+original derived `:plan`, `:advance` and `:authorize` receipts. The existing
+manager and ordinary decision repairs compose without a further production
+change: a fresh open settles the admitted component, and replay continues using
+its original root/child identity and response. Three fresh processes retain one
+plan, one container and one child, one authorization decision, and no attempt,
+Run or managed execution intent. Repeated replays retain all receipt and Work
+bytes. Original check authority and execution envelope remain bound to that child.
+
+The new `verified_creation_recovery` fixture uses the established synthetic CLI,
+check profile and lease resolver authority. It calls real readiness and real
+service methods; it does not manually bind a store request. Background writers
+are stopped, and the existing `SKIP_VERIFIED_DRIVE` test boundary holds dispatch.
+This qualifies the creation/materialization/authorization prefix only, with no
+provider, private check execution, source apply or discard. Full managed/external
+effect qualification retains the unchanged supported tests and hosted gate.
+
+The matrix has seventeen admitted cuts (six creation, six materialization,
+five authorization), three fresh replays per cut, three pre-admission cuts,
+changed-input refusal after every successful sequence, and changed-profile
+refusal after creation admission. The first replay walks both authenticated MCP
+readers with one row per page and reads the child summary with
+`ptah_get_work_detail`; both complete traversals return exactly the two IDs.
+The shared manager cleanup hook fires first during creation in this composed
+entry point, so materialization cleanup is covered here by its distinct
+post-commit hook and by the standalone manager matrix's unlink hook.
+
+No external-effect receipt boundary, readiness check, executor policy or schema
+was weakened for this proof. Writer testing is not independent acceptance.
+
+
+## Final local qualification and draft gate
+
+The complete bridge run finishes with 1,274 passed, 114 failed and 15 ignored,
+across 48 library/integration/doc targets (`work/v2-final-full-bridge.log`). The
+seven new recovery targets pass all 68 named tests in this single run, including
+the final expanded twenty-caller target9/9 and composed Verified Change5/5.
+The five failing targets are the library11, adapter11, managed executor1,
+self-host Computer Use1 and Verified Change90. These retain the local confinement
+failures and representative untouched-main comparisons already recorded; this
+is not a successful full bridge run. Native MCP16 and native store46 both pass.
+
+Final bridge/service/gateway fmt and strict all-target Clippy pass. Desktop
+passes typecheck and61files/459tests. Complete headless service passes21tests
+and the test gateway passes17 including its doctest. Terminal rows are saved in
+`outputs/v2-final-{bridge,service,gateway}-results.json` in the task-owned workspace.
+
+The headless cursor-expiry fixture initially filled the journal writer's bounded
+queue, making safe shutdown retain the instance lock and preventing restart.
+The same complete target reproduced that failure on untouched7dd; its focused
+run passed. The fixture now waits for each small batch's published sequence to
+appear in its own journal and asserts healthy persistence before proceeding.
+It still publishes all5,000events and retains every expiry/reconnect/restart
+assertion. No event-bus capacity, shutdown policy or production service code
+changed. Corrected complete qualification passes21/21; original failures remain
+in the task logs.
+
+Exact-head hosted Desktop qualification is required to disposition the local
+confinement limitation and qualify the other supported consumers. The new PR
+stays draft for separate adversarial review; #520/#521 stay open for separate
+acceptance. No live-provider, packaged-native or independent CLEAN claim is made.
