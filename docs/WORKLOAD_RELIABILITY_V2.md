@@ -333,25 +333,25 @@ was weakened for this proof. Writer testing is not independent acceptance.
 The complete bridge run finishes with 1,274 passed, 114 failed and 15 ignored,
 across 48 library/integration/doc targets (`work/v2-final-full-bridge.log`). The
 seven new recovery targets pass all 68 named tests in this single run, including
-the final expanded twenty-caller target9/9 and composed Verified Change5/5.
-The five failing targets are the library11, adapter11, managed executor1,
-self-host Computer Use1 and Verified Change90. These retain the local confinement
+the final expanded twenty-caller target 9/9 and composed Verified Change 5/5.
+The five failing targets are the library 11, adapter 11, managed executor 1,
+self-host Computer Use 1 and Verified Change 90. These retain the local confinement
 failures and representative untouched-main comparisons already recorded; this
 is not a successful full bridge run. Native MCP16 and native store46 both pass.
 
 Final bridge/service/gateway fmt and strict all-target Clippy pass. Desktop
-passes typecheck and61files/459tests. Complete headless service passes21tests
-and the test gateway passes17 including its doctest. Terminal rows are saved in
+passes typecheck and 61 files / 459 tests. Complete headless service passes 21 tests
+and the test gateway passes 17 including its doctest. Terminal rows are saved in
 `outputs/v2-final-{bridge,service,gateway}-results.json` in the task-owned workspace.
 
 The headless cursor-expiry fixture initially filled the journal writer's bounded
 queue, making safe shutdown retain the instance lock and preventing restart.
-The same complete target reproduced that failure on untouched7dd; its focused
+The same complete target reproduced that failure on untouched `7ddce0d5a`; its focused
 run passed. The fixture now waits for each small batch's published sequence to
 appear in its own journal and asserts healthy persistence before proceeding.
-It still publishes all5,000events and retains every expiry/reconnect/restart
+It still publishes all 5,000 events and retains every expiry/reconnect/restart
 assertion. No event-bus capacity, shutdown policy or production service code
-changed. Corrected complete qualification passes21/21; original failures remain
+changed. Corrected complete qualification passes 21/21; original failures remain
 in the task logs.
 
 Exact-head hosted Desktop qualification is required to disposition the local

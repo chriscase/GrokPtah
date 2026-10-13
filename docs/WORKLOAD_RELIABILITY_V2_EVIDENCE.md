@@ -431,7 +431,7 @@ policy, compiler cache, daemon/socket, owner hold or production credential chang
 ## Final whole-slice qualification
 
 Final bridge strict all-target Clippy passes (`work/v2-final-clippy.log`).
-Desktop typecheck and all61files/459tests pass on the unchanged F3/F6 consumers
+Desktop typecheck and all 61 files / 459 tests pass on the unchanged F3/F6 consumers
 (`work/v2-final-desktop-typecheck.log`, `work/v2-final-desktop-tests.log`).
 The complete supported bridge run uses `--no-fail-fast` to retain every target's
 result, normal Rust1.92 debug, locked/offline, task target and isolated home.
@@ -439,31 +439,31 @@ Its terminal results are below; hosted qualification remains required.
 Earlier broad sandbox failures are retained above, not relabeled as success.
 
 
-The final complete bridge run ends exit101: library748pass/11fail/11ignore,
-46integration targets526pass/103fail/3ignore, and one ignored doctest. All68
+The final complete bridge run ends exit101: library: 748 passed / 11 failed / 11 ignored,
+46 integration targets: 526 passed / 103 failed / 3 ignored, and one ignored doctest. All 68
 new named tests pass in the seven recovery targets. The twenty-caller target now
-has a complete9/9 final-source run; the earlier precise phase qualifications
-remain historical evidence. Manager mutation14/14, ordinary creation8+2,
-related creation16/16, MCP/legacy caller14/14 and composed VerifiedChange5/5
+has a complete 9/9 final-source run; the earlier precise phase qualifications
+remain historical evidence. Manager mutation 14/14, ordinary creation 8+2,
+related creation 16/16, MCP/legacy caller 14/14 and composed VerifiedChange 5/5
 pass on the same production sources. The five failed targets retain the local
-confinement limitation: library11, adapter11, managed executor1, self-host CU1,
-Verified Change90. This is not full green or a blanket untouched-main proof for
+confinement limitation: library 11, adapter 11, managed executor 1, self-host CU1,
+Verified Change 90. This is not full green or a blanket untouched-main proof for
 every failed case; prior representative main reproductions remain separate.
 
-Final headless service fmt/strict Clippy and complete21/21 pass
+Final headless service fmt/strict Clippy and complete 21/21 pass
 (`work/v2-final-service-clippy-corrected.log`,
 `work/v2-final-service-tests-corrected.log`). Its initial two complete runs each
 passed20 and failed the journal-flood restart case; untouched main's complete
 conformance target also failed that exact case (`work/v2-final-service-baseline-full.log`),
 although a focused main run passed. The test-only `flood_journal` now observes
-appended journal sequence after each32events (and final partial batch), with
+appended journal sequence after each 32 events (and final partial batch), with
 an explicit no-persistence-error assertion and bounded wait. It retains all
-5,000events, expiry, disconnect, replay and restart assertions. Queue256, journal
+5,000events, expiry, disconnect, replay and restart assertions. The queue capacity of 256, journal
 limits, fail-closed shutdown/lock retention and production code are unchanged.
 This fixes the fixture's timing assumption, not the Work transaction authority.
 
-Gateway fmt/strict Clippy and17tests including doctest pass
-(`work/v2-final-gateway-{clippy,tests}.log`). Desktop61files/459tests and typecheck
+Gateway fmt/strict Clippy and 17 tests including doctest pass
+(`work/v2-final-gateway-{clippy,tests}.log`). Desktop 61 files / 459 tests and typecheck
 pass. Task-owned terminal result rows and original failure logs are retained.
 The draft's exact-head hosted workflow and independent review remain the next
-acceptance gates. Issues#520/#521 remain OPEN by explicit instruction.
+acceptance gates. Issues #520 and #521 remain OPEN by explicit instruction.
