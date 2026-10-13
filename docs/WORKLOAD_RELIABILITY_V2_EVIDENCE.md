@@ -37,25 +37,25 @@ request ID and payload hash. Caller scope validation precedes receipt lookup.
 The table identifies the operation-local response binding; shared machinery
 alone is not complete proof of every caller/cut combination.
 
-| Caller | Bound response / transaction authority | Remaining proof or source finding |
+| Caller | Bound response / transaction authority | Production proof |
 |---|---|---|
-| `create_work` | `work_attempts`; schema-2 absent-prior lifecycle intent, original Work ID, snapshot digest and receipt | Creation proof above; finish additional negative and concurrency cases |
-| `assign_work` | `work_item_mutation`, `work_scope`; assignment decision/Work mutation envelope | Map real caller cuts and original scope response |
-| `offer_work` | `decision`; Work mutation envelope | Real caller cut/replay matrix |
-| `accept_work`, `decline_work` | `worker_identity_mutation`, `decision_scope` | Identity, revision, receipt and original response at each cut |
-| `reassign_work` | `decision`; Work mutation envelope | Prior and successor assignment/decision evidence at each cut |
-| `reprioritize_work`, `block_work`, `request_work_review` | `work_item_mutation`, `work_scope` | Reprioritize real caller Work/receipt/cleanup fault proof passes with one decision and exact work_scope response. Block/review cuts remain pending |
-| `unblock_work` | `unblock`; operation-specific projector | Preserve its complete response, not just the Work row |
-| `authorize_work_execution` | `decision`; explicit caller binding | Authorization identity and no redispatch on replay |
-| `claim_work` | `claim`; lifecycle envelope and redacted receipt; replay restores existing lease authority | Existing #584 actual service crash battery passes; extend partial write/cleanup fault proof |
-| `renew_work`, `link_work_run` | `work_lease_mutation`, `lease_view` | Existing #584 real caller cut battery passes; preserve expired/revoked/rotated lease behavior |
-| `report_work_progress` | `work_attempt`; lifecycle envelope | Real caller red reproduced timestamp conflict; stable hashing and original-response/newer-row/legacy/refusal tests pass. Remaining child-process cuts pending |
-| `release_work`, `complete_work`, `fail_work` | `work_item_attempt_mutation`, `work_attempt` | Complete/fail actual MCP timestamp conflicts reproduced and fixed; success, legacy fixture and refusal replay pass. Release and full cut coverage pending |
-| `cancel_work` | `work_attempts`; lifecycle then managed authority cancellation | Real Work/receipt/cleanup fault cases replay through three host lifetimes; managed external cancellation ordering remains a separate acceptance row |
-| `retry_work` | `work_item_mutation`, `work_scope` | Retry state and receipt replay across all relevant cuts |
-| `approve_work` | `work_item_attempt_mutation`, `work_attempt` | Caller expected revision is hashed and checked by store; explicitly qualify binding and original result |
-| `resolve_work_input` | Live permission ID; existing managed Parked/Resolving intent plus host receiver, then unbound Work lifecycle update | Has no request ID or ordinary authenticated idempotency claim. Preserve managed permission/effect authority; scope, receiver-gone, failed respond and restart tests are named below |
-| Managed seal/finalization/reconciliation | Existing managed intent, finalization, quarantine and recovery protocols | Preserve #584 F1/F5 and external-effect settlement; inventory all relevant caller cuts |
+| `create_work` | `work_attempts`; schema-2 absent-prior lifecycle intent, original ID/snapshot/receipt | Creation process, negative, capacity, MCP and concurrency proofs above |
+| `assign_work` | `work_item_mutation`, `work_scope`; legacy assign lifecycle envelope | Twenty-caller process/fault matrix below; assign creates no decision |
+| `offer_work`, `reassign_work` | `decision`; Work/decision envelope | Full original Work + decision, all admitted cuts and applicable writes |
+| `accept_work`, `decline_work` | `worker_identity_mutation`, `decision_scope` | Full response includes session/workspace and attributable acting/assigned Agent metadata |
+| `reprioritize_work`, `block_work`, `request_work_review` | `work_item_mutation`, `work_scope`; Work/decision envelope | Full original scope response, one original decision, repeated process replay |
+| `unblock_work` | `unblock`; compact operation-specific projector | Exact compact Work/revision/provenance/session response, not a full-row substitution |
+| `authorize_work_execution` | `decision`; explicit original binding | Original authorization decision; no dispatch or new managed authority from receipt replay |
+| `claim_work` | `claim`; lifecycle envelope and redacted receipt | Process/write/cleanup cases; restores the same original lease in memory and persists no raw token; v1 adverse lease proofs remain |
+| `renew_work`, `link_work_run` | `work_lease_mutation`, `lease_view` | Original attempt/scope response; both change the attempt and intentionally leave Work unchanged; actual run-link scope gate remains before replay |
+| `report_work_progress` | `work_attempt`; lifecycle envelope | Process/fault matrix plus original-response/newer-row and legacy timestamp proofs |
+| `release_work`, `complete_work`, `fail_work` | `work_item_attempt_mutation`, `work_attempt` | Process/fault matrix plus actual MCP completion/failure success/legacy/refusal proofs |
+| `cancel_work` | `work_attempts`; lifecycle then managed authority cancellation | Full original attempt array for ordinary Work; managed external cancellation remains under its separate effect authority |
+| `retry_work` | `work_item_mutation`, `work_scope`; lifecycle envelope | Original retry state and scope, no extra attempt on replay |
+| `approve_work` | `work_item_attempt_mutation`, `work_attempt` | Ordinary approval-gated completion across all cuts/writes; candidate approval/apply remains a distinct managed boundary |
+| `resolve_work_input` | Live permission ID; managed Parked/Resolving intent + host receiver, then unbound Work update | No request ID/ordinary claim; existing six actual MCP permission preservation cases and native store cases are named below |
+| Managed seal/finalization/reconciliation | Existing managed intent/finalization/quarantine/recovery authority | Preserve F1/F5 and external-effect settlement; full final supported/hosted qualification remains pending |
+
 
 Real cancellation and reprioritization write/receipt faults reproduce the
 pending-to-failed receipt bug, and cancellation cleanup fault reproduces open
@@ -70,8 +70,9 @@ original response after a newer report, exact legacy hash fixtures with changed
 input refusal, and newly rejected input replay. Complete/fail each run actual
 authenticated MCP success, legacy hash fixture and refusal replay. Cancel and
 reprioritize each cover Work/receipt/cleanup write faults and exact original
-response across three fresh host lifetimes. This is not yet the complete
-operation/child-process cut matrix. Managed cancellation and apply/discard must
+response across three fresh host lifetimes. The additional production process target now covers the twenty ordinary
+update callers listed below. These earlier fault tests remain complementary
+legacy/MCP evidence. Managed cancellation and apply/discard must
 continue to settle at their existing external-effect boundaries.
 
 ## Adjacent creation audit
@@ -300,3 +301,86 @@ No cache, socket, daemon, hold or sandbox policy was changed. Prior broad local
 sandbox failures remain retained. No hosted v2 CI, draft handoff, complete caller
 matrix or independent CLEAN acceptance is claimed by this checkpoint.
 #520 and #521 were freshly reverified open after the checks.
+
+
+## Ordinary mutation receipt admission and recovery
+
+`work_caller_process_conformance.rs` uses the actual authenticated service for
+all twenty ordinary update callers. Each fixture creates its Work through the
+real service and uses real offer/accept/claim/block/complete/fail preludes when
+needed. The second scoped worker and linked Run are synthetic typed fixtures;
+link still passes the production run scope gate. Fixtures stop unrelated
+background writers and set their explicit ordinary Work policy to forbid managed
+execution. These tests never manually bind a store request or call a provider.
+They derive synthetic original lease credentials from immutable attempt identity
+in memory, without putting raw tokens in fixture or ledger JSON.
+
+Two actual original-receipt corruption probes reproduced recovery writing the
+decision/item or attempt/item before refusing a missing canonical request:
+`work/v2-callers-receipt-preflight-red.log`. Ordinary update admission and recovery
+now inspect the canonical regular-file receipt and original scope/tool/hash,
+refuse conflicting pending fields or completed outcomes before dependent writes,
+and validate all present effects before accepting an already completed receipt.
+Generic legacy claim/read migration remains under its existing authority;
+recovery inspection cannot move a conflicting legacy file or follow a receipt
+link. Apply/discard retain their existing settlement predicate and sealed
+external-effect authority.
+
+A separate actual assign probe showed settlement dropping the `Some(work_id)`
+subject the public caller supplies (`work/v2-callers-subject-red.log`). Known
+ordinary Work tools now settle their original named Work subject from the sealed
+binding/response. Existing completed v1 receipts with an absent subject remain
+readable and replay byte-for-byte when their original outcome/effects match;
+they are not rewritten into new evidence. Failed/malformed/foreign receipts do
+not gain that compatibility.
+
+| Named test | Contract |
+|---|---|
+| `every_remaining_caller_replays_the_public_response_after_receipt_write` | All twenty declared public response shapes replay exactly, including compact unblock, scoped worker decision, lease view, attempt array and redacted claim |
+| `remaining_production_callers_replay_each_admitted_process_cut` | One hundred operation/cut cases: intent, decision/attempt, Work stage, intent unlink and cleanup; three fresh-process replays, no extra revisions/records or lease minting |
+| `pre_intent_production_caller_cuts_preserve_the_prior_records` | Twenty pre-admission process cuts leave prior Work/attempt/decision bytes unchanged and become stable original refusals |
+| `all_remaining_callers_distinguish_pre_admission_refusal_from_live_recovery` | Ninety-six applicable operation/write cases; before-intent refusal versus admitted attempt/decision/item/receipt/cleanup failure; live admission closes only after uncertainty |
+| `decision_caller_recovery_refuses_a_conflicting_original_receipt_before_writes`, `lifecycle_caller_recovery_refuses_a_conflicting_original_receipt_before_writes` | Twelve receipt evidence variants per family, three refused opens each, bytes and links preserved |
+| `work_caller_receipt_identifies_its_original_named_work` | Lifecycle, decision and progress receipts retain the named Work subject supplied by the caller |
+| `legacy_completed_work_receipts_without_subject_replay_without_rewriting` | Three response families preserve the original completed no-subject receipt bytes across three fresh processes |
+
+Every successful replay also rejects changed payload/revision and, on the first
+replay, wrong target/session/workspace without modifying the original receipt.
+Bounded list and graph service reads agree on the recovered Work ID. Existing
+v1 service request races, unbound writer, expired/revoked/rotated lease, full
+capacity/detail and quarantine proofs remain separate acceptance evidence.
+The new claim response restores the original token only to the caller; its
+receipt and all ledger JSON stay redacted.
+
+Renew and link perform no Work-item write, so their fault matrix targets the
+attempt, receipt and cleanup rather than injecting an unused item fault. Their
+process Work-stage cut still checks that the unchanged Work snapshot remains
+consistent with the changed attempt. Already-terminal same-result/same-reviewer
+fast paths that change no Work/attempt/decision are genuinely read-only outcomes
+plus one new receipt; no transaction is admitted before that receipt. Worker
+presence/heartbeat changes are outside the Work-mutation transaction inventory.
+Managed permission and source apply/discard are not ordinary request replay rows.
+
+The seventeen-update version passes its complete nine-test target including
+83 applicable live faults (`work/v2-callers-final-matrix-4.log`). The expanded
+twenty-caller target passes its eight process/response/pre-admission/compatibility
+cases (`work/v2-callers-twenty-matrix-2.log`); its remaining live-fault fixture
+initially targeted a Work write that renew/link do not perform. The corrected
+96-case live-fault test separately passes
+(`work/v2-callers-twenty-live-faults-final.log`, 1/1). These are exact source phases,
+not a claimed single expanded 9/9 full-target run. Earlier fixture compile errors,
+a missing renewal prelude, and retry's intentional automatic-retry policy are
+recorded as fixture/iteration failures; the exact red logs above identify the
+demonstrated production failures.
+
+Selected preservation passes 121/121 on final production sources
+(`work/v2-callers-preservation-final.log`; exact rows are in task-owned results).
+Expanded strict all-target Clippy passes (`work/v2-callers-expanded-clippy.log`).
+Related/ordinary creation and manager recovery pass 38/38
+(`work/v2-callers-related-preservation.log`), including the first complete 14/14
+manager mutation target. Seven compatibility/idempotency library cases pass
+(`work/v2-callers-compatibility-final.log`), and six actual managed permission
+MCP cases pass (`work/v2-callers-permission-preservation.log`). Prior broad local
+sandbox failures remain retained. Derived Verified Change composition and final
+whole-slice supported/hosted qualification plus one draft handoff remain pending.
+Both issues stay open; this remains writer testing.

@@ -270,3 +270,26 @@ See the named manager tests and qualification phases in the evidence document.
 The remaining production assignment/lifecycle process matrix, derived Verified
 Change composition, whole-slice supported/hosted validation and independent
 review are still pending. Both tracking issues remain open.
+
+
+## Ordinary update receipt proof
+
+The real process caller matrix now covers every ordinary assignment/lifecycle
+update, including claim, renewal and run linking. The new recovery preflight
+repairs a demonstrated missing-receipt gap: no decision, attempt or Work successor
+is written before the original canonical receipt is proved. Admission validates
+that evidence before persisting the ordinary intent. Pending outcome fields and
+foreign/completed mismatches refuse without rewriting their evidence; exact
+already-completed outcomes require their dependent effects to be present.
+
+Ordinary settlement also preserves the Work subject the public caller supplies.
+Successful legacy v1 receipts whose subject is absent continue to replay unchanged
+when the original body/effects match. API response, Work, attempt and intent
+schemas remain unchanged. Legacy generic claim/read migration is preserved;
+sealed recovery reads the canonical receipt without migration or link traversal.
+The existing apply/discard settlement predicate and managed external-effect
+protocols remain in force.
+
+The evidence document records twenty-caller process/fault coverage and explicit
+single-record/no-op exclusions. Derived Verified Change composition and final
+whole-slice supported/hosted acceptance are still pending; issues remain open.

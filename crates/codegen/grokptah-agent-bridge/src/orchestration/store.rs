@@ -3136,9 +3136,10 @@ impl OrchStore {
         Ok(present)
     }
 
-    /// New sealed creations own a canonical claim. Inspection cannot follow
-    /// links or adopt an unrelated legacy file before proving the outcome.
-    fn inspect_creation_request_receipt_unlocked(
+    /// Admitted bound mutations own a canonical claim. Inspection cannot
+    /// follow links or adopt legacy evidence before proving the outcome.
+    /// The ordinary claim/read migration authority remains unchanged.
+    fn inspect_canonical_request_receipt_unlocked(
         &self,
         request: &WorkRequestBinding,
     ) -> Result<IdempotencyReceipt, OrchError> {
@@ -3173,6 +3174,37 @@ impl OrchStore {
         Ok(receipt)
     }
 
+    /// Ordinary bound updates predate creation's subject metadata. Their
+    /// completed v1 receipts may have no subject; exact original bodies still
+    /// replay, without rewriting old evidence or using a newer Work snapshot.
+    fn preflight_bound_work_outcome_unlocked(
+        &self,
+        request: Option<&WorkRequestBinding>,
+        response: &serde_json::Value,
+        work_id: &str,
+        effects_present: bool,
+    ) -> Result<(), OrchError> {
+        let Some(request) = request else {
+            return Ok(());
+        };
+        let receipt = self.inspect_canonical_request_receipt_unlocked(request)?;
+        let complete = receipt.status == "complete"
+            && receipt.error.is_none()
+            && receipt.response == *response
+            && receipt
+                .run_id
+                .as_deref()
+                .is_none_or(|subject| subject == work_id)
+            && effects_present;
+        if !creation_receipt_is_pending(&receipt) && !complete {
+            return Err(OrchError::new(
+                OrchErrorCode::Conflict,
+                "work request receipt conflicts with its sealed outcome",
+            ));
+        }
+        Ok(())
+    }
+
     fn preflight_related_receipt_unlocked(
         &self,
         request: Option<&RelatedCreationRequest>,
@@ -3183,7 +3215,7 @@ impl OrchStore {
         let Some(request) = request else {
             return Ok(());
         };
-        let receipt = self.inspect_creation_request_receipt_unlocked(&request.binding)?;
+        let receipt = self.inspect_canonical_request_receipt_unlocked(&request.binding)?;
         let complete = receipt.status == "complete"
             && receipt.error.is_none()
             && receipt.response == *response
@@ -3755,20 +3787,28 @@ impl OrchStore {
                 "work mutation recovery found an unexpected expected_revision",
             ));
         }
-        if let Some(decision) =
-            self.load_work_decision_unlocked(&intent.work_id, &intent.decision.decision_id)?
-        {
+        let current_decision =
+            self.load_work_decision_unlocked(&intent.work_id, &intent.decision.decision_id)?;
+        if let Some(decision) = &current_decision {
             let digest = super::hash_payload(
-                &serde_json::to_value(&decision)
+                &serde_json::to_value(decision)
                     .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?,
             );
-            if digest != intent.decision_digest || decision != intent.decision {
+            if digest != intent.decision_digest || decision != &intent.decision {
                 return Err(OrchError::new(
                     OrchErrorCode::Conflict,
                     "work mutation recovery found a conflicting decision receipt",
                 ));
             }
-        } else {
+        }
+        self.preflight_bound_work_outcome_unlocked(
+            intent.request.as_ref(),
+            &mutation_response_value(intent),
+            &intent.work_id,
+            current_digest.as_deref() == Some(intent.next_item_digest.as_str())
+                && current_decision.is_some(),
+        )?;
+        if current_decision.is_none() {
             self.save_work_decision_unlocked(&intent.decision)
                 .map_err(|error| self.note_partial_commit(error))?;
         }
@@ -3983,6 +4023,15 @@ impl OrchStore {
             )?;
             intent.request = Some(request);
         }
+        if Self::lifecycle_settles_service_receipt(&intent) {
+            self.preflight_bound_work_outcome_unlocked(
+                intent.request.as_ref(),
+                &lifecycle_response_value(&intent)?,
+                &intent.work_id,
+                false,
+            )?;
+        }
+        crash_process_if_stage("lifecycle_before_intent");
         self.persist_work_lifecycle_intent_unlocked(&intent)?;
         crash_process_if_stage("lifecycle_after_intent");
         self.commit_work_lifecycle_intent_unlocked(&intent)
@@ -4026,7 +4075,7 @@ impl OrchStore {
             .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
         if intent.prior_item.is_none() {
             let request = intent.request.as_ref().expect("validated creation request");
-            let receipt = self.inspect_creation_request_receipt_unlocked(request)?;
+            let receipt = self.inspect_canonical_request_receipt_unlocked(request)?;
             let response = lifecycle_response_value(intent)?;
             let settled = receipt.status == "complete"
                 && receipt.response == response
@@ -4088,6 +4137,23 @@ impl OrchStore {
                 OrchErrorCode::Conflict,
                 "work lifecycle recovery found an unexpected attempt",
             ));
+        }
+        if intent.prior_item.is_some() && Self::lifecycle_settles_service_receipt(intent) {
+            let mut attempts_present = current_attempts.len() == intent.attempts.len();
+            for next in &intent.attempts {
+                let current = current_attempts
+                    .iter()
+                    .find(|current| current.attempt_id == next.attempt_id);
+                attempts_present &= current.map(Self::attempt_digest).transpose()?.as_deref()
+                    == Some(Self::attempt_digest(next)?.as_str());
+            }
+            self.preflight_bound_work_outcome_unlocked(
+                intent.request.as_ref(),
+                &lifecycle_response_value(intent)?,
+                &intent.work_id,
+                current_item_digest.as_deref() == Some(next_item_digest.as_str())
+                    && attempts_present,
+            )?;
         }
         Ok((current_item_digest, current_attempts))
     }
@@ -6172,6 +6238,13 @@ impl OrchStore {
             )?;
             intent.request = Some(request);
         }
+        self.preflight_bound_work_outcome_unlocked(
+            intent.request.as_ref(),
+            &mutation_response_value(&intent),
+            &intent.work_id,
+            false,
+        )?;
+        crash_process_if_stage("mutation_before_intent");
         self.persist_work_mutation_intent_unlocked(&intent)?;
         crash_process_if_stage("mutation_after_intent");
         self.commit_work_mutation_intent_unlocked(&intent)
@@ -8103,6 +8176,31 @@ impl OrchStore {
                     response["plan"]["planId"].as_str().map(str::to_string)
                 }
                 "ptah_fire_routine" => response["routineId"].as_str().map(str::to_string),
+                "ptah_assign_work"
+                | "ptah_offer_work"
+                | "ptah_accept_work"
+                | "ptah_decline_work"
+                | "ptah_reassign_work"
+                | "ptah_reprioritize_work"
+                | "ptah_block_work"
+                | "ptah_unblock_work"
+                | "ptah_request_review"
+                | "ptah_authorize_work_execution"
+                | "ptah_claim_work"
+                | "ptah_renew_work"
+                | "ptah_link_work_run"
+                | "ptah_report_work_progress"
+                | "ptah_release_work"
+                | "ptah_complete_work"
+                | "ptah_fail_work"
+                | "ptah_cancel_work"
+                | "ptah_retry_work"
+                | "ptah_approve_work" => request.target_work_id.clone().or_else(|| {
+                    response["work"]["workId"]
+                        .as_str()
+                        .or_else(|| response["workId"].as_str())
+                        .map(str::to_string)
+                }),
                 _ => None,
             },
             response.clone(),
@@ -12729,6 +12827,9 @@ fn remove_file_durable(lease: &crate::host_runtime::WriteLease, path: &Path) -> 
     if path.is_file() {
         fs::remove_file(path)?;
         if let Some(parent) = path.parent() {
+            if parent.ends_with("work-intents") {
+                crash_process_if_stage("mutation_after_intent_remove");
+            }
             if parent.ends_with("work-lifecycle-intents") {
                 crash_process_if_stage("lifecycle_after_intent_remove");
             }
