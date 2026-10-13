@@ -508,7 +508,7 @@ impl ManagedExecutionIntent {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NativeExecutorStatus {
     pub enabled: bool,
