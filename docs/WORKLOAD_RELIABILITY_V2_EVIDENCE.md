@@ -44,24 +44,35 @@ alone is not complete proof of every caller/cut combination.
 | `offer_work` | `decision`; Work mutation envelope | Real caller cut/replay matrix |
 | `accept_work`, `decline_work` | `worker_identity_mutation`, `decision_scope` | Identity, revision, receipt and original response at each cut |
 | `reassign_work` | `decision`; Work mutation envelope | Prior and successor assignment/decision evidence at each cut |
-| `reprioritize_work`, `block_work`, `request_work_review` | `work_item_mutation`, `work_scope` | Exact caller payload/revision and response proof |
+| `reprioritize_work`, `block_work`, `request_work_review` | `work_item_mutation`, `work_scope` | Reprioritize real caller Work/receipt/cleanup fault proof passes with one decision and exact work_scope response. Block/review cuts remain pending |
 | `unblock_work` | `unblock`; operation-specific projector | Preserve its complete response, not just the Work row |
 | `authorize_work_execution` | `decision`; explicit caller binding | Authorization identity and no redispatch on replay |
 | `claim_work` | `claim`; lifecycle envelope and redacted receipt; replay restores existing lease authority | Existing #584 actual service crash battery passes; extend partial write/cleanup fault proof |
 | `renew_work`, `link_work_run` | `work_lease_mutation`, `lease_view` | Existing #584 real caller cut battery passes; preserve expired/revoked/rotated lease behavior |
-| `report_work_progress` | `work_attempt`; lifecycle envelope | Source hashes fresh `WorkProgress.updated_at` before lookup. Suspected replay mismatch; reproduce through actual caller before fixing |
-| `release_work`, `complete_work`, `fail_work` | `work_item_attempt_mutation`, `work_attempt` | Per-caller original response and failed-commit receipt proof |
-| `cancel_work` | `work_attempts`; lifecycle then managed authority cancellation | Reproduce partial receipt/cleanup errors; preserve cancellation authority ordering |
+| `report_work_progress` | `work_attempt`; lifecycle envelope | Real caller red reproduced timestamp conflict; stable hashing and original-response/newer-row/legacy/refusal tests pass. Remaining child-process cuts pending |
+| `release_work`, `complete_work`, `fail_work` | `work_item_attempt_mutation`, `work_attempt` | Complete/fail actual MCP timestamp conflicts reproduced and fixed; success, legacy fixture and refusal replay pass. Release and full cut coverage pending |
+| `cancel_work` | `work_attempts`; lifecycle then managed authority cancellation | Real Work/receipt/cleanup fault cases replay through three host lifetimes; managed external cancellation ordering remains a separate acceptance row |
 | `retry_work` | `work_item_mutation`, `work_scope` | Retry state and receipt replay across all relevant cuts |
 | `approve_work` | `work_item_attempt_mutation`, `work_attempt` | Caller expected revision is hashed and checked by store; explicitly qualify binding and original result |
 | `resolve_work_input` | Synchronous service entry; deeper audit pending | Classify its actual durable boundary before including or excluding |
 | Managed seal/finalization/reconciliation | Existing managed intent, finalization, quarantine and recovery protocols | Preserve #584 F1/F5 and external-effect settlement; inventory all relevant caller cuts |
 
-After partial commit, ordinary lifecycle callers still reach `fail_claim` and
-the lease destructor. Creation now explicitly preserves its admitted pending
-receipt. The remaining callers need real service fault tests before changing
-shared lease behavior. A failed outer call cannot honestly erase an admitted
-mutation's recoverable outcome. Cleanup failures also need admission checks.
+Real cancellation and reprioritization write/receipt faults reproduce the
+pending-to-failed receipt bug, and cancellation cleanup fault reproduces open
+admission after uncertainty. The repaired lease failure/destructor now protects
+matching original bindings in unresolved Work intents. Persist/commit/cleanup
+uncertainty closes admission. Reprioritization Work/receipt failures also fail on
+untouched merged main, using the same real caller tests (the temporary test file
+was removed afterward). No unbound writer acquires a foreground request.
+
+`work_mutation_replay_conformance.rs` has fourteen passing tests. Progress covers
+original response after a newer report, exact legacy hash fixtures with changed
+input refusal, and newly rejected input replay. Complete/fail each run actual
+authenticated MCP success, legacy hash fixture and refusal replay. Cancel and
+reprioritize each cover Work/receipt/cleanup write faults and exact original
+response across three fresh host lifetimes. This is not yet the complete
+operation/child-process cut matrix. Managed cancellation and apply/discard must
+continue to settle at their existing external-effect boundaries.
 
 ## Adjacent creation audit
 
@@ -109,3 +120,29 @@ evidence without claiming that partial page counts are whole-lane totals.
 #521 remains open for the unfinished caller and adjacent-creation matrix,
 negative/replay checks, complete supported qualification and independent review.
 A draft PR is not yet prepared; this document intentionally records pending rows.
+
+## Current qualification exception
+
+The family cache launcher was attempted after a dry run but sccache's Cargo
+compiler probe was refused in this wake, including after access grants. No
+cache, socket, daemon or owner hold was deleted or changed to resolve it.
+The supported direct qualification path uses task-owned `work/v2-qualification-target`,
+Rust 1.92, normal debug profile, wrappers unset, `CARGO_INCREMENTAL=0`, locked/offline
+and isolated homes. Strict fmt and all-target Clippy pass. Selected preservation targets pass; retain the earlier failed broad qualification and its
+baseline comparisons, and require hosted checks for the completed slice.
+
+The final compatibility regression also verifies that a changed payload leaves
+its legacy owner-layout receipt untouched. Timestamp inspection reads without
+adoption; the existing claim authority migrates the receipt only after proving
+the exact original tool/payload hash. Correct original input then replays and
+migrates successfully. Final caller target passes 14/14, six existing legacy /
+idempotency unit tests pass, and final strict all-target Clippy passes.
+
+The selected preservation run passed all 118 integration tests across v1
+adversarial (16), manager MCP (2), native executor store (46), routine MCP (1),
+creation (9), graph service (4), caller conformance (13 before the final legacy
+inspection regression), workload MCP (1), authenticated pages (6) and workload
+store (20). Its library retains the known local baseline: 748 pass, 11 failed,
+11 ignored. This run is not green. The final non-mutating inspection is separately
+qualified by the final 14 caller tests, six legacy/idempotency units and Clippy;
+no full hosted v2 qualification or independent review is claimed.

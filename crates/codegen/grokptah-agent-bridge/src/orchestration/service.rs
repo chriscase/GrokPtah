@@ -419,6 +419,15 @@ impl IdempotencyLease {
     }
 
     fn fail(&mut self, run_id: Option<String>, error: OrchError) -> OrchError {
+        if self.store.work_request_recovery_is_pending(
+            &self.scope,
+            &self.tool,
+            &self.request_id,
+            &self.payload_hash,
+        ) {
+            self.leave_pending();
+            return error;
+        }
         match self.store.fail_idempotency(
             &self.scope,
             &self.tool,
@@ -435,9 +444,8 @@ impl IdempotencyLease {
         }
     }
 
-    /// The Work commit landed and the process died before the receipt. Leave
-    /// the claim pending so restart can finish that response. Drop must not
-    /// record the committed apply as a failed mutation.
+    /// A sealed mutation or external effect still owns the outcome. Leave its
+    /// receipt for recovery; Drop must not replace it with a refusal.
     fn leave_pending(&mut self) {
         self.settled = true;
     }
@@ -446,6 +454,15 @@ impl IdempotencyLease {
 impl Drop for IdempotencyLease {
     fn drop(&mut self) {
         if self.settled {
+            return;
+        }
+        if self.store.work_request_recovery_is_pending(
+            &self.scope,
+            &self.tool,
+            &self.request_id,
+            &self.payload_hash,
+        ) {
+            self.leave_pending();
             return;
         }
         let error = OrchError::new(
@@ -4281,7 +4298,14 @@ impl OrchestrationService {
         if let Some(message) = self.store.ledger_admission_closed() {
             return Err(OrchError::new(OrchErrorCode::Conflict, message));
         }
-        let payload_hash = hash_payload(payload);
+        let payload_hash = if matches!(
+            tool,
+            "ptah_report_work_progress" | "ptah_complete_work" | "ptah_fail_work"
+        ) {
+            self.work_attempt_request_hash(auth, tool, request_id, session_id, &claimed, payload)?
+        } else {
+            hash_payload(payload)
+        };
         if tool == "ptah_apply_verified_change" {
             if let Some(work_id) = payload.get("workId").and_then(serde_json::Value::as_str) {
                 let scope = IdempotencyScope::new(&auth.owner_id, session_id, &claimed)?;
@@ -4293,6 +4317,76 @@ impl OrchestrationService {
             .begin_idempotency(auth, tool, request_id, &payload_hash, session_id, &claimed)
             .await?;
         Ok((claimed, start))
+    }
+
+    /// Older progress/result requests hashed a server timestamp. A completed receipt
+    /// retains that exact timestamp in its original response, so it can prove
+    /// the old hash without consulting a newer Work row. Failed legacy claims
+    /// lack this evidence and must retain their ordinary conflict behavior.
+    fn work_attempt_request_hash(
+        &self,
+        auth: &AuthContext,
+        tool: &str,
+        request_id: &str,
+        session_id: Uuid,
+        workspace: &Path,
+        payload: &serde_json::Value,
+    ) -> Result<String, OrchError> {
+        let (field, timestamp) = if tool == "ptah_report_work_progress" {
+            ("progress", "updatedAt")
+        } else {
+            ("result", "completedAt")
+        };
+        let mut caller_payload = payload.clone();
+        if let Some(object) = caller_payload["details"][field].as_object_mut() {
+            object.remove(timestamp);
+        }
+        let current_hash = hash_payload(&caller_payload);
+        let scope = IdempotencyScope::new(&auth.owner_id, session_id, workspace)?;
+        let Some(receipt) = self
+            .store
+            .inspect_idempotency_for_replay_hash(&scope, request_id)?
+        else {
+            return Ok(current_hash);
+        };
+        if receipt.tool != tool
+            || receipt.status != "complete"
+            || receipt.error.is_some()
+            || receipt.response["work"]["workId"] != payload["workId"]
+            || receipt.response["work"]["sessionId"] != json!(session_id)
+            || receipt.response["work"]["workspace"] != json!(workspace.display().to_string())
+            || receipt.response["attempt"]["attemptId"] != payload["details"]["attemptId"]
+        {
+            return Ok(current_hash);
+        }
+        let sealed_value = &receipt.response["work"][field];
+        let sealed_value = if field == "progress" {
+            serde_json::from_value::<WorkProgress>(sealed_value.clone())
+                .ok()
+                .and_then(|value| serde_json::to_value(value).ok())
+        } else {
+            serde_json::from_value::<WorkResult>(sealed_value.clone())
+                .ok()
+                .and_then(|value| serde_json::to_value(value).ok())
+        };
+        let Some(sealed_value) = sealed_value else {
+            return Ok(current_hash);
+        };
+        let mut sealed_inputs = sealed_value.clone();
+        if let Some(object) = sealed_inputs.as_object_mut() {
+            object.remove(timestamp);
+        }
+        if sealed_inputs != caller_payload["details"][field] {
+            return Ok(current_hash);
+        }
+        let mut legacy_payload = payload.clone();
+        legacy_payload["details"][field] = sealed_value;
+        let legacy_hash = hash_payload(&legacy_payload);
+        Ok(if legacy_hash == receipt.payload_hash {
+            legacy_hash
+        } else {
+            current_hash
+        })
     }
 
     fn map_work_ledger_error(error: anyhow::Error) -> OrchError {
@@ -5521,13 +5615,8 @@ impl OrchestrationService {
         summary: String,
         percent: Option<u8>,
     ) -> Result<serde_json::Value, OrchError> {
-        let progress = WorkProgress {
-            summary,
-            percent,
-            updated_at: Utc::now(),
-        };
-        let payload_details =
-            json!({"attemptId": attempt_id, "leaseToken": lease_token, "progress": progress});
+        let payload_details = json!({"attemptId": attempt_id, "leaseToken": lease_token,
+                "progress": {"summary": summary, "percent": percent}});
         let payload = json!({
             "sessionId": session_id,
             "workspace": workspace.display().to_string(),
@@ -5559,6 +5648,11 @@ impl OrchestrationService {
             Some(attempt_id),
             None,
         )?;
+        let progress = WorkProgress {
+            summary,
+            percent,
+            updated_at: Utc::now(),
+        };
         let progress_result =
             self.store
                 .report_work_progress(work_id, attempt_id, lease_token, progress);

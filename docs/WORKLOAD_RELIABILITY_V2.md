@@ -93,3 +93,63 @@ source-backed caller inventory and explicit remaining acceptance work.
 See `WORKLOAD_RELIABILITY_V1_EVIDENCE.md` for the six v1 repairs that this slice
 must preserve. Held pages requiring explicit Refresh and newer selected detail
 leading its list row remain accepted operating constraints.
+
+## Production caller replay repairs
+
+The actual service progress caller reproduced a conflict on identical inputs:
+its payload hash included a freshly generated `updatedAt`. Authenticated MCP
+completion and failure callers reproduced the same error because their adapter
+creates a fresh `completedAt`. New request hashes exclude these bookkeeping
+timestamps. The original response and timestamps remain sealed and replayed;
+all meaningful progress/result fields, target, attempt, lease and scope remain
+part of request identity. This agrees with the existing completion replay
+comparison, which already excludes `completedAt`.
+
+Existing successful legacy receipts remain replayable only when the exact old
+hash can be proved from the original receipt's timestamp and caller inputs.
+The repair does not use a newer Work row to reconstruct an old request. Legacy
+failed receipts lack that sealed timestamp; they keep their prior conflict
+behavior rather than inventing evidence. Newly rejected requests replay their
+original refusal normally.
+
+Real cancellation and reprioritization callers also demonstrate a partial
+commit gap: `fail_claim` could change an admitted pending receipt to `failed`.
+Receipt failure and Work write failure now leave the original sealed outcome
+for recovery. Cleanup failure closes live admission even when the receipt is
+already complete. The lease failure/destructor path checks unresolved existing
+Work intents for the exact original owner/session/workspace/tool/request/hash;
+this protects its own outcome without adopting another caller's receipt.
+Malformed evidence is retained conservatively. Recovery authority remains in
+the existing intent and receipt files.
+
+The caller target now has fourteen passing tests, including real MCP success,
+legacy hash fixtures and refusal replay, plus Work/receipt/cleanup write faults
+for cancellation and reprioritization. Fault cases replay the exact original
+response through three fresh host lifetimes, with no duplicate attempts or
+decisions. These are same-process write-fault proofs with fresh host reopen;
+additional child-process cuts and the remaining operation matrix are pending.
+
+This wake's ordinary compiler-cache launcher was refused by sccache's Cargo
+compiler probe. Current-turn access grants did not resolve that wrapper error.
+Checks therefore use the repository's supported uncached qualification path in
+a task-owned target, Rust 1.92, normal debug profile, locked/offline, wrappers
+unset and `CARGO_INCREMENTAL=0`. No cache target, hold, socket or daemon was
+removed. Outer sandbox checks remain intact. Strict fmt/Clippy passed; current
+preservation results and remaining hosted qualification are recorded in the
+evidence matrix and task-owned progress file.
+
+The final compatibility regression also verifies that a changed payload leaves
+its legacy owner-layout receipt untouched. Timestamp inspection reads without
+adoption; the existing claim authority migrates the receipt only after proving
+the exact original tool/payload hash. Correct original input then replays and
+migrates successfully. Final caller target passes 14/14, six existing legacy /
+idempotency unit tests pass, and final strict all-target Clippy passes.
+
+The selected preservation run passed all 118 integration tests across v1
+adversarial (16), manager MCP (2), native executor store (46), routine MCP (1),
+creation (9), graph service (4), caller conformance (13 before the final legacy
+inspection regression), workload MCP (1), authenticated pages (6) and workload
+store (20). Its library retains the known local baseline: 748 pass, 11 failed,
+11 ignored. This run is not green. The final non-mutating inspection is separately
+qualified by the final 14 caller tests, six legacy/idempotency units and Clippy;
+no full hosted v2 qualification or independent review is claimed.

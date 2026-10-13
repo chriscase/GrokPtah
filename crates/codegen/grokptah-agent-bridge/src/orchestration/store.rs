@@ -2250,14 +2250,23 @@ impl OrchStore {
         &self,
         intent: &WorkMutationIntent,
     ) -> Result<(), OrchError> {
+        self.refuse_closed_admission()?;
         intent.validate()?;
         let path = self.work_mutation_intent_path(&intent.intent_id)?;
-        atomic_write_json(&self.lease(), &path, intent)
-            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))
+        atomic_write_json(&self.lease(), &path, intent).map_err(|error| {
+            let error = OrchError::new(OrchErrorCode::Internal, error.to_string());
+            if path.try_exists().unwrap_or(true) {
+                self.note_work_recovery_required(error)
+            } else {
+                error
+            }
+        })
     }
 
     fn clear_work_mutation_intent_unlocked(&self, intent_id: &str) -> Result<(), OrchError> {
         let path = self.work_mutation_intent_path(intent_id)?;
+        crate::verified_change::fail_durable_write_if_armed(&path)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
         remove_file_durable(&self.lease(), &path)
             .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))
     }
@@ -2345,7 +2354,8 @@ impl OrchStore {
             &mutation_response_value(intent),
         )?;
         crash_process_if_stage("mutation_after_receipt");
-        self.clear_work_mutation_intent_unlocked(&intent.intent_id)?;
+        self.clear_work_mutation_intent_unlocked(&intent.intent_id)
+            .map_err(|error| self.note_work_recovery_required(error))?;
         crash_process_if_stage("mutation_after_commit");
         Ok(())
     }
@@ -2379,8 +2389,14 @@ impl OrchStore {
         self.refuse_closed_admission()?;
         intent.validate()?;
         let path = self.work_lifecycle_intent_path(&intent.intent_id)?;
-        atomic_write_json(&self.lease(), &path, intent)
-            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))
+        atomic_write_json(&self.lease(), &path, intent).map_err(|error| {
+            let error = OrchError::new(OrchErrorCode::Internal, error.to_string());
+            if path.try_exists().unwrap_or(true) {
+                self.note_work_recovery_required(error)
+            } else {
+                error
+            }
+        })
     }
 
     fn clear_work_lifecycle_intent_unlocked(&self, intent_id: &str) -> Result<(), OrchError> {
@@ -2434,7 +2450,8 @@ impl OrchStore {
             )?;
         }
         crash_process_if_stage("lifecycle_after_receipt");
-        self.clear_work_lifecycle_intent_unlocked(&intent.intent_id)?;
+        self.clear_work_lifecycle_intent_unlocked(&intent.intent_id)
+            .map_err(|error| self.note_work_recovery_required(error))?;
         crash_process_if_stage("lifecycle_after_commit");
         Ok(())
     }
@@ -2535,6 +2552,7 @@ impl OrchStore {
         self.persist_work_lifecycle_intent_unlocked(&intent)?;
         crash_process_if_stage("lifecycle_after_intent");
         self.commit_work_lifecycle_intent_unlocked(&intent)
+            .map_err(|error| self.note_work_recovery_required(error))
     }
 
     fn preflight_work_lifecycle_intent_unlocked(
@@ -4561,7 +4579,8 @@ impl OrchStore {
         }
         self.persist_work_mutation_intent_unlocked(&intent)?;
         crash_process_if_stage("mutation_after_intent");
-        self.commit_work_mutation_intent_unlocked(&intent)?;
+        self.commit_work_mutation_intent_unlocked(&intent)
+            .map_err(|error| self.note_work_recovery_required(error))?;
         Ok((item, decision))
     }
 
@@ -6265,6 +6284,62 @@ impl OrchStore {
 
     pub fn ledger_admission_closed(&self) -> Option<String> {
         self.inner.ledger_admission_closed.lock().clone()
+    }
+
+    /// Protect only this request's sealed Work outcome. Closing admission for
+    /// another request must not turn an ordinary unrelated refusal into a
+    /// recoverable mutation. Unreadable evidence is conservative: keep the
+    /// claim rather than destroy an outcome which reopening must inspect.
+    pub(crate) fn work_request_recovery_is_pending(
+        &self,
+        scope: &IdempotencyScope,
+        tool: &str,
+        request_id: &str,
+        payload_hash: &str,
+    ) -> bool {
+        if self.ledger_admission_closed().is_none() {
+            return false;
+        }
+        let _guard = self.inner.lock.lock();
+        for directory in ["work-intents", "work-lifecycle-intents"] {
+            let Ok(entries) = fs::read_dir(self.inner.root.join(directory)) else {
+                return true;
+            };
+            for entry in entries {
+                let Ok(entry) = entry else {
+                    return true;
+                };
+                let path = entry.path();
+                if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
+                    continue;
+                }
+                let Ok(bytes) = fs::read(path) else {
+                    return true;
+                };
+                let request = if directory == "work-intents" {
+                    match serde_json::from_slice::<WorkMutationIntent>(&bytes) {
+                        Ok(intent) if intent.validate().is_ok() => intent.request,
+                        _ => return true,
+                    }
+                } else {
+                    match serde_json::from_slice::<WorkLifecycleIntent>(&bytes) {
+                        Ok(intent) if intent.validate().is_ok() => intent.request,
+                        _ => return true,
+                    }
+                };
+                if request.is_some_and(|request| {
+                    request.owner_id == scope.owner_id
+                        && request.session_id == scope.session_id
+                        && request.workspace_digest == scope.workspace_digest
+                        && request.tool == tool
+                        && request.request_id == request_id
+                        && request.payload_hash == payload_hash
+                }) {
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     fn note_partial_commit(&self, error: OrchError) -> OrchError {
@@ -10050,6 +10125,63 @@ impl OrchStore {
     ) -> anyhow::Result<Option<IdempotencyReceipt>> {
         let _guard = self.inner.lock.lock();
         self.load_idempotency_unlocked(scope, request_id)
+    }
+
+    /// Inspect the original timestamp before choosing a legacy request hash.
+    /// This must not adopt a legacy file: claim_idempotency performs migration
+    /// only after it proves the supplied tool and payload identity.
+    pub(crate) fn inspect_idempotency_for_replay_hash(
+        &self,
+        scope: &IdempotencyScope,
+        request_id: &str,
+    ) -> Result<Option<IdempotencyReceipt>, OrchError> {
+        let _guard = self.inner.lock.lock();
+        for (path, legacy) in [
+            (self.idemp_path(scope, request_id)?, false),
+            (self.legacy_owner_v2_path(scope, request_id)?, true),
+        ] {
+            match fs::metadata(&path) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    return Err(OrchError::new(OrchErrorCode::Internal, error.to_string()))
+                }
+                Ok(metadata) if !metadata.is_file() => {
+                    return Err(OrchError::new(
+                        OrchErrorCode::Conflict,
+                        "idempotency evidence is not a regular file",
+                    ))
+                }
+                Ok(_) => {}
+            }
+            let bytes = fs::read(&path)
+                .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+            let receipt: IdempotencyReceipt = serde_json::from_slice(&bytes).map_err(|_| {
+                OrchError::new(
+                    OrchErrorCode::Conflict,
+                    "idempotency receipt cannot be reused",
+                )
+            })?;
+            if receipt.schema_version != IDEMPOTENCY_RECEIPT_SCHEMA_VERSION
+                || receipt.owner_id != scope.owner_id
+                || receipt.request_id != request_id
+            {
+                return Err(OrchError::new(
+                    OrchErrorCode::Conflict,
+                    "idempotency receipt cannot be reused",
+                ));
+            }
+            if !receipt.is_in_scope(scope) {
+                if legacy {
+                    return Ok(None);
+                }
+                return Err(OrchError::new(
+                    OrchErrorCode::Conflict,
+                    "idempotency receipt scope does not match its durable path",
+                ));
+            }
+            return Ok(Some(receipt));
+        }
+        Ok(None)
     }
 
     fn load_idempotency_unlocked(
