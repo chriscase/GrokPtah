@@ -1,0 +1,267 @@
+/* SessionBrowser — Lane Operations workspace. Component-local styles layered
+ * over the shared .sb-* rules in styles/app.css; tokens only, no raw colors
+ * beyond what the token set provides. */
+
+/* The shared grid-template-rows only lines up when the error card is mounted;
+ * a flex column keeps the scroll region correct for any number of chrome rows. */
+.session-browser {
+  display: flex;
+  flex-direction: column;
+}
+
+.session-browser .sb-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+}
+
+.session-browser .sb-body-inner {
+  width: 100%;
+}
+
+.session-browser .sb-body > .state-card,
+.session-browser > .state-card {
+  margin: 0.5rem 1rem;
+}
+
+.session-browser .sb-kbd {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  padding: 0 0.3rem;
+  margin-left: 0.3rem;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--muted);
+  background: var(--surface-chip);
+}
+
+/* ── Result count, filter chips, reset ── */
+.session-browser .sb-summary {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.4rem;
+  padding: 0.4rem 1rem;
+  border-bottom: 1px solid var(--border-soft);
+  font-size: 12px;
+  background: var(--bg-panel);
+}
+
+.session-browser .sb-count {
+  font-weight: 600;
+  color: var(--text);
+  white-space: nowrap;
+}
+
+.session-browser .sb-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  font-size: 11px;
+  padding: 0.1rem 0.5rem;
+  border-radius: 999px;
+  border: 1px solid var(--accent-dim);
+  background: var(--accent-bg);
+  color: var(--accent);
+  max-width: 18rem;
+}
+
+.session-browser .sb-chip-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.session-browser .sb-chip-x {
+  font-size: 12px;
+  line-height: 1;
+  opacity: 0.85;
+}
+
+.session-browser .sb-chip:hover {
+  border-color: var(--accent);
+}
+
+.session-browser .sb-reset {
+  font-size: 11px;
+  padding: 0.15rem 0.5rem;
+}
+
+/* Selection disclosure */
+.session-browser .sb-sel-hidden {
+  color: var(--state-attention);
+}
+
+/* ── Bulk progress ── */
+.session-browser .sb-progress {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  padding: 0.35rem 1rem;
+  border-bottom: 1px solid var(--border-soft);
+  font-size: 12px;
+  color: var(--accent);
+  background: var(--bg-panel);
+}
+
+.session-browser .sb-progress-track {
+  flex: 1;
+  max-width: 16rem;
+  height: 4px;
+  border-radius: 999px;
+  background: var(--overlay-mid);
+  overflow: hidden;
+}
+
+.session-browser .sb-progress-fill {
+  height: 100%;
+  background: var(--accent);
+}
+
+/* ── Delete confirmation (nested alertdialog) ── */
+.session-browser .sb-confirm-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 10;
+  display: grid;
+  place-items: center;
+  padding: 1rem;
+  background: var(--overlay-scrim);
+}
+
+.session-browser .sb-confirm {
+  width: 100%;
+  max-width: 28rem;
+  max-height: min(80vh, 32rem);
+  overflow-y: auto;
+  padding: 1rem 1.1rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-panel);
+  box-shadow: 0 12px 40px var(--overlay-scrim);
+}
+
+.session-browser .sb-confirm h3 {
+  margin: 0 0 0.4rem;
+  font-size: 0.95rem;
+  color: var(--danger);
+}
+
+.session-browser .sb-confirm p {
+  margin: 0 0 0.6rem;
+  font-size: 12.5px;
+  color: var(--text);
+  overflow-wrap: anywhere;
+}
+
+.session-browser .sb-confirm-list {
+  margin: 0 0 0.6rem;
+  padding-left: 1.2rem;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.session-browser .sb-confirm-list li {
+  overflow-wrap: anywhere;
+}
+
+.session-browser .sb-confirm-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 0.45rem;
+}
+
+/* ── Long-content guards ── */
+.session-browser .sb-title-btn {
+  overflow-wrap: anywhere;
+  min-width: 0;
+}
+
+.session-browser .sb-meta {
+  min-width: 0;
+}
+
+/* Token-based archive pill (shared rule hardcodes a dark-only border). */
+.session-browser .sb-pill.archive {
+  border-color: var(--accent-dim);
+}
+
+.session-browser .sb-select {
+  min-width: 0;
+}
+
+/* ── Motion (opt-in only when the user allows it) ── */
+@media (prefers-reduced-motion: no-preference) {
+  .session-browser .sb-row {
+    transition: background-color 120ms ease, border-color 120ms ease;
+  }
+  .session-browser .sb-progress-fill {
+    transition: width 160ms ease;
+  }
+}
+
+/* ── Narrow: stack row actions, full-width filter input ── */
+@media (max-width: 719px) {
+  .session-browser .sb-header {
+    flex-wrap: wrap;
+    gap: 0.4rem;
+    padding: 0.6rem 0.75rem;
+  }
+  .session-browser .sb-toolbar,
+  .session-browser .sb-summary,
+  .session-browser .sb-bulk,
+  .session-browser .sb-progress {
+    padding-left: 0.75rem;
+    padding-right: 0.75rem;
+  }
+  .session-browser .sb-body {
+    padding: 0.6rem 0.75rem 1.5rem;
+  }
+  .session-browser .sb-search {
+    flex-basis: 100%;
+    order: -1;
+    min-width: 0;
+  }
+  .session-browser .sb-row {
+    grid-template-columns: auto 1fr;
+  }
+  .session-browser .sb-actions {
+    grid-column: 1 / -1;
+    justify-content: flex-start;
+    max-width: none;
+  }
+  .session-browser .sb-cwd {
+    max-width: 14rem;
+  }
+}
+
+/* ── Very narrow (320px): shed the subtitle, tighten chrome ── */
+@media (max-width: 419px) {
+  .session-browser .sb-sub {
+    display: none;
+  }
+  .session-browser .sb-chip {
+    max-width: 12rem;
+  }
+  .session-browser .sb-cwd {
+    max-width: 9rem;
+  }
+  .session-browser .sb-actions button {
+    padding: 0.3rem 0.4rem;
+  }
+}
+
+/* ── Wide and ultrawide: cap the reading column so rows keep hierarchy ── */
+@media (min-width: 1280px) {
+  .session-browser .sb-body-inner {
+    max-width: 72rem;
+    margin-inline: auto;
+  }
+}
+
+@media (min-width: 1920px) {
+  .session-browser .sb-body-inner {
+    max-width: 84rem;
+  }
+}
