@@ -312,7 +312,18 @@ explicit enable/disable; it does not own dispatch.
 
 ## Follow-up
 
-- Manager-agent planning and decomposition
-- Message-triggered routine activation
-- Per-principal worker credentials bound to one Agent
-- Computer Use for unattended Agents (not in this slice)
+Shipped since this slice (do not treat as remaining work):
+
+- Manager-agent planning and decomposition — [`MANAGER_PLANS.md`](MANAGER_PLANS.md) (autonomous supervisor is Experimental; not a Grokbot binary; not unattended Computer Use)
+- Manual and scheduled routines — [`DURABLE_ROUTINES.md`](DURABLE_ROUTINES.md) ([#306](https://github.com/chriscase/GrokPtah/issues/306) closed)
+
+Still remaining:
+
+- Message-triggered routine activation (`RoutineTrigger::External` adapters remain `unsupported` on create/fire)
+- Per-principal worker credentials bound to one Agent (bearers are operator-equivalent today)
+- Computer Use for unattended Agents (not in this slice; [#287](https://github.com/chriscase/GrokPtah/issues/287)/[#288](https://github.com/chriscase/GrokPtah/issues/288) Planned)
+- Native Coding Readiness Center / local host quota ledger — **Pending — not shipped** on [PR #352](https://github.com/chriscase/GrokPtah/pull/352)
+
+Status: [`CAPABILITY_MATRIX.md`](CAPABILITY_MATRIX.md). Road to 100%:
+[`ROADMAP_TO_100.md`](ROADMAP_TO_100.md). Grok Build session/gateway routing is
+already Supported; quota observability and live certification are separate.

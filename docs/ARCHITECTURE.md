@@ -52,6 +52,9 @@ authorization, reconnect, desktop receipts) is documented in
 [`HEADLESS_SERVICE.md`](./HEADLESS_SERVICE.md). Runtime, storage, capability,
 and authority boundaries are normative in
 [`ADR-002-runtime-boundaries.md`](./ADR-002-runtime-boundaries.md).
+Supported vs Experimental vs Planned vs Explicitly unsupported capabilities
+are the [`CAPABILITY_MATRIX.md`](./CAPABILITY_MATRIX.md); the path to a
+trustworthy 100% claim is [`ROADMAP_TO_100.md`](./ROADMAP_TO_100.md).
 
 ## Why a bridge crate
 
@@ -75,8 +78,8 @@ The bridge:
 - Runs **local tools** (read/list/grep, shell, write with permission) in-process
 - **Build sessions** run a multi-round **tool-calling agent loop** (list/read/grep/glob/write/apply_patch/shell) with permissions; **Chat sessions** are single-shot completions
 - Injects project instructions (`AGENTS.md`, etc.) into Build context; sends effort on the wire
-- When OIDC/`~/.grok/auth.json` or an xAI API key is present, calls cli-chat-proxy / API for model steps
-- Discovers MCP servers from `~/.grokptah/mcp.json` / project `.mcp.json`, skills under `~/.grokptah/skills` and project skill dirs, plugins under `~/.grokptah/plugins` + local catalog (MCP **dispatch** into the loop is Phase 15)
+- When OIDC/`~/.grok/auth.json` or an xAI API key is present, calls cli-chat-proxy / API for model steps. Session/gateway **routing is Supported**; complete quota observability and exact live certification remain distinct questions ([`CAPABILITY_MATRIX.md`](./CAPABILITY_MATRIX.md)).
+- Discovers MCP servers from `~/.grokptah/mcp.json` / project `.mcp.json` and dispatches enabled **stdio** MCP tools into the Build loop as `mcp__server__tool` (`mcp_runtime.rs`). Skills live under `~/.grokptah/skills` and project skill dirs; plugins under `~/.grokptah/plugins` plus a local catalog. The authenticated control plane is a **separate** MCP surface (`CONTROL_TOOLS`). Computer Use MCP **mutations** remain unsupported ([#271](https://github.com/chriscase/GrokPtah/issues/271)); read-only Computer Run tools are on main.
 - Background tasks run real async work (directory walk) via `tokio::spawn`
 - Integrated terminal PTYs forward stdout to the UI (`pty://output`) with multi-tab backlog replay
 
@@ -109,7 +112,11 @@ host-level filesystem/process confinement. The workspace allowlist selects
 exact authorized project identities; it is not an OS sandbox. The current
 single service bearer is operator-equivalent for the full MCP surface,
 including isolated-run approval and promotion; scoped principal tiers are a
-required boundary before durable worker leases ship.
+required boundary before durable worker leases ship. Hosts are not assumed to
+have identical capabilities; declared host-capability advertisement and
+hosted-service CI are not on `origin/main` (see the matrix). “Grokbot” in
+ADR-002 / [#301](https://github.com/chriscase/GrokPtah/issues/301) is hosted
+always-on language, not a shipped binary name.
 
 ```sh
 # CLI / TUI (root workspace)

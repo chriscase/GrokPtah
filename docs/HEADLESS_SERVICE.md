@@ -6,6 +6,16 @@ control plane used by the desktop app. Policy, persistent orchestration, and
 restart recovery stay in `grokptah-agent-bridge`; the service crate owns only
 configuration and process lifecycle.
 
+Desktop and `grokptah-service` share a runtime; they are **not** assumed to
+have identical host capabilities, and a declared capability document is not
+on `origin/main`. Hosted-service CI (`.github/workflows/hosted-service.yml`)
+exists only on draft [PR #352](https://github.com/chriscase/GrokPtah/pull/352)
+and is **Pending — not shipped**. Named bearers are operator-equivalent.
+See [`CAPABILITY_MATRIX.md`](CAPABILITY_MATRIX.md) and
+[`ROADMAP_TO_100.md`](ROADMAP_TO_100.md). Always-on “Grokbot” language in
+ADR-002 / [#301](https://github.com/chriscase/GrokPtah/issues/301) is not a
+shipped binary name.
+
 ## Run locally
 
 Use a disposable workspace while testing:

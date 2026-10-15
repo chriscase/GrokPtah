@@ -44,7 +44,7 @@ dispatch handle, host path, screenshot asset locator, credential, or general she
 | Malicious app mimicking a reviewed title/icon | Native target attestation is required; packaged identity and hardware proof remain release-gate work | `docs/COMPUTER_USE_MACOS.md`; #274 hardware-backed smoke |
 | Focus theft, app restart, window reuse, resize, DPI/display change, and occlusion | Native fixtures cover the implemented identity/geometry checks; broader hardware matrix remains required before stable release | macOS observation/action tests; #274 manual exact-head matrix |
 | Credential UI, lock/login, permission panels, privilege prompts, password managers | Explicit unsupported/denied disposition; no model-visible capture or action is allowed | `Sensitivity::{Secure,SystemRestricted}` policy; native surface classification tests |
-| MCP Computer mutations, raw shell, clipboard, AppleScript, unattended control | Explicitly unsupported in this release; #271 is a later scoped interoperability phase | `CONTROL_TOOLS` boundary; `docs/COMPUTER_USE.md` non-goals |
+| MCP Computer mutations, raw shell, clipboard, AppleScript, unattended control | Read-only MCP Computer Run tools are on main; **mutations** remain Explicitly unsupported. [#271](https://github.com/chriscase/GrokPtah/issues/271) is **open** for mutations, not proof that reads are absent. | `CONTROL_TOOLS` / `FORBIDDEN_TOOLS`; `ptah_list_computer_runs` and siblings; [`COMPUTER_USE.md`](COMPUTER_USE.md) non-goals |
 | Windows/Linux native control | Explicitly unsupported until their platform issues have native consent and evidence | #275 and #276 |
 
 ## Release blockers still open
@@ -52,10 +52,17 @@ dispatch handle, host path, screenshot asset locator, credential, or general she
 - Run the three-action disposable macOS fixture proof through the packaged GrokPtah identity with
   Screen Recording and Accessibility grants. Terminal-owned grants do not prove packaged identity.
 - Complete the named hardware matrix for focus/geometry/display changes and permission revocation.
-- Keep #271 Computer MCP mutations disabled until the shared event/approval contract and its threat
-  review are complete.
-- Keep #288 isolated visual execution disabled until a backend provides a genuinely separate input
-  surface; hidden windows, separate Spaces, and global `CGEvent` injection do not qualify.
+- Keep [#271](https://github.com/chriscase/GrokPtah/issues/271) Computer MCP **mutations** disabled
+  until the shared event/approval contract and its threat review are complete. Read-only tools are
+  already on main.
+- Keep [#288](https://github.com/chriscase/GrokPtah/issues/288) isolated visual execution disabled
+  until a backend provides a genuinely separate input surface; hidden windows, separate Spaces, and
+  global `CGEvent` injection do not qualify. Foreground activation of a selected window is **not**
+  that isolated surface. Current semantic Computer Use has no raw global mouse injection
+  (`unsupported_pointer_fallback_never_reaches_backend`).
+
+Tier status: [`CAPABILITY_MATRIX.md`](CAPABILITY_MATRIX.md). Road to 100%:
+[`ROADMAP_TO_100.md`](ROADMAP_TO_100.md).
 
 ## Verification command
 

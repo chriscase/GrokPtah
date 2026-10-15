@@ -5,6 +5,14 @@ OpenAI-compatible provider profiles. A profile binds one base URL, credential
 reference, model inventory, request budget, and capability record. Routing and
 authentication are resolved together in the native host.
 
+Grok Build session/gateway **routing is Supported** (`~/.grok/auth.json` /
+OIDC and optional API key). Complete quota observability and exact live
+certification are distinct questions. GrokPtah does not synchronize a Grok
+Build account balance. A local durable host quota ledger and the Native
+Coding Readiness Center are **Pending — not shipped** on
+[PR #352](https://github.com/chriscase/GrokPtah/pull/352). Status:
+[`CAPABILITY_MATRIX.md`](CAPABILITY_MATRIX.md).
+
 ## Configure a provider
 
 Open **Settings > Auth > Model providers** and enter:
@@ -117,4 +125,5 @@ does not combine one profile's endpoint with another profile's credential.
 - Malformed existing profile configuration is never silently replaced.
 
 The built-in xAI profile retains its existing API-key and Grok Build OIDC
-refresh/header behavior.
+refresh/header behavior. That is routing, not a passed live-certification
+campaign and not a Grok Build account-balance feed.
