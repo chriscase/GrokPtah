@@ -208,6 +208,10 @@ struct LedgerAdmissionRecoveryMarker {
     tool: String,
     request_id: String,
     payload_hash: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    sealed_binding: Option<WorkRequestBinding>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    sealed_response: Option<serde_json::Value>,
 }
 
 // Schema 1 is the original unbound envelope. Schema 2 admits new records
@@ -4146,18 +4150,17 @@ impl OrchStore {
             .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
         if intent.prior_item.is_none() {
             let request = intent.request.as_ref().expect("validated creation request");
+            let caller_inputs =
+                Self::legacy_creation_request_payload_hash_from_item(request, &intent.item)?;
+            if caller_inputs != request.payload_hash {
+                return Err(related_creation_conflict(
+                    "creation receipt does not match sealed caller inputs",
+                ));
+            }
             if let Some(sealed) = intent.creation_request_digest.as_deref() {
                 if sealed != request.payload_hash.as_str() {
                     return Err(related_creation_conflict(
                         "creation request digest does not match the authenticated receipt hash",
-                    ));
-                }
-            } else {
-                let legacy =
-                    Self::legacy_creation_request_payload_hash_from_item(request, &intent.item)?;
-                if legacy != request.payload_hash {
-                    return Err(related_creation_conflict(
-                        "creation receipt does not match sealed caller inputs",
                     ));
                 }
             }
@@ -8193,7 +8196,7 @@ impl OrchStore {
             )
         })?;
         let marker = LedgerAdmissionRecoveryMarker {
-            schema_version: 1,
+            schema_version: 2,
             intent_id: intent.intent_id.clone(),
             owner_id: request.binding.owner_id.clone(),
             session_id: request.binding.session_id,
@@ -8201,6 +8204,8 @@ impl OrchStore {
             tool: request.binding.tool.clone(),
             request_id: request.binding.request_id.clone(),
             payload_hash: request.binding.payload_hash.clone(),
+            sealed_binding: Some(request.binding.clone()),
+            sealed_response: Some(intent.response()),
         };
         atomic_write_json(
             &self.lease(),
@@ -8245,37 +8250,48 @@ impl OrchStore {
         )
         .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
         let intent_path = self.manager_creation_intent_path(&marker.intent_id)?;
-        if !intent_path.is_file() {
-            return Err(OrchError::new(
-                OrchErrorCode::Internal,
-                "post-commit prune recovery is missing its manager intent",
-            ));
-        }
-        let intent = ManagerIntent::decode(
-            &fs::read(&intent_path)
-                .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?,
-        )?;
-        let intent = match intent {
-            ManagerIntent::Mutation(intent) => intent,
-            ManagerIntent::Creation(_) => {
-                return Err(OrchError::new(
-                    OrchErrorCode::Internal,
-                    "post-commit prune recovery expected a manager mutation intent",
-                ));
-            }
-        };
         let _guard = self.inner.lock.lock();
-        self.complete_bound_request_unlocked(
-            intent.request.as_ref().map(|request| &request.binding),
-            &intent.response(),
-        )?;
-        if let Err(error) = self.prune_messages_unlocked() {
-            self.note_work_recovery_required(error);
-            return Ok(());
+        if intent_path.is_file() {
+            let intent =
+                ManagerIntent::decode(&fs::read(&intent_path).map_err(|error| {
+                    OrchError::new(OrchErrorCode::Internal, error.to_string())
+                })?)?;
+            let intent = match intent {
+                ManagerIntent::Mutation(intent) => intent,
+                ManagerIntent::Creation(_) => {
+                    return Err(OrchError::new(
+                        OrchErrorCode::Internal,
+                        "post-commit prune recovery expected a manager mutation intent",
+                    ));
+                }
+            };
+            self.complete_bound_request_unlocked(
+                intent.request.as_ref().map(|request| &request.binding),
+                &intent.response(),
+            )?;
+            if let Err(error) = self.prune_messages_unlocked() {
+                self.note_work_recovery_required(error);
+                return Ok(());
+            }
+            remove_file_durable(&self.lease(), &path)
+                .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+            self.clear_related_intent_unlocked(&intent_path)?;
+        } else {
+            // Intent was unlinked before the admission marker — seal the caller
+            // outcome from the marker envelope, then finish retention.
+            if let (Some(binding), Some(response)) = (
+                marker.sealed_binding.as_ref(),
+                marker.sealed_response.as_ref(),
+            ) {
+                self.complete_bound_request_unlocked(Some(binding), response)?;
+            }
+            if let Err(error) = self.prune_messages_unlocked() {
+                self.note_work_recovery_required(error);
+                return Ok(());
+            }
+            remove_file_durable(&self.lease(), &path)
+                .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
         }
-        self.clear_related_intent_unlocked(&intent_path)?;
-        remove_file_durable(&self.lease(), &path)
-            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
         *self.inner.ledger_admission_closed.lock() = None;
         *self.inner.last_run_error.lock() = None;
         Ok(())
@@ -11400,7 +11416,40 @@ impl OrchStore {
             ));
         }
         Self::require_work_revision(&fresh, expected_revision)?;
+        let mut lifecycle_intent = WorkLifecycleIntent::new(
+            "cancel",
+            prior_item,
+            item.clone(),
+            prior_attempts,
+            attempts.clone(),
+        )?;
+        if let Some(request) = request {
+            self.validate_bound_request_unlocked(
+                &request,
+                lifecycle_intent
+                    .prior_item
+                    .as_ref()
+                    .expect("cancel constructor seals a prior item"),
+                &lifecycle_intent.prior_attempts,
+                &lifecycle_intent.attempts,
+            )?;
+            lifecycle_intent.request = Some(request);
+        }
+        if Self::lifecycle_settles_service_receipt(&lifecycle_intent) {
+            self.preflight_bound_work_outcome_unlocked(
+                lifecycle_intent.request.as_ref(),
+                &lifecycle_response_value(&lifecycle_intent)?,
+                &lifecycle_intent.work_id,
+                false,
+            )?;
+        }
+        crash_process_if_stage("lifecycle_before_intent");
+        self.persist_work_lifecycle_intent_unlocked(&lifecycle_intent)
+            .map_err(|error| self.note_work_recovery_required(error))?;
+        crash_process_if_stage("lifecycle_after_intent");
+        crash_process_if_stage("cancel_after_intent");
         pre_commit(&managed_intents)?;
+        crash_process_if_stage("cancel_after_revoke");
         let fresh = self
             .load_work_item_unlocked(work_id)
             .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
@@ -11415,14 +11464,8 @@ impl OrchStore {
             ));
         }
         Self::require_work_revision(&fresh, expected_revision)?;
-        self.commit_lifecycle_with_request_unlocked(
-            "cancel",
-            prior_item,
-            item.clone(),
-            prior_attempts,
-            attempts.clone(),
-            request,
-        )?;
+        self.commit_work_lifecycle_intent_unlocked(&lifecycle_intent)
+            .map_err(|error| self.note_work_recovery_required(error))?;
         Ok((item, attempts))
     }
 

@@ -1355,6 +1355,34 @@ fn manager_post_commit_prune_recovers_on_ordinary_reopen_without_test_phase_env(
 }
 
 #[test]
+fn manager_post_commit_prune_recovers_when_intent_unlinked_before_marker() {
+    let root = tempfile::tempdir().unwrap();
+    write(
+        root.path().join("options.json"),
+        &json!({"seedMessages":500}),
+    );
+    exited(
+        &child(root.path(), "tick-message", "prune_remove_fault", ""),
+        0,
+    );
+    let marker_path = root
+        .path()
+        .join("home/ledger/ledger-admission-recovery.json");
+    let intent_paths = paths(&root.path().join("home/ledger/manager-intents"));
+    assert_eq!(intent_paths.len(), 1);
+    let intent_path = intent_paths[0].clone();
+    std::fs::remove_file(&intent_path).unwrap();
+    assert!(marker_path.is_file());
+    let _guard = common::ProcessEnvGuard::new();
+    set_grokptah_home_override(Some(root.path().join("home")));
+    std::env::remove_var("MANAGER_MUTATION_PHASE");
+    let store = OrchStore::open(root.path().join("home/ledger")).unwrap();
+    assert!(store.ledger_admission_closed().is_none());
+    assert!(!marker_path.exists());
+    assert_eq!(receipt(root.path())["status"], "complete");
+}
+
+#[test]
 fn manager_post_commit_prune_keeps_intent_when_prune_fails_again_on_reopen() {
     let root = tempfile::tempdir().unwrap();
     write(

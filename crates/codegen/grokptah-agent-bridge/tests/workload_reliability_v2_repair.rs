@@ -656,3 +656,173 @@ async fn cancel_revoke_conflict_leaves_work_active_and_retryable_receipt() {
         "failed"
     );
 }
+
+#[test]
+fn cancel_cut_child() {
+    let Ok(mode) = std::env::var("WR_V2_CANCEL_CUT_MODE") else {
+        return;
+    };
+    let root = PathBuf::from(std::env::var("WR_V2_CANCEL_CUT_ROOT").unwrap());
+    let mut env = common::ProcessEnvGuard::new();
+    env.set("GROKPTAH_AGENT_OFFLINE", "1");
+    if mode == "cut" {
+        env.set(
+            "GROKPTAH_CRASH_STAGE",
+            std::env::var("WR_V2_CANCEL_CUT_STAGE").unwrap(),
+        );
+    }
+    set_grokptah_home_override(Some(root.join("home")));
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            let workspace = canonical_workspace(&root.join("workspace")).unwrap();
+            let runtime = AgentHost::create(HostConfig {
+                always_approve: true,
+                ..HostConfig::default()
+            })
+            .unwrap();
+            runtime.start().unwrap();
+            let meta: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(root.join("fixture.json")).unwrap()).unwrap();
+            let session = Uuid::parse_str(meta["sessionId"].as_str().unwrap()).unwrap();
+            let work_id = meta["workId"].as_str().unwrap();
+            runtime.session_set_cwd(session, &workspace).unwrap();
+            if mode == "recover" {
+                let store = OrchStore::open(root.join("home/ledger")).unwrap();
+                assert_eq!(
+                    store.load_work_item(work_id).unwrap().unwrap().state,
+                    WorkState::Cancelled
+                );
+                assert_eq!(
+                    idempotency_receipt_status(store.root(), "cancel-managed"),
+                    "complete"
+                );
+                return;
+            }
+            let store = OrchStore::open(root.join("home/ledger")).unwrap();
+            let orch = OrchestrationService::new(
+                runtime.clone(),
+                runtime.event_bus(),
+                store.clone(),
+                OrchestrationConfig {
+                    bearer_token: TOKEN.into(),
+                    allowlist: WorkspaceAllowlist::new([workspace.clone()]),
+                    max_concurrent_runs: 2,
+                    bounds: RunBounds::default(),
+                },
+            );
+            let auth = orch.auth_header(Some(&format!("Bearer {TOKEN}"))).unwrap();
+            let revision = meta["revision"].as_u64().unwrap();
+            orch.configure_managed_grok_executor(
+                ManagedGrokExecutorConfig {
+                    executable: PathBuf::from("/bin/true"),
+                    git_executable: PathBuf::from("/usr/bin/git"),
+                    cwd: workspace.clone(),
+                    isolate_parent: root.join("isolate"),
+                    repository_id: "repo-wr-v2-repair".into(),
+                    base_ref: "refs/heads/main".into(),
+                    identity: GrokBuildGitIdentity {
+                        repository_id: "repo-wr-v2-repair".into(),
+                        git_ref: "refs/heads/main".into(),
+                        base_sha: "0000000000000000000000000000000000000001".into(),
+                        head_sha: "0000000000000000000000000000000000000001".into(),
+                    },
+                    credential_lease_id: "managed-cancel-lease".into(),
+                },
+                Arc::new(CountingRevokeResolver {
+                    revoke_count: Arc::new(AtomicU32::new(0)),
+                }),
+            )
+            .unwrap();
+            let _ = orch
+                .cancel_work(
+                    &auth,
+                    "cancel-managed",
+                    session,
+                    &workspace,
+                    work_id,
+                    "cut".into(),
+                    Some(revision),
+                )
+                .await;
+        });
+}
+
+struct CountingRevokeResolver {
+    revoke_count: Arc<AtomicU32>,
+}
+
+impl CredentialLeaseResolver for CountingRevokeResolver {
+    fn resolve(&self, lease_id: &str) -> Result<CredentialLeaseHandle, GrokBuildAdapterError> {
+        let _ = lease_id;
+        Err(GrokBuildAdapterError::CredentialLease)
+    }
+
+    fn revoke(&self, lease_id: &str) -> Result<(), GrokBuildAdapterError> {
+        let _ = lease_id;
+        self.revoke_count.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn provider_evidence(&self, lease_id: &str) -> Option<ManagedProviderEvidence> {
+        let _ = lease_id;
+        Some(ManagedProviderEvidence {
+            mechanism: "test-revoke-order".into(),
+            model: "grok-build-0.1".into(),
+            requests_reserved: 1,
+            wire_attempts: 0,
+            responses_completed: 0,
+            denied_requests: 0,
+            tool_calls: 0,
+            input_tokens: 0,
+            output_tokens: 0,
+            uncertain: false,
+            revoked: false,
+            authority_attempts: Vec::new(),
+            ..Default::default()
+        })
+    }
+}
+
+#[tokio::test]
+async fn cancel_durable_intent_precedes_revoke_and_survives_revoke_before_commit_cut() {
+    let (root, runtime, _orch, store, _auth, session, _workspace, work_id, _, _) =
+        managed_cancel_fixture().await;
+    let revision = store.load_work_item(&work_id).unwrap().unwrap().revision;
+    write_json(
+        root.path().join("fixture.json"),
+        &json!({
+            "sessionId": session,
+            "workId": work_id,
+            "revision": revision,
+        }),
+    );
+    drop(_orch);
+    drop(store);
+    assert!(runtime.shutdown().await.is_clean());
+    let exe = std::env::current_exe().unwrap();
+    let cut = std::process::Command::new(&exe)
+        .args(["--exact", "cancel_cut_child", "--nocapture"])
+        .env("WR_V2_CANCEL_CUT_ROOT", root.path())
+        .env("WR_V2_CANCEL_CUT_MODE", "cut")
+        .env("WR_V2_CANCEL_CUT_STAGE", "cancel_after_revoke")
+        .output()
+        .unwrap();
+    assert_eq!(cut.status.code(), Some(86));
+    assert!(
+        std::fs::read_dir(root.path().join("home/ledger/work-lifecycle-intents"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .count()
+            > 0
+    );
+    let recover = std::process::Command::new(&exe)
+        .args(["--exact", "cancel_cut_child", "--nocapture"])
+        .env("WR_V2_CANCEL_CUT_ROOT", root.path())
+        .env("WR_V2_CANCEL_CUT_MODE", "recover")
+        .output()
+        .unwrap();
+    assert_eq!(recover.status.code(), Some(0));
+}

@@ -1,0 +1,15 @@
+{
+  "schemaVersion": 2,
+  "ownerId": "primary",
+  "sessionId": "a8b8bc1b-301c-48c3-8c16-25a1ef7cf847",
+  "workspaceDigest": "733f32716995e42444d17ae81608ed96f77bbf09dfbfa84fb1db26d4cbfecaec",
+  "requestId": "create-original-request",
+  "payloadHash": "e470eaa37bea6bb96c1b0889d59002197da073ca09a85c844bb7acaf912653dd",
+  "runId": null,
+  "tool": "ptah_create_work",
+  "response": null,
+  "error": null,
+  "createdAt": "2026-10-25T14:08:02.708509267Z",
+  "status": "pending",
+  "cleanupPlanDigest": ""
+}

@@ -14,6 +14,7 @@ use grokptah_agent_bridge::{
     McpControlClient, SessionKind, DURABLE_WRITE_FAULT,
 };
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 const BEARER: &str = "synthetic-work-creation-v2";
@@ -673,25 +674,66 @@ fn substituted_both_digests_with_untouched_receipt_refuses_recovery() {
 }
 
 #[test]
-fn legacy_schema2_creation_intent_without_request_digest_reopens() {
-    let root = tempfile::tempdir().unwrap();
-    assert_exit(&child(root.path(), "create", "lifecycle_after_intent"), 86);
-    let path = intent_paths(root.path()).remove(0);
-    let mut intent = read_json(&path);
-    intent
-        .as_object_mut()
+fn legacy_schema2_585_producer_cut_reopens_on_candidate() {
+    let bundle = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/wr-v2-585-schema2-creation-cut-25d40262");
+    assert!(
+        bundle.join("PRODUCER_SHA").is_file(),
+        "missing #585 producer bundle at {}; run scripts/produce_585_creation_cut.sh",
+        bundle.display()
+    );
+    let producer_sha = std::fs::read_to_string(bundle.join("PRODUCER_SHA"))
         .unwrap()
-        .remove("creationRequestDigest");
-    write_json(&path, &intent);
+        .trim()
+        .to_string();
+    assert_eq!(
+        producer_sha.as_str(),
+        "25d40262a3b530227af850f26974c19dfc2935fd",
+        "producer bundle must be from exact #585 base"
+    );
+    let root = tempfile::tempdir().unwrap();
+    common::copy_dir_all(&bundle.join("ledger-tree"), &root.path().join("ledger")).unwrap();
+    common::copy_dir_all(&bundle.join("home-tree"), &root.path().join("home")).unwrap();
+    std::fs::copy(
+        bundle.join("fixture.json"),
+        root.path().join("fixture.json"),
+    )
+    .unwrap();
+    let intent = read_json(intent_paths(root.path()).first().expect("intent"));
+    assert!(
+        intent.get("creationRequestDigest").is_none(),
+        "real #585 cuts do not carry creationRequestDigest"
+    );
+    let receipt_file = receipt_path(root.path());
+    let receipt = read_json(&receipt_file);
+    let expected_sha = expected_receipt_sha256(&bundle);
+    let actual = sha256_file(&receipt_file);
+    assert_eq!(actual, expected_sha, "receipt bytes must match preserved artifact");
     for reopen in 0..3 {
         assert_exit(&child(root.path(), "replay", ""), 0);
         let outcome = read_json(root.path().join("outcome.json"));
         assert!(
             outcome.get("response").is_some(),
-            "legacy schema-2 reopen {reopen}: {outcome}"
+            "legacy #585 reopen {reopen}: {outcome}"
         );
-        assert_eq!(read_json(receipt_path(root.path()))["status"], "complete");
+        let settled = read_json(receipt_path(root.path()));
+        assert_eq!(settled["status"], "complete");
+        assert_eq!(settled["payloadHash"], receipt["payloadHash"]);
+        assert_eq!(settled["requestId"], receipt["requestId"]);
     }
+}
+
+fn expected_receipt_sha256(bundle: &Path) -> String {
+    std::fs::read_to_string(bundle.join("receipt.sha256"))
+        .unwrap()
+        .split_whitespace()
+        .next()
+        .unwrap()
+        .to_string()
+}
+
+fn sha256_file(path: &Path) -> String {
+    format!("{:x}", Sha256::digest(std::fs::read(path).unwrap()))
 }
 
 #[test]
