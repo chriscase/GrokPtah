@@ -1529,18 +1529,26 @@ pub struct DurableWriteFault {
     pub skips_remaining: u32,
 }
 
+#[cfg(debug_assertions)]
 pub static DURABLE_WRITE_FAULT: std::sync::Mutex<Option<DurableWriteFault>> =
     std::sync::Mutex::new(None);
 
-/// Test-only switch that makes the next message-prune removal fail closed.
+/// Debug-only switch that makes the next message-prune removal fail closed.
+#[cfg(debug_assertions)]
 pub static PRUNE_REMOVE_FAULT: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
 pub(crate) fn prune_remove_fault_armed() -> bool {
+    if !cfg!(debug_assertions) {
+        return false;
+    }
     PRUNE_REMOVE_FAULT.load(std::sync::atomic::Ordering::SeqCst)
 }
 
 pub(crate) fn fail_durable_write_if_armed(path: &std::path::Path) -> anyhow::Result<()> {
+    if !cfg!(debug_assertions) {
+        return Ok(());
+    }
     let mut guard = DURABLE_WRITE_FAULT
         .lock()
         .unwrap_or_else(|error| error.into_inner());

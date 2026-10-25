@@ -207,7 +207,26 @@ async fn creation_races_and_refusals_preserve_request_scope_and_original_outcome
             .unwrap(),
         aliased
     );
-    assert_eq!(store.list_work_items().unwrap().len(), 6);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::symlink;
+        let symlink_lane = root.path().join("symlink-lane");
+        symlink(&first, &symlink_lane).unwrap();
+        let symlinked = create(&orch, &auth, a, &symlink_lane, "symlink-alias", "symlink")
+            .await
+            .unwrap();
+        assert_eq!(symlinked["work"]["workspace"], first.display().to_string());
+        assert_eq!(
+            create(&orch, &auth, a, &symlink_lane, "symlink-alias", "symlink")
+                .await
+                .unwrap(),
+            symlinked
+        );
+    }
+    assert_eq!(
+        store.list_work_items().unwrap().len(),
+        if cfg!(unix) { 7 } else { 6 }
+    );
     assert!(store.list_work_attempts(None).unwrap().is_empty());
     let stopped = orch.stop_background_tasks().await;
     assert!(stopped.fully_stopped && stopped.errors.is_empty());

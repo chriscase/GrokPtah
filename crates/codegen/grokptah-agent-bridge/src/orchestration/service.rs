@@ -6009,7 +6009,7 @@ impl OrchestrationService {
             expected_revision,
             |intents| {
                 for intent in intents {
-                    self.cancel_managed_grok_authority(intent)?;
+                    self.revoke_managed_grok_credentials(intent)?;
                 }
                 Ok(())
             },
@@ -6020,6 +6020,14 @@ impl OrchestrationService {
                 return Err(self.fail_claim(&mut lease, None, session_id, &claimed, error))
             }
         };
+        for intent in self
+            .store
+            .list_managed_intents()?
+            .into_iter()
+            .filter(|intent| intent.work_id == work_id && intent.grok.is_some())
+        {
+            self.stop_managed_grok_task(&intent);
+        }
         let attempts = attempts
             .iter()
             .map(WorkAttemptView::from)
@@ -6039,13 +6047,10 @@ impl OrchestrationService {
         Ok(response)
     }
 
-    fn cancel_managed_grok_authority(
+    fn revoke_managed_grok_credentials(
         &self,
         intent: &ManagedExecutionIntent,
     ) -> Result<(), OrchError> {
-        if let Some(task) = self.managed_grok_tasks.lock().get(&intent.intent_id) {
-            task.cancel.cancel();
-        }
         if let Some(id) = intent
             .grok
             .as_ref()
@@ -6064,6 +6069,21 @@ impl OrchestrationService {
                 }
             }
         }
+        Ok(())
+    }
+
+    fn stop_managed_grok_task(&self, intent: &ManagedExecutionIntent) {
+        if let Some(task) = self.managed_grok_tasks.lock().get(&intent.intent_id) {
+            task.cancel.cancel();
+        }
+    }
+
+    fn cancel_managed_grok_authority(
+        &self,
+        intent: &ManagedExecutionIntent,
+    ) -> Result<(), OrchError> {
+        self.revoke_managed_grok_credentials(intent)?;
+        self.stop_managed_grok_task(intent);
         Ok(())
     }
 

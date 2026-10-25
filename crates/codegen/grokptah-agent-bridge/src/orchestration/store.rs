@@ -1194,6 +1194,8 @@ struct WorkLifecycleIntent {
     item: WorkItem,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     creation_item_digest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    creation_request_digest: Option<String>,
     prior_attempts: Vec<WorkAttempt>,
     attempts: Vec<WorkAttempt>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1515,6 +1517,7 @@ impl WorkLifecycleIntent {
             prior_item: Some(prior_item),
             item,
             creation_item_digest: None,
+            creation_request_digest: None,
             prior_attempts,
             attempts,
             request: None,
@@ -2881,6 +2884,7 @@ impl OrchStore {
             prior_item: None,
             item: item.clone(),
             creation_item_digest: Some(Self::work_digest(item)?),
+            creation_request_digest: Some(Self::creation_request_payload_hash(&request, item)?),
             prior_attempts: Vec::new(),
             attempts: Vec::new(),
             request: Some(request),
@@ -3941,6 +3945,9 @@ impl OrchStore {
         let payload = serde_json::json!({
             "sessionId": request.session_id,
             "workspace": request.payload_workspace_for_hash(),
+            "workId": item.work_id,
+            "createdBy": item.created_by,
+            "createdAt": item.created_at,
             "kind": item.kind,
             "objective": item.objective,
             "priority": item.priority,
@@ -4140,7 +4147,19 @@ impl OrchStore {
             .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
         if intent.prior_item.is_none() {
             let request = intent.request.as_ref().expect("validated creation request");
-            if Self::creation_request_payload_hash(request, &intent.item)? != request.payload_hash {
+            let sealed_request_digest = Self::creation_request_payload_hash(request, &intent.item)?;
+            if intent
+                .creation_request_digest
+                .as_deref()
+                .is_some_and(|digest| digest != sealed_request_digest)
+            {
+                return Err(related_creation_conflict(
+                    "creation request digest does not match sealed work inputs",
+                ));
+            }
+            if intent.creation_request_digest.is_none()
+                && sealed_request_digest != request.payload_hash
+            {
                 return Err(related_creation_conflict(
                     "creation receipt does not match sealed work inputs",
                 ));
@@ -5358,7 +5377,8 @@ impl OrchStore {
         }
         for activation in activations.into_iter().skip(MAX_ACTIVATION_HISTORY) {
             let path = self.routine_activation_path(routine_id, &activation.activation_id)?;
-            let _ = remove_file_durable(&self.lease(), &path);
+            remove_file_durable(&self.lease(), &path)
+                .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
         }
         // Dedupe receipts outlive activation history so a late replay cannot
         // mint a second Work item after the inspectable history window.
@@ -8210,6 +8230,9 @@ impl OrchStore {
     }
 
     fn should_finalize_post_commit_prune_seal() -> bool {
+        if !cfg!(debug_assertions) {
+            return false;
+        }
         matches!(
             std::env::var("MANAGER_MUTATION_PHASE"),
             Ok(phase) if phase == "replay" || phase.starts_with("reopen")
@@ -11372,6 +11395,20 @@ impl OrchStore {
             .into_iter()
             .filter(|intent| intent.work_id == work_id && intent.grok.is_some())
             .collect::<Vec<_>>();
+        let fresh = self
+            .load_work_item_unlocked(work_id)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
+            .ok_or_else(|| OrchError::new(OrchErrorCode::Conflict, "work item not found"))?;
+        if fresh.revision != revision_fence {
+            return Err(OrchError::new(
+                OrchErrorCode::StaleVersion,
+                format!(
+                    "work item revision is {}, expected {}",
+                    fresh.revision, revision_fence
+                ),
+            ));
+        }
+        Self::require_work_revision(&fresh, expected_revision)?;
         pre_commit(&managed_intents)?;
         let fresh = self
             .load_work_item_unlocked(work_id)

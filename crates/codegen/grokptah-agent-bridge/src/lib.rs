@@ -246,9 +246,11 @@ pub use verified_change::{
     write_check_authority, CandidateVerification, CheckAuthority, DurableWriteFault,
     ReadinessInput, RequiredCheckCwd, RequiredCheckEnv, RequiredCheckSpec, VerifiedChangeError,
     VerifiedChangeReadiness, VerifiedExecutionEnvelopeV1, ADMISSION_FAULT, APPLY_FAULT,
-    BEFORE_CANDIDATE_BIND, CHECK_CONFINEMENT_EXECUTABLE, CLEANUP_FAULT, DURABLE_WRITE_FAULT,
-    PRUNE_REMOVE_FAULT, RECEIPT_TREE_SCANS, SKIP_VERIFIED_DRIVE,
+    BEFORE_CANDIDATE_BIND, CHECK_CONFINEMENT_EXECUTABLE, CLEANUP_FAULT, RECEIPT_TREE_SCANS,
+    SKIP_VERIFIED_DRIVE,
 };
+#[cfg(debug_assertions)]
+pub use verified_change::{DURABLE_WRITE_FAULT, PRUNE_REMOVE_FAULT};
 
 /// Crate version string for about / diagnostics.
 pub const BRIDGE_VERSION: &str = env!("CARGO_PKG_VERSION");

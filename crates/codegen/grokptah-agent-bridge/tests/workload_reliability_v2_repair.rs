@@ -1,7 +1,7 @@
 //! Targeted repairs for workload reliability v2 draft #585.
 mod common;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Barrier, Mutex};
 
@@ -25,6 +25,24 @@ use uuid::Uuid;
 
 const TOKEN: &str = "wr-v2-585-repair";
 const MAX_RETAINED_MESSAGES: usize = 500;
+
+fn idempotency_receipt_status(ledger: &Path, request_id: &str) -> String {
+    for entry in walkdir::WalkDir::new(ledger.join("idempotency"))
+        .into_iter()
+        .filter_map(Result::ok)
+    {
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+            continue;
+        }
+        let value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        if value["requestId"] == request_id {
+            return value["status"].as_str().unwrap().to_string();
+        }
+    }
+    panic!("idempotency receipt {request_id} not found under {ledger:?}");
+}
 
 fn write_json(path: impl AsRef<std::path::Path>, value: &serde_json::Value) {
     std::fs::write(path, serde_json::to_vec_pretty(value).unwrap()).unwrap();
@@ -140,22 +158,10 @@ async fn managed_cancel_fixture() -> (
     let lease_id = "managed-cancel-lease";
     let revoke_count = Arc::new(AtomicU32::new(0));
     let receipt_status_at_revoke = Arc::new(Mutex::new(None));
-    let receipt_reader = {
-        let store = store.clone();
-        let scope = grokptah_agent_bridge::orchestration::IdempotencyScope::new(
-            &auth.owner_id,
-            session,
-            &workspace,
-        )
-        .unwrap();
-        Arc::new(move || {
-            store
-                .load_idempotency(&scope, "cancel-managed")
-                .unwrap()
-                .unwrap()
-                .status
-        }) as Arc<dyn Fn() -> String + Send + Sync>
-    };
+    let ledger_root = store.root().to_path_buf();
+    let receipt_reader =
+        Arc::new(move || idempotency_receipt_status(&ledger_root, "cancel-managed"))
+            as Arc<dyn Fn() -> String + Send + Sync>;
     orch.configure_managed_grok_executor(
         ManagedGrokExecutorConfig {
             executable: PathBuf::from("/bin/true"),
@@ -519,4 +525,134 @@ async fn concurrent_cancel_revision_fence_blocks_stale_side_effects() {
         WorkState::Queued
     );
     let _ = root;
+}
+
+struct FailRevokeResolver {
+    revoke_count: Arc<AtomicU32>,
+}
+
+impl CredentialLeaseResolver for FailRevokeResolver {
+    fn resolve(&self, lease_id: &str) -> Result<CredentialLeaseHandle, GrokBuildAdapterError> {
+        let _ = lease_id;
+        Err(GrokBuildAdapterError::CredentialLease)
+    }
+
+    fn revoke(&self, lease_id: &str) -> Result<(), GrokBuildAdapterError> {
+        let _ = lease_id;
+        self.revoke_count.fetch_add(1, Ordering::SeqCst);
+        Err(GrokBuildAdapterError::CredentialLease)
+    }
+
+    fn provider_evidence(&self, lease_id: &str) -> Option<ManagedProviderEvidence> {
+        let _ = lease_id;
+        Some(ManagedProviderEvidence {
+            mechanism: "test-revoke-fail".into(),
+            model: "grok-build-0.1".into(),
+            requests_reserved: 1,
+            wire_attempts: 0,
+            responses_completed: 0,
+            denied_requests: 0,
+            tool_calls: 0,
+            input_tokens: 0,
+            output_tokens: 0,
+            usage_observed: false,
+            accounting_complete: false,
+            uncertain: false,
+            revoked: false,
+            authority_attempts: Vec::new(),
+            ..Default::default()
+        })
+    }
+}
+
+#[tokio::test]
+async fn cancel_revoke_conflict_leaves_work_active_and_retryable_receipt() {
+    let (
+        _root,
+        _runtime,
+        orch,
+        store,
+        auth,
+        session,
+        workspace,
+        work_id,
+        revoke_count,
+        _receipt_status,
+    ) = managed_cancel_fixture().await;
+    orch.configure_managed_grok_executor(
+        ManagedGrokExecutorConfig {
+            executable: PathBuf::from("/bin/true"),
+            git_executable: PathBuf::from("/usr/bin/git"),
+            cwd: workspace.clone(),
+            isolate_parent: _root.path().join("isolate"),
+            repository_id: "repo-wr-v2-repair".into(),
+            base_ref: "refs/heads/main".into(),
+            identity: GrokBuildGitIdentity {
+                repository_id: "repo-wr-v2-repair".into(),
+                git_ref: "refs/heads/main".into(),
+                base_sha: "0000000000000000000000000000000000000001".into(),
+                head_sha: "0000000000000000000000000000000000000001".into(),
+            },
+            credential_lease_id: "managed-cancel-lease".into(),
+        },
+        Arc::new(FailRevokeResolver {
+            revoke_count: revoke_count.clone(),
+        }),
+    )
+    .unwrap();
+    let revision = store.load_work_item(&work_id).unwrap().unwrap().revision;
+    let error = orch
+        .cancel_work(
+            &auth,
+            "cancel-revoke-conflict",
+            session,
+            &workspace,
+            &work_id,
+            "revoke refused".into(),
+            Some(revision),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, OrchErrorCode::Conflict);
+    assert_eq!(revoke_count.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        store.load_work_item(&work_id).unwrap().unwrap().state,
+        WorkState::Queued
+    );
+    let scope = grokptah_agent_bridge::orchestration::IdempotencyScope::new(
+        &auth.owner_id,
+        session,
+        &workspace,
+    )
+    .unwrap();
+    let receipt = store
+        .load_idempotency(&scope, "cancel-revoke-conflict")
+        .unwrap()
+        .unwrap();
+    assert_eq!(receipt.status, "failed");
+    assert_eq!(
+        receipt.error.as_ref().map(|e| e.code.clone()),
+        Some(OrchErrorCode::Conflict)
+    );
+    let retry = orch
+        .cancel_work(
+            &auth,
+            "cancel-revoke-conflict",
+            session,
+            &workspace,
+            &work_id,
+            "revoke refused".into(),
+            Some(revision),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(retry.code, OrchErrorCode::Conflict);
+    assert_eq!(
+        store
+            .load_idempotency(&scope, "cancel-revoke-conflict")
+            .unwrap()
+            .unwrap()
+            .status,
+        "failed"
+    );
 }
