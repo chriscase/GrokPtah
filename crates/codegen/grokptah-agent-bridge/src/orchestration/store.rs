@@ -13254,11 +13254,12 @@ impl OrchStore {
         for receipt_path in owner_receipt_files(&owner_dir)
             .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
         {
-            let receipt: IdempotencyReceipt = serde_json::from_str(
-                &fs::read_to_string(&receipt_path)
-                    .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?,
-            )
-            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+            let Ok(text) = fs::read_to_string(&receipt_path) else {
+                continue;
+            };
+            let Ok(receipt) = serde_json::from_str::<IdempotencyReceipt>(&text) else {
+                continue;
+            };
             if receipt.owner_id != scope.owner_id
                 || receipt.session_id != scope.session_id
                 || receipt.request_id != request_id
@@ -13376,11 +13377,12 @@ impl OrchStore {
         for receipt_path in owner_receipt_files(&owner_dir)
             .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
         {
-            let receipt: IdempotencyReceipt = serde_json::from_str(
-                &fs::read_to_string(&receipt_path)
-                    .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?,
-            )
-            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+            let Ok(text) = fs::read_to_string(&receipt_path) else {
+                continue;
+            };
+            let Ok(receipt) = serde_json::from_str::<IdempotencyReceipt>(&text) else {
+                continue;
+            };
             if receipt.owner_id != scope.owner_id
                 || receipt.session_id != scope.session_id
                 || receipt.request_id != request_id
