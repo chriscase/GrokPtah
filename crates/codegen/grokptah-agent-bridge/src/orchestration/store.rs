@@ -3601,10 +3601,6 @@ impl OrchStore {
                 &write.item,
             )?;
             if write.prior.is_none()
-                && self.related_record_matches_unlocked(
-                    &self.work_item_path(&write.item.work_id)?,
-                    &write.item,
-                )?
                 && (!self
                     .list_work_attempts_unlocked(Some(&write.item.work_id))
                     .map_err(Self::orch_error_from_anyhow)?
@@ -3631,21 +3627,16 @@ impl OrchStore {
                 write.prior.as_ref(),
                 &write.message,
             )?;
-            if self.related_record_matches_unlocked(
-                &self.message_path(&write.message.message_id)?,
-                &write.message,
-            )? {
-                self.require_optional_agent_in_scope_unlocked(
-                    write.message.from_agent_id.as_deref(),
-                    write.message.session_id,
-                    &write.message.workspace,
-                )?;
-                self.require_optional_agent_in_scope_unlocked(
-                    write.message.to_agent_id.as_deref(),
-                    write.message.session_id,
-                    &write.message.workspace,
-                )?;
-            }
+            self.require_optional_agent_in_scope_unlocked(
+                write.message.from_agent_id.as_deref(),
+                write.message.session_id,
+                &write.message.workspace,
+            )?;
+            self.require_optional_agent_in_scope_unlocked(
+                write.message.to_agent_id.as_deref(),
+                write.message.session_id,
+                &write.message.workspace,
+            )?;
         }
         if let Some(sequence) = &intent.sequence {
             let current = self.read_manager_sequence_unlocked()?;

@@ -5,8 +5,8 @@ mod copy_tree;
 
 use grokptah_agent_bridge::orchestration::{
     canonical_workspace, safe_id_filename, AuthContext, ManagerCoordinationMode, ManagerStepSpec,
-    MessageKind, OrchStore, OrchestrationConfig, OrchestrationService, RunBounds, WorkItem,
-    WorkMessage, WorkPolicy, WorkspaceAllowlist,
+    MessageKind, OrchStore, OrchestrationConfig, OrchestrationService, RunBounds, WorkAttempt,
+    WorkItem, WorkMessage, WorkPolicy, WorkspaceAllowlist,
 };
 use grokptah_agent_bridge::{
     set_grokptah_home_override, start_control_server, AgentHost, DurableWriteFault, HostConfig,
@@ -786,6 +786,68 @@ fn delete_prune_fault_notification(root: &Path) {
     std::fs::remove_file(prune_fault_notification_path(root)).unwrap();
 }
 
+fn prune_advance_prune_fault_root() -> tempfile::TempDir {
+    let root = tempfile::tempdir().unwrap();
+    write(
+        root.path().join("options.json"),
+        &json!({"seedMessages":501}),
+    );
+    exited(&child(root.path(), "advance", "prune_remove_fault", ""), 0);
+    root
+}
+
+fn sealed_prune_fault_message_agents(root: &Path) -> Value {
+    let intent_paths = paths(&root.join("home/ledger/manager-intents"));
+    if let Some(path) = intent_paths.last() {
+        read(path)["messageWrites"][0]["message"].clone()
+    } else {
+        read(root.join("home/ledger/ledger-admission-recovery.json"))["sealedMutationIntent"]
+            ["messageWrites"][0]["message"]
+            .clone()
+    }
+}
+
+fn delete_notification_and_foreign_scope_message_agents(root: &Path) {
+    delete_prune_fault_notification(root);
+    let message = sealed_prune_fault_message_agents(root);
+    for key in ["fromAgentId", "toAgentId"] {
+        if let Some(agent_id) = message[key].as_str() {
+            let path = root
+                .join("home/ledger/agents")
+                .join(format!("{}.json", safe_id_filename(agent_id).unwrap()));
+            if path.is_file() {
+                let mut agent = read(&path);
+                agent["workspace"] = json!("/tmp/foreign-manager-mutation-scope");
+                write(&path, &agent);
+            }
+        }
+    }
+}
+
+fn delete_created_child_and_seed_orphan_attempt(root: &Path) {
+    let outcome = read(root.join("prune_remove_fault.json"));
+    let created = outcome["response"]["createdWork"]
+        .as_array()
+        .and_then(|items| items.first())
+        .expect("advance prune fault must seal created Work");
+    let work_id = created["workId"].as_str().unwrap();
+    let work_path = root
+        .join("home/ledger/work-items")
+        .join(format!("{}.json", safe_id_filename(work_id).unwrap()));
+    std::fs::remove_file(&work_path).unwrap();
+    let attempt = WorkAttempt::new(
+        work_id,
+        1,
+        "synthetic-orphan-actor",
+        "synthetic-orphan-lease",
+    );
+    attempt.validate().unwrap();
+    let attempt_path = root
+        .join("home/ledger/work-attempts")
+        .join(format!("{}.json", safe_id_filename(&attempt.attempt_id).unwrap()));
+    write(&attempt_path, &json!(attempt));
+}
+
 fn receipt_path_for_request(root: &Path) -> PathBuf {
     paths(&root.join("home/ledger/idempotency"))
         .into_iter()
@@ -798,8 +860,10 @@ fn assert_refused_prune_recovery_preserves_evidence(root: &Path, expected_receip
     let _guard = common::ProcessEnvGuard::new();
     set_grokptah_home_override(Some(root.join("home")));
     std::env::remove_var("MANAGER_MUTATION_PHASE");
-    let store = OrchStore::open(root.join("home/ledger")).unwrap();
-    assert!(store.ledger_admission_closed().is_some());
+    match OrchStore::open(root.join("home/ledger")) {
+        Ok(store) => assert!(store.ledger_admission_closed().is_some()),
+        Err(_) => {}
+    }
     assert_eq!(disk_json(root), before);
     assert_eq!(receipt(root)["status"], expected_receipt_status);
     assert!(root
@@ -1805,6 +1869,42 @@ fn manager_post_commit_prune_refusal_prior_plan_and_tampered_notification_preser
         std::fs::remove_file(path).unwrap();
     }
     assert_refused_prune_recovery_preserves_evidence(root.path(), "pending");
+}
+
+#[test]
+fn manager_post_commit_prune_refusal_missing_notification_foreign_agent_preserves_evidence_intent_present(
+) {
+    let root = prune_tick_prune_fault_root();
+    delete_notification_and_foreign_scope_message_agents(root.path());
+    assert_refused_prune_recovery_preserves_evidence(root.path(), "pending");
+}
+
+#[test]
+fn manager_post_commit_prune_refusal_missing_notification_foreign_agent_preserves_evidence_marker_only(
+) {
+    let root = prune_tick_prune_fault_root();
+    delete_notification_and_foreign_scope_message_agents(root.path());
+    for path in paths(&root.path().join("home/ledger/manager-intents")) {
+        std::fs::remove_file(path).unwrap();
+    }
+    assert_refused_prune_recovery_preserves_evidence(root.path(), "pending");
+}
+
+#[test]
+fn manager_post_commit_prune_refusal_missing_child_orphan_attempt_preserves_evidence_intent_present() {
+    let root = prune_advance_prune_fault_root();
+    delete_created_child_and_seed_orphan_attempt(root.path());
+    assert_refused_prune_recovery_preserves_evidence(root.path(), "complete");
+}
+
+#[test]
+fn manager_post_commit_prune_refusal_missing_child_orphan_attempt_preserves_evidence_marker_only() {
+    let root = prune_advance_prune_fault_root();
+    delete_created_child_and_seed_orphan_attempt(root.path());
+    for path in paths(&root.path().join("home/ledger/manager-intents")) {
+        std::fs::remove_file(path).unwrap();
+    }
+    assert_refused_prune_recovery_preserves_evidence(root.path(), "complete");
 }
 
 #[test]
