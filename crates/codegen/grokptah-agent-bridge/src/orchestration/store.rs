@@ -1083,6 +1083,9 @@ pub struct WorkRequestBinding {
     pub session_id: Uuid,
     pub workspace_digest: String,
     pub workspace_display: String,
+    /// Workspace spelling from the authenticated request payload used for hashing.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub payload_workspace: String,
     pub payload_hash: String,
     /// `work_attempt`, `work_attempts`, `work_scope`, `decision`, `decision_scope`,
     /// `claim`, `lease_view`, or `unblock`.
@@ -1118,11 +1121,20 @@ impl WorkRequestBinding {
             session_id: scope.session_id,
             workspace_digest: scope.workspace_digest.clone(),
             workspace_display: workspace_display.into(),
+            payload_workspace: String::new(),
             payload_hash: payload_hash.into(),
             shape: shape.into(),
             target_work_id: None,
             target_attempt_id: None,
             expected_revision: None,
+        }
+    }
+
+    fn payload_workspace_for_hash(&self) -> &str {
+        if self.payload_workspace.is_empty() {
+            self.workspace_display.as_str()
+        } else {
+            self.payload_workspace.as_str()
         }
     }
 }
@@ -3894,7 +3906,7 @@ impl OrchStore {
     ) -> Result<String, OrchError> {
         let payload = serde_json::json!({
             "sessionId": request.session_id,
-            "workspace": request.workspace_display,
+            "workspace": request.payload_workspace_for_hash(),
             "kind": item.kind,
             "objective": item.objective,
             "priority": item.priority,
@@ -6705,7 +6717,7 @@ impl OrchStore {
         let path = self.message_path(&message.message_id)?;
         atomic_write_json(&self.lease(), &path, &message)
             .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
-        self.prune_messages_unlocked()?;
+        let _ = self.prune_messages_unlocked();
         Ok(message.clone())
     }
 
@@ -8173,6 +8185,7 @@ impl OrchStore {
         match intent.request.as_ref().map(|request| request.tool.as_str()) {
             Some("ptah_apply_verified_change") => false,
             Some("ptah_discard_verified_change") => intent.operation == "discard-candidate",
+            Some("ptah_cancel_work") => false,
             _ => true,
         }
     }
