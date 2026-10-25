@@ -3986,10 +3986,18 @@ impl OrchestrationService {
         let scope = IdempotencyScope::new(&auth.owner_id, session_id, workspace)?;
         let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
         loop {
-            match self
-                .store
-                .claim_idempotency(&scope, tool, request_id, payload_hash)
-            {
+            match self.store.claim_idempotency(
+                &scope,
+                tool,
+                request_id,
+                payload_hash,
+                Some(workspace.to_str().ok_or_else(|| {
+                    OrchError::new(
+                        OrchErrorCode::InvalidRequest,
+                        "workspace must be valid UTF-8",
+                    )
+                })?),
+            ) {
                 Ok(IdempotencyClaim::Perform) => {
                     return Ok(IdempotencyStart::Perform(IdempotencyLease {
                         store: self.store.clone(),

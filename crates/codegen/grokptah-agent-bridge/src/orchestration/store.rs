@@ -262,13 +262,11 @@ impl RelatedCreationRequest {
             || binding.target_attempt_id.is_some()
             || binding.expected_revision.is_some()
             || binding.session_id != session
-            || binding.workspace_display != workspace
+            || !workspaces_match(&binding.workspace_display, workspace)
             || self.payload["sessionId"] != serde_json::json!(session)
             || !bound_request_workspace_matches(binding, workspace)
             || !workspaces_match(input_workspace, workspace)
-            || IdempotencyScope::new(&binding.owner_id, session, Path::new(workspace))?
-                .workspace_digest
-                != binding.workspace_digest
+            || !idempotency_binding_matches_workspace(binding, session, workspace)?
             || super::types::hash_payload(&self.payload) != self.payload_digest
             || (tool == "ptah_create_manager_plan" && self.payload_digest != binding.payload_hash)
             || self.actor.is_empty()
@@ -12938,6 +12936,65 @@ impl OrchStore {
         Ok(receipts)
     }
 
+    fn idempotency_receipt_path_via_bound_workspace_alias_unlocked(
+        &self,
+        scope: &IdempotencyScope,
+        tool: &str,
+        request_id: &str,
+        payload_hash: &str,
+        claimed_canonical_workspace: &str,
+    ) -> Result<Option<(PathBuf, IdempotencyScope)>, OrchError> {
+        let dir = self.inner.root.join("work-lifecycle-intents");
+        if !dir.is_dir() {
+            return Ok(None);
+        }
+        for entry in fs::read_dir(&dir)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
+        {
+            let path = entry
+                .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
+                .path();
+            if path.extension().and_then(|value| value.to_str()) != Some("json") {
+                continue;
+            }
+            let intent: WorkLifecycleIntent = serde_json::from_str(
+                &fs::read_to_string(&path)
+                    .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?,
+            )
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+            if intent.validate().is_err() || intent.operation != "create" {
+                continue;
+            }
+            let Some(request) = intent.request.as_ref() else {
+                continue;
+            };
+            if request.owner_id != scope.owner_id
+                || request.session_id != scope.session_id
+                || request.request_id != request_id
+                || request.tool != tool
+                || request.payload_hash != payload_hash
+            {
+                continue;
+            }
+            if !workspaces_match(&request.workspace_display, claimed_canonical_workspace) {
+                continue;
+            }
+            let bound_scope = IdempotencyScope::new(
+                &request.owner_id,
+                request.session_id,
+                Path::new(&request.workspace_display),
+            )?;
+            if bound_scope.workspace_digest == scope.workspace_digest {
+                continue;
+            }
+            let receipt_path = self.idemp_path(&bound_scope, request_id)?;
+            if receipt_path.is_file() {
+                return Ok(Some((receipt_path, bound_scope)));
+            }
+        }
+        Ok(None)
+    }
+
     /// Atomically claim a request_id for mutation.
     /// - Existing complete receipt with same hash → `Replay(response)`
     /// - Existing complete receipt with different hash → Conflict
@@ -12949,10 +13006,27 @@ impl OrchStore {
         tool: &str,
         request_id: &str,
         payload_hash: &str,
+        claimed_canonical_workspace: Option<&str>,
     ) -> Result<IdempotencyClaim, OrchError> {
-        let path = self.idemp_path(scope, request_id)?;
         let _g = self.inner.lock.lock();
         self.adopt_legacy_owner_receipt_unlocked(scope, request_id, Some((tool, payload_hash)))?;
+        let primary = self.idemp_path(scope, request_id)?;
+        let (path, alias_scope) = if primary.is_file() {
+            (primary, None)
+        } else if let Some(claimed) = claimed_canonical_workspace {
+            match self.idempotency_receipt_path_via_bound_workspace_alias_unlocked(
+                scope,
+                tool,
+                request_id,
+                payload_hash,
+                claimed,
+            )? {
+                Some((alias_path, bound_scope)) => (alias_path, Some(bound_scope)),
+                None => (primary, None),
+            }
+        } else {
+            (primary, None)
+        };
         // Count, compact, and claim under one critical section so concurrent
         // callers cannot discard more terminal evidence than the one slot
         // needed for the winning claim.
@@ -12979,7 +13053,11 @@ impl OrchStore {
                 .map_err(|e| OrchError::new(OrchErrorCode::Internal, e.to_string()))?;
             let prev: IdempotencyReceipt = serde_json::from_str(&text)
                 .map_err(|e| OrchError::new(OrchErrorCode::Internal, e.to_string()))?;
-            if !prev.is_in_scope(scope)
+            let in_scope = prev.is_in_scope(scope)
+                || alias_scope
+                    .as_ref()
+                    .is_some_and(|bound| prev.is_in_scope(bound));
+            if !in_scope
                 || prev.request_id != request_id
                 || prev.tool != tool
                 || prev.payload_hash != payload_hash
@@ -13646,6 +13724,38 @@ pub(crate) fn workspaces_match(left: &str, right: &str) -> bool {
         (Ok(left), Ok(right)) => left == right,
         _ => false,
     }
+}
+
+pub(crate) fn idempotency_workspace_digest_for_path(
+    owner_id: &str,
+    session_id: Uuid,
+    workspace: &str,
+) -> Result<String, OrchError> {
+    Ok(IdempotencyScope::new(owner_id, session_id, Path::new(workspace))?.workspace_digest)
+}
+
+/// True when `workspace` names the same v2 receipt shard as the sealed binding,
+/// including producer-bound displays that canonicalize differently on this host.
+pub(crate) fn idempotency_binding_matches_workspace(
+    binding: &WorkRequestBinding,
+    session_id: Uuid,
+    workspace: &str,
+) -> Result<bool, OrchError> {
+    if idempotency_workspace_digest_for_path(&binding.owner_id, session_id, workspace)?
+        == binding.workspace_digest
+    {
+        return Ok(true);
+    }
+    if workspaces_match(&binding.workspace_display, workspace)
+        && idempotency_workspace_digest_for_path(
+            &binding.owner_id,
+            session_id,
+            &binding.workspace_display,
+        )? == binding.workspace_digest
+    {
+        return Ok(true);
+    }
+    Ok(false)
 }
 
 fn owner_receipt_files(owner_dir: &Path) -> anyhow::Result<Vec<PathBuf>> {
@@ -15056,11 +15166,44 @@ mod tests {
     }
 
     #[test]
+    fn idempotency_tmp_and_private_tmp_project_use_independent_receipt_shards() {
+        let session = Uuid::nil();
+        let tmp_scope =
+            IdempotencyScope::new("owner-a", session, Path::new("/tmp/project")).unwrap();
+        let private_scope =
+            IdempotencyScope::new("owner-a", session, Path::new("/private/tmp/project")).unwrap();
+        assert_ne!(tmp_scope.workspace_digest, private_scope.workspace_digest);
+        assert!(!workspaces_match("/tmp/project", "/private/tmp/project"));
+
+        let dir = tempdir().unwrap();
+        let store = OrchStore::open(dir.path()).unwrap();
+        assert!(matches!(
+            store
+                .claim_idempotency(&tmp_scope, "tool", "shared-request", "hash", None)
+                .unwrap(),
+            IdempotencyClaim::Perform
+        ));
+        assert!(matches!(
+            store
+                .claim_idempotency(&private_scope, "tool", "shared-request", "hash", None)
+                .unwrap(),
+            IdempotencyClaim::Perform
+        ));
+        assert_ne!(
+            store.idemp_path(&tmp_scope, "shared-request").unwrap(),
+            store.idemp_path(&private_scope, "shared-request").unwrap(),
+        );
+    }
+
+    #[test]
     fn idempotency_claim_exclusive() {
         let d = tempdir().unwrap();
         let store = OrchStore::open(d.path()).unwrap();
         let scope = receipt_scope(d.path());
-        match store.claim_idempotency(&scope, "t", "req", "h").unwrap() {
+        match store
+            .claim_idempotency(&scope, "t", "req", "h", None)
+            .unwrap()
+        {
             IdempotencyClaim::Perform => {}
             _ => panic!("first claim should perform"),
         }
@@ -15074,12 +15217,15 @@ mod tests {
                 serde_json::json!({"ok": true}),
             )
             .unwrap();
-        match store.claim_idempotency(&scope, "t", "req", "h").unwrap() {
+        match store
+            .claim_idempotency(&scope, "t", "req", "h", None)
+            .unwrap()
+        {
             IdempotencyClaim::Replay(Ok(v)) => assert_eq!(v["ok"], true),
             _ => panic!("replay"),
         }
         assert!(store
-            .claim_idempotency(&scope, "t", "req", "other")
+            .claim_idempotency(&scope, "t", "req", "other", None)
             .is_err());
     }
 
@@ -15089,7 +15235,9 @@ mod tests {
         let store = OrchStore::open(d.path()).unwrap();
         let scope = receipt_scope(d.path());
         assert!(matches!(
-            store.claim_idempotency(&scope, "t", "failed", "h").unwrap(),
+            store
+                .claim_idempotency(&scope, "t", "failed", "h", None)
+                .unwrap(),
             IdempotencyClaim::Perform
         ));
         let error = OrchError::new(OrchErrorCode::Internal, "failed once");
@@ -15106,7 +15254,10 @@ mod tests {
                 serde_json::json!({"ok": true}),
             )
             .is_err());
-        match store.claim_idempotency(&scope, "t", "failed", "h").unwrap() {
+        match store
+            .claim_idempotency(&scope, "t", "failed", "h", None)
+            .unwrap()
+        {
             IdempotencyClaim::Replay(Err(replayed)) => {
                 assert_eq!(replayed.code.as_str(), error.code.as_str());
                 assert_eq!(replayed.message, error.message);
@@ -15125,7 +15276,7 @@ mod tests {
 
         assert!(matches!(
             store
-                .claim_idempotency(&owner_a, "tool", "shared-request", "hash-a")
+                .claim_idempotency(&owner_a, "tool", "shared-request", "hash-a", None)
                 .unwrap(),
             IdempotencyClaim::Perform
         ));
@@ -15142,13 +15293,13 @@ mod tests {
 
         assert!(matches!(
             store
-                .claim_idempotency(&owner_b, "tool", "shared-request", "hash-b")
+                .claim_idempotency(&owner_b, "tool", "shared-request", "hash-b", None)
                 .unwrap(),
             IdempotencyClaim::Perform
         ));
         assert!(matches!(
             store
-                .claim_idempotency(&owner_a, "tool", "shared-request", "hash-a")
+                .claim_idempotency(&owner_a, "tool", "shared-request", "hash-a", None)
                 .unwrap(),
             IdempotencyClaim::Replay(Ok(value)) if value["owner"] == "a"
         ));
@@ -15157,7 +15308,8 @@ mod tests {
                 &other_session,
                 "tool",
                 "shared-request",
-                "hash-a"
+                "hash-a",
+                None,
             ),
             Err(error) if error.code == OrchErrorCode::Conflict
         ));
@@ -15168,14 +15320,20 @@ mod tests {
             .unwrap();
         assert!(matches!(
             store
-                .claim_idempotency(&other_workspace, "tool", "shared-request", "foreign-hash")
+                .claim_idempotency(
+                    &other_workspace,
+                    "tool",
+                    "shared-request",
+                    "foreign-hash",
+                    None
+                )
                 .unwrap(),
             IdempotencyClaim::Perform
         ));
         let foreign_bytes = fs::read(&foreign_path).unwrap();
         assert!(matches!(
             store
-                .claim_idempotency(&owner_a, "tool", "shared-request", "hash-a")
+                .claim_idempotency(&owner_a, "tool", "shared-request", "hash-a", None)
                 .unwrap(),
             IdempotencyClaim::Replay(Ok(value)) if value["owner"] == "a"
         ));
@@ -15240,7 +15398,7 @@ mod tests {
         for index in 0..MAX_IDEMPOTENCY_RECEIPTS_PER_OWNER {
             fs::write(owner_dir.join(format!("synthetic-{index}.json")), b"{}").unwrap();
         }
-        match store.claim_idempotency(&scope, "tool", "new-request", "hash") {
+        match store.claim_idempotency(&scope, "tool", "new-request", "hash", None) {
             Err(error) => assert_eq!(error.code, OrchErrorCode::CapacityExhausted),
             Ok(_) => panic!("receipt admission must stop at the hard owner bound"),
         }
@@ -15295,7 +15453,7 @@ mod tests {
         );
         assert!(matches!(
             store
-                .claim_idempotency(&scope, "tool", "fresh", "hash")
+                .claim_idempotency(&scope, "tool", "fresh", "hash", None)
                 .unwrap(),
             IdempotencyClaim::Perform
         ));
@@ -15387,12 +15545,24 @@ mod tests {
             let left_store = store.clone();
             let left_scope = scope.clone();
             let left = threads.spawn(move || {
-                left_store.claim_idempotency(&left_scope, "tool", "concurrent-request", "hash")
+                left_store.claim_idempotency(
+                    &left_scope,
+                    "tool",
+                    "concurrent-request",
+                    "hash",
+                    None,
+                )
             });
             let right_store = store.clone();
             let right_scope = scope.clone();
             let right = threads.spawn(move || {
-                right_store.claim_idempotency(&right_scope, "tool", "concurrent-request", "hash")
+                right_store.claim_idempotency(
+                    &right_scope,
+                    "tool",
+                    "concurrent-request",
+                    "hash",
+                    None,
+                )
             });
             let outcomes = [
                 left.join().unwrap().unwrap(),
@@ -15447,7 +15617,7 @@ mod tests {
         let scope = receipt_scope(d.path());
         assert!(matches!(
             store
-                .claim_idempotency(&scope, "tool", "created-at", "hash")
+                .claim_idempotency(&scope, "tool", "created-at", "hash", None)
                 .unwrap(),
             IdempotencyClaim::Perform
         ));
@@ -15499,6 +15669,7 @@ mod tests {
             "tool",
             "legacy-secret",
             "new-hash",
+            None,
         ) {
             Err(error) => error,
             Ok(_) => panic!("an unscoped legacy request id must never execute again"),
@@ -15513,6 +15684,7 @@ mod tests {
             "tool",
             "legacy-secret",
             "new-hash",
+            None,
         ) {
             Err(error) => error,
             Ok(_) => panic!("legacy request tombstone must survive restart"),
@@ -15748,14 +15920,16 @@ mod tests {
         let store = OrchStore::open(d.path()).unwrap();
         let scope = receipt_scope(d.path());
         assert!(matches!(
-            store.claim_idempotency(&scope, "t", "orphan", "h").unwrap(),
+            store
+                .claim_idempotency(&scope, "t", "orphan", "h", None)
+                .unwrap(),
             IdempotencyClaim::Perform
         ));
         drop(store);
 
         let reopened = OrchStore::open(d.path()).unwrap();
         match reopened
-            .claim_idempotency(&scope, "t", "orphan", "h")
+            .claim_idempotency(&scope, "t", "orphan", "h", None)
             .unwrap()
         {
             IdempotencyClaim::Replay(Err(e)) => {
@@ -15820,7 +15994,9 @@ mod tests {
         let d = tempdir().unwrap();
         let store = OrchStore::open(d.path()).unwrap();
         let scope = receipt_scope(d.path());
-        assert!(store.claim_idempotency(&scope, "t", "../x", "h").is_err());
+        assert!(store
+            .claim_idempotency(&scope, "t", "../x", "h", None)
+            .is_err());
     }
 
     #[test]
@@ -16681,7 +16857,7 @@ mod tests {
         fs::create_dir_all(receipt_path.parent().unwrap()).unwrap();
         assert!(matches!(
             store
-                .claim_idempotency(&scope, "ptah_cancel", &intent_id, "hash")
+                .claim_idempotency(&scope, "ptah_cancel", &intent_id, "hash", None)
                 .unwrap(),
             IdempotencyClaim::Perform
         ));
@@ -16853,7 +17029,13 @@ mod tests {
         let legacy = write_legacy_v2(dir.path(), &scope, &receipt);
         let before = fs::read(&legacy).unwrap();
         let claim = store
-            .claim_idempotency(&scope, "ptah_claim_work", request_id, "shared-ledger-hash")
+            .claim_idempotency(
+                &scope,
+                "ptah_claim_work",
+                request_id,
+                "shared-ledger-hash",
+                None,
+            )
             .unwrap();
         match claim {
             IdempotencyClaim::Replay(Ok(value)) => assert_eq!(value, response),
@@ -16886,6 +17068,7 @@ mod tests {
                 "ptah_discard_verified_change",
                 "legacy-failed",
                 "shared-ledger-hash",
+                None,
             )
             .unwrap();
         match claim {
@@ -16936,6 +17119,7 @@ mod tests {
                 "ptah_claim_work",
                 "legacy-pending",
                 "shared-ledger-hash",
+                None,
             )
             .unwrap();
         assert!(
@@ -16990,6 +17174,7 @@ mod tests {
                 "ptah_claim_work",
                 "legacy-conflict",
                 "shared-ledger-hash",
+                None,
             )
             .unwrap_err();
         assert_eq!(error.code, OrchErrorCode::Conflict);
@@ -17018,6 +17203,7 @@ mod tests {
                 "ptah_claim_work",
                 "legacy-restart",
                 "shared-ledger-hash",
+                None,
             )
             .unwrap();
         drop(store);
@@ -17028,6 +17214,7 @@ mod tests {
                 "ptah_claim_work",
                 "legacy-restart",
                 "shared-ledger-hash",
+                None,
             )
             .unwrap();
         match (first, second) {

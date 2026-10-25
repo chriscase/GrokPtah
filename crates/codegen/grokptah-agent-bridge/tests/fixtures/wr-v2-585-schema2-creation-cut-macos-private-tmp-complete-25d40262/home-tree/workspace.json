@@ -1,0 +1,14 @@
+{
+  "version": 2,
+  "project_cwd": "/private/tmp/grokptah-585-cut-root.wu1Qcc/workspace",
+  "active_session": "102bc2b2-62b7-47e5-907b-ffcfe2faae81",
+  "open_tab_ids": [
+    "102bc2b2-62b7-47e5-907b-ffcfe2faae81"
+  ],
+  "model": "grok-4.5",
+  "effort": "medium",
+  "sandbox_profile": "workspace-write",
+  "appearance": "dark",
+  "always_approve": true,
+  "subagent_isolation": "worktree"
+}

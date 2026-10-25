@@ -783,6 +783,160 @@ fn legacy_schema2_585_producer_cut_reopens_on_candidate() {
     }
 }
 
+#[cfg(target_os = "macos")]
+#[test]
+fn legacy_schema2_585_macos_private_tmp_pending_producer_cut_reopens_on_candidate() {
+    let bundle = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/wr-v2-585-schema2-creation-cut-macos-private-tmp-pending-25d40262");
+    assert!(
+        bundle.join("PRODUCER_SHA").is_file(),
+        "missing macOS pending producer bundle at {}",
+        bundle.display()
+    );
+    let producer_sha = std::fs::read_to_string(bundle.join("PRODUCER_SHA"))
+        .unwrap()
+        .trim()
+        .to_string();
+    assert_eq!(
+        producer_sha.as_str(),
+        "25d40262a3b530227af850f26974c19dfc2935fd",
+        "producer bundle must be from exact #585 base"
+    );
+    let root = tempfile::tempdir().unwrap();
+    copy_tree::copy_dir_all(&bundle.join("ledger-tree"), &root.path().join("ledger")).unwrap();
+    copy_tree::copy_dir_all(&bundle.join("home-tree"), &root.path().join("home")).unwrap();
+    std::fs::copy(
+        bundle.join("fixture.json"),
+        root.path().join("fixture.json"),
+    )
+    .unwrap();
+    let intent = read_json(intent_paths(root.path()).first().expect("intent"));
+    let receipt_file = receipt_path(root.path());
+    let receipt = read_json(&receipt_file);
+    let expected_sha = expected_receipt_sha256(&bundle);
+    assert_eq!(sha256_file(&receipt_file), expected_sha);
+    let fixture = read_json(root.path().join("fixture.json"));
+    let invoke_workspace = intent["request"]["workspaceDisplay"]
+        .as_str()
+        .expect("producer-bound request scope");
+    assert!(
+        invoke_workspace.starts_with("/private/tmp/"),
+        "macOS producer must seal /private/tmp display paths"
+    );
+    std::fs::create_dir_all(invoke_workspace).unwrap();
+    let original_work_id = intent["workId"].as_str().unwrap();
+    let original_objective = intent["item"]["objective"].as_str().unwrap();
+    let anchored_payload_hash = receipt["payloadHash"].clone();
+    let anchored_request_id = receipt["requestId"].clone();
+    let anchored_scope = json!({
+        "ownerId": receipt["ownerId"].clone(),
+        "sessionId": receipt["sessionId"].clone(),
+        "workspaceDigest": receipt["workspaceDigest"].clone(),
+        "tool": receipt["tool"].clone(),
+    });
+    for reopen in 0..3 {
+        assert_exit(
+            &child_with(
+                root.path(),
+                "replay",
+                "",
+                &[("WORK_CREATION_WORKSPACE_ALIAS", invoke_workspace)],
+            ),
+            0,
+        );
+        let outcome = read_json(root.path().join("outcome.json"));
+        assert!(
+            outcome.get("response").is_some(),
+            "macOS pending reopen {reopen}: {outcome}"
+        );
+        let work = &outcome["response"]["work"];
+        assert_eq!(work["workId"].as_str().unwrap(), original_work_id);
+        assert_eq!(work["objective"].as_str().unwrap(), original_objective);
+        assert_eq!(work["sessionId"], fixture["sessionId"]);
+        assert_eq!(work["createdBy"], fixture["ownerId"]);
+        let settled = read_json(&receipt_file);
+        assert_eq!(settled["status"], "complete");
+        assert_eq!(settled["payloadHash"], anchored_payload_hash);
+        assert_eq!(settled["requestId"], anchored_request_id);
+        assert_eq!(settled["ownerId"], anchored_scope["ownerId"]);
+        assert_eq!(settled["sessionId"], anchored_scope["sessionId"]);
+        assert_eq!(
+            settled["workspaceDigest"],
+            anchored_scope["workspaceDigest"]
+        );
+        assert_eq!(settled["tool"], anchored_scope["tool"]);
+        assert_eq!(records(&root.path().join("ledger/work-items")).len(), 1);
+        assert_eq!(
+            records(&root.path().join("ledger/work-items"))[0]["workId"],
+            original_work_id
+        );
+        let matching_receipts = json_paths(&root.path().join("ledger/idempotency"))
+            .into_iter()
+            .filter(|path| read_json(path)["requestId"] == REQUEST)
+            .collect::<Vec<_>>();
+        assert_eq!(matching_receipts.len(), 1);
+        assert_eq!(matching_receipts[0], receipt_file);
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn legacy_schema2_585_macos_private_tmp_completed_producer_replays_without_duplicate_execution() {
+    let bundle = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/wr-v2-585-schema2-creation-cut-macos-private-tmp-complete-25d40262");
+    assert!(bundle.join("PRODUCER_SHA").is_file());
+    let root = tempfile::tempdir().unwrap();
+    copy_tree::copy_dir_all(&bundle.join("ledger-tree"), &root.path().join("ledger")).unwrap();
+    copy_tree::copy_dir_all(&bundle.join("home-tree"), &root.path().join("home")).unwrap();
+    std::fs::copy(
+        bundle.join("fixture.json"),
+        root.path().join("fixture.json"),
+    )
+    .unwrap();
+    let intent = read_json(intent_paths(root.path()).first().expect("intent"));
+    let receipt_file = receipt_path(root.path());
+    let receipt = read_json(&receipt_file);
+    assert_eq!(receipt["status"], "complete");
+    let invoke_workspace = intent["request"]["workspaceDisplay"]
+        .as_str()
+        .expect("producer-bound request scope");
+    std::fs::create_dir_all(invoke_workspace).unwrap();
+    let original_work_id = intent["workId"].as_str().unwrap();
+    let work_items_before = records(&root.path().join("ledger/work-items"));
+    assert_eq!(work_items_before.len(), 1);
+    for reopen in 0..3 {
+        assert_exit(
+            &child_with(
+                root.path(),
+                "replay",
+                "",
+                &[("WORK_CREATION_WORKSPACE_ALIAS", invoke_workspace)],
+            ),
+            0,
+        );
+        let outcome = read_json(root.path().join("outcome.json"));
+        assert!(
+            outcome.get("response").is_some(),
+            "macOS completed reopen {reopen}: {outcome}"
+        );
+        assert_eq!(
+            outcome["response"]["work"]["workId"].as_str().unwrap(),
+            original_work_id
+        );
+        assert_eq!(
+            records(&root.path().join("ledger/work-items")),
+            work_items_before
+        );
+        let matching_receipts = json_paths(&root.path().join("ledger/idempotency"))
+            .into_iter()
+            .filter(|path| read_json(path)["requestId"] == REQUEST)
+            .collect::<Vec<_>>();
+        assert_eq!(matching_receipts.len(), 1);
+        assert_eq!(matching_receipts[0], receipt_file);
+        assert_eq!(read_json(&receipt_file)["status"], "complete");
+    }
+}
+
 fn expected_receipt_sha256(bundle: &Path) -> String {
     std::fs::read_to_string(bundle.join("receipt.sha256"))
         .unwrap()

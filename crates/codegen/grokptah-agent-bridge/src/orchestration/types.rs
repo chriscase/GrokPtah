@@ -1490,18 +1490,6 @@ pub struct IdempotencyScope {
     pub(crate) workspace_digest: String,
 }
 
-/// macOS resolves `/tmp` through `/private/tmp`. Idempotency receipts are keyed
-/// by a domain digest of the workspace path string; normalize the private temp
-/// spelling so producer cuts and replay callers agree across hosts.
-fn idempotency_workspace_identity(workspace: &str) -> String {
-    const PRIVATE_TMP_PREFIX: &str = "/private/tmp/";
-    if let Some(suffix) = workspace.strip_prefix(PRIVATE_TMP_PREFIX) {
-        format!("/tmp/{suffix}")
-    } else {
-        workspace.to_string()
-    }
-}
-
 impl IdempotencyScope {
     pub fn new(
         owner_id: &str,
@@ -1519,10 +1507,7 @@ impl IdempotencyScope {
         Ok(Self {
             owner_id: owner_id.to_string(),
             session_id,
-            workspace_digest: domain_digest(
-                "grokptah-idempotency-workspace-v2",
-                &idempotency_workspace_identity(workspace),
-            ),
+            workspace_digest: domain_digest("grokptah-idempotency-workspace-v2", workspace),
         })
     }
 
@@ -1966,29 +1951,6 @@ mod tests {
         assert!(!p.is_empty());
         // must be valid UTF-8 (always true for String) and not panic
         assert!(p.chars().count() <= 120);
-    }
-
-    #[test]
-    fn idempotency_workspace_digest_matches_linux_tmp_on_macos_private_tmp() {
-        use std::path::Path;
-        let session = Uuid::new_v4();
-        let linux = IdempotencyScope::new(
-            "primary",
-            session,
-            Path::new("/tmp/grokptah-585-cut-root.wu1Qcc/workspace"),
-        )
-        .unwrap();
-        let macos = IdempotencyScope::new(
-            "primary",
-            session,
-            Path::new("/private/tmp/grokptah-585-cut-root.wu1Qcc/workspace"),
-        )
-        .unwrap();
-        assert_eq!(linux.workspace_digest, macos.workspace_digest);
-        assert_eq!(
-            linux.workspace_digest,
-            "fc461db136aadc1c047675f98cc35d7af84522e1a01e7c3aa3c9908645da9ee7"
-        );
     }
 
     #[test]

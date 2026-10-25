@@ -1,0 +1,2 @@
+{"ts":"2026-10-25T17:09:07.614665528Z","tool":"ptah_create_work","requestId":"create-original-request","sessionId":"102bc2b2-62b7-47e5-907b-ffcfe2faae81","workspace":"/tmp/grokptah-585-cut-root.wu1Qcc/workspace","outcome":"replayed","errorCode":null,"detail":"replayed successful mutation outcome"}
+{"ts":"2026-10-25T17:09:07.623642005Z","tool":"host.shutdown","requestId":null,"sessionId":null,"workspace":null,"outcome":"accepted","errorCode":null,"detail":""}

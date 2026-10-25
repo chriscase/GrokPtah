@@ -1,0 +1,4 @@
+[
+  {"id":"diff-review","name":"Diff Review","description":"Highlight agent edits"},
+  {"id":"commit-helper","name":"Commit Helper","description":"Conventional commits"}
+]

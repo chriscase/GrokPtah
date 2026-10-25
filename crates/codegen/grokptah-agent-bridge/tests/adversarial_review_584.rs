@@ -164,10 +164,10 @@ fn concurrent_bindings_must_not_publish_foreign_work_in_the_other_receipt() {
     let scope_a = IdempotencyScope::new("owner-a", a.session_id, ws_a.path()).unwrap();
     let scope_b = IdempotencyScope::new("owner-b", b.session_id, ws_b.path()).unwrap();
     store
-        .claim_idempotency(&scope_a, "ptah_cancel_work", "request-a", "hash-a")
+        .claim_idempotency(&scope_a, "ptah_cancel_work", "request-a", "hash-a", None)
         .unwrap();
     store
-        .claim_idempotency(&scope_b, "ptah_cancel_work", "request-b", "hash-b")
+        .claim_idempotency(&scope_b, "ptah_cancel_work", "request-b", "hash-b", None)
         .unwrap();
     let binding_a = WorkRequestBinding::bound(
         &scope_a,

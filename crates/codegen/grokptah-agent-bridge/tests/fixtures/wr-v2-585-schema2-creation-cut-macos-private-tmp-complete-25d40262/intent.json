@@ -1,0 +1,61 @@
+{
+  "schemaVersion": 2,
+  "intentId": "5950d9d4-e708-42f5-99e5-3287b45759ff",
+  "operation": "create",
+  "workId": "6449ac1f-1b2c-46eb-8d4d-a922edb64ce9",
+  "priorItem": null,
+  "item": {
+    "schemaVersion": 1,
+    "workId": "6449ac1f-1b2c-46eb-8d4d-a922edb64ce9",
+    "kind": "test",
+    "objective": "recover the original Work creation",
+    "sessionId": "102bc2b2-62b7-47e5-907b-ffcfe2faae81",
+    "workspace": "/private/tmp/grokptah-585-cut-root.wu1Qcc/workspace",
+    "createdBy": "primary",
+    "assignedAgentId": null,
+    "priority": 7,
+    "deadline": null,
+    "parentWorkId": null,
+    "dependencies": [],
+    "policy": {
+      "bounds": {
+        "maxPromptBytes": 100000,
+        "maxRounds": 24,
+        "maxDurationMs": 900000
+      },
+      "retry": {
+        "maxAttempts": 3,
+        "retryFailed": true,
+        "retryExpired": true,
+        "backoffMs": 0
+      },
+      "requiresApproval": false,
+      "maxConcurrentAttempts": 1,
+      "managedExecution": "inherit",
+      "allowedFiles": []
+    },
+    "state": "queued",
+    "revision": 1,
+    "attemptCount": 0,
+    "progress": null,
+    "result": null,
+    "isContainer": false,
+    "approval": null,
+    "assignmentStatus": "unassigned",
+    "createdAt": "2026-10-25T14:28:21.526070769Z",
+    "updatedAt": "2026-10-25T14:28:21.526070769Z"
+  },
+  "creationItemDigest": "fc2fe8a8049498c1ea8bfb74d0ba7b3a961803a54f118b647eafb97f4ee4b81f",
+  "priorAttempts": [],
+  "attempts": [],
+  "request": {
+    "requestId": "create-original-request",
+    "ownerId": "primary",
+    "tool": "ptah_create_work",
+    "sessionId": "102bc2b2-62b7-47e5-907b-ffcfe2faae81",
+    "workspaceDigest": "f1cbe34c2d1784835b7447699f0d21e56583364e5d2203e376d616b146868c77",
+    "workspaceDisplay": "/private/tmp/grokptah-585-cut-root.wu1Qcc/workspace",
+    "payloadHash": "f9bb0d058f425c42a2ebb1233340bfaabfdea94564bbf6eca6b04322354495e6",
+    "shape": "work_attempts"
+  }
+}

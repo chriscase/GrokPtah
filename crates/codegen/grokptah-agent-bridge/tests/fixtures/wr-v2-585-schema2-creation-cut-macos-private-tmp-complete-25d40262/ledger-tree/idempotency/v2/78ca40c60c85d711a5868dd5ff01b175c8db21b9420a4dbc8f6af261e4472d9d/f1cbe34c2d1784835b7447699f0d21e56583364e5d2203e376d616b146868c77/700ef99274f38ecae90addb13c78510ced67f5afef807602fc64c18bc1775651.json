@@ -1,0 +1,58 @@
+{
+  "schemaVersion": 2,
+  "ownerId": "primary",
+  "sessionId": "102bc2b2-62b7-47e5-907b-ffcfe2faae81",
+  "workspaceDigest": "f1cbe34c2d1784835b7447699f0d21e56583364e5d2203e376d616b146868c77",
+  "requestId": "create-original-request",
+  "payloadHash": "f9bb0d058f425c42a2ebb1233340bfaabfdea94564bbf6eca6b04322354495e6",
+  "runId": "6449ac1f-1b2c-46eb-8d4d-a922edb64ce9",
+  "tool": "ptah_create_work",
+  "response": {
+    "attempts": [],
+    "work": {
+      "approval": null,
+      "assignedAgentId": null,
+      "assignmentStatus": "unassigned",
+      "attemptCount": 0,
+      "createdAt": "2026-10-25T14:28:21.526070769Z",
+      "createdBy": "primary",
+      "deadline": null,
+      "dependencies": [],
+      "isContainer": false,
+      "kind": "test",
+      "objective": "recover the original Work creation",
+      "parentWorkId": null,
+      "policy": {
+        "allowedFiles": [],
+        "bounds": {
+          "maxDurationMs": 900000,
+          "maxPromptBytes": 100000,
+          "maxRounds": 24
+        },
+        "managedExecution": "inherit",
+        "maxConcurrentAttempts": 1,
+        "requiresApproval": false,
+        "retry": {
+          "backoffMs": 0,
+          "maxAttempts": 3,
+          "retryExpired": true,
+          "retryFailed": true
+        }
+      },
+      "priority": 7,
+      "progress": null,
+      "result": null,
+      "revision": 1,
+      "schemaVersion": 1,
+      "sessionId": "102bc2b2-62b7-47e5-907b-ffcfe2faae81",
+      "state": "queued",
+      "updatedAt": "2026-10-25T14:28:21.526070769Z",
+      "workId": "6449ac1f-1b2c-46eb-8d4d-a922edb64ce9",
+      "workspace": "/private/tmp/grokptah-585-cut-root.wu1Qcc/workspace"
+    }
+  },
+  "error": null,
+  "createdAt": "2026-10-25T14:28:21.519852176Z",
+  "status": "complete",
+  "cleanupPlanDigest": ""
+}

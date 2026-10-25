@@ -871,7 +871,13 @@ fn claiming_intent_adopts_already_committed_run() {
     .unwrap();
     assert!(matches!(
         store
-            .claim_idempotency(&scope, "ptah_native_execute", "intent-admit-1", "hash")
+            .claim_idempotency(
+                &scope,
+                "ptah_native_execute",
+                "intent-admit-1",
+                "hash",
+                None
+            )
             .unwrap(),
         IdempotencyClaim::Perform
     ));
@@ -923,7 +929,13 @@ fn linked_attempt_before_intent_commit_recovers_one_run() {
     .unwrap();
     assert!(matches!(
         store
-            .claim_idempotency(&scope, "ptah_native_execute", "intent-admit-1", "hash")
+            .claim_idempotency(
+                &scope,
+                "ptah_native_execute",
+                "intent-admit-1",
+                "hash",
+                None
+            )
             .unwrap(),
         IdempotencyClaim::Perform
     ));
@@ -2005,7 +2017,7 @@ fn workload_reliability_crash_child() {
     let tool = std::env::var("GROKPTAH_CRASH_TOOL").unwrap();
     let shape = std::env::var("GROKPTAH_CRASH_SHAPE").unwrap();
     store
-        .claim_idempotency(&scope, &tool, &request_id, "payload-reliability")
+        .claim_idempotency(&scope, &tool, &request_id, "payload-reliability", None)
         .unwrap();
     let _bound = OrchStore::bind_work_request(WorkRequestBinding::bound(
         &scope,
@@ -2101,7 +2113,7 @@ fn replay_is_complete(
     )
     .unwrap();
     match store
-        .claim_idempotency(&scope, tool, request_id, "payload-reliability")
+        .claim_idempotency(&scope, tool, request_id, "payload-reliability", None)
         .unwrap()
     {
         IdempotencyClaim::Replay(Ok(body)) => {
