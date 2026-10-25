@@ -20,7 +20,10 @@
 
 mod adaptive;
 mod isolated_surface;
+#[cfg(target_os = "macos")]
 mod macos_observation;
+#[cfg(not(target_os = "macos"))]
+mod macos_observation_disabled;
 mod platform;
 mod policy;
 mod projection;
@@ -50,7 +53,10 @@ pub use isolated_surface::{
     VfDryRunPlatform, VfLaunchReceipt, CONTAINED_BROWSER_DRY_RUN_NONCLAIM,
     NATIVE_HOST_SENTINEL_NONCLAIM, SYNTHETIC_HARNESS_NONCLAIM, VF_DRY_RUN_NONCLAIM,
 };
+#[cfg(target_os = "macos")]
 pub use macos_observation::MacOsObservationPlatform;
+#[cfg(not(target_os = "macos"))]
+pub use macos_observation_disabled::MacOsObservationPlatform;
 pub use platform::{
     ComputerObservationPlatform, ComputerPermission, ComputerPermissionStatus,
     ComputerPlatformStatus, ComputerTargetCandidate,

@@ -197,6 +197,25 @@ struct RoutineDedupeRecord {
     created_at: chrono::DateTime<Utc>,
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LedgerAdmissionRecoveryMarker {
+    schema_version: u32,
+    intent_id: String,
+    owner_id: String,
+    session_id: Uuid,
+    workspace_digest: String,
+    tool: String,
+    request_id: String,
+    payload_hash: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    sealed_binding: Option<WorkRequestBinding>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    sealed_response: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    sealed_mutation_intent: Option<ManagerMutationIntent>,
+}
+
 // Schema 1 is the original unbound envelope. Schema 2 admits new records
 // with absent priors and seals the original authenticated caller when present.
 fn legacy_related_creation_schema() -> u32 {
@@ -243,13 +262,11 @@ impl RelatedCreationRequest {
             || binding.target_attempt_id.is_some()
             || binding.expected_revision.is_some()
             || binding.session_id != session
-            || binding.workspace_display != workspace
+            || !workspaces_match(&binding.workspace_display, workspace)
             || self.payload["sessionId"] != serde_json::json!(session)
             || !bound_request_workspace_matches(binding, workspace)
             || !workspaces_match(input_workspace, workspace)
-            || IdempotencyScope::new(&binding.owner_id, session, Path::new(workspace))?
-                .workspace_digest
-                != binding.workspace_digest
+            || !idempotency_binding_matches_workspace(binding, session, workspace)?
             || super::types::hash_payload(&self.payload) != self.payload_digest
             || (tool == "ptah_create_manager_plan" && self.payload_digest != binding.payload_hash)
             || self.actor.is_empty()
@@ -1083,6 +1100,9 @@ pub struct WorkRequestBinding {
     pub session_id: Uuid,
     pub workspace_digest: String,
     pub workspace_display: String,
+    /// Workspace spelling from the authenticated request payload used for hashing.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub payload_workspace: String,
     pub payload_hash: String,
     /// `work_attempt`, `work_attempts`, `work_scope`, `decision`, `decision_scope`,
     /// `claim`, `lease_view`, or `unblock`.
@@ -1098,6 +1118,58 @@ pub struct WorkRequestBinding {
     /// empty and relies on the work id plus the idempotency payload.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expected_revision: Option<u64>,
+}
+
+/// Idempotency binding/receipt lifecycle (v2 owner shards):
+///
+/// - **Create / bind:** work-lifecycle and bound-request completion persist
+///   `request-scopes/<request>.json` (one owner+request binding) and a scoped
+///   receipt under `idempotency/v2/<owner>/<workspace_digest>/<request>.json`.
+///   Multiple workspace digests may each hold a receipt for the same request id;
+///   they share the single binding file when lifecycle code last sealed it.
+/// - **Alias / replay:** `claim_idempotency` checks the binding first (workspace
+///   match, then tool/payload), then intents, then owner-wide receipt scans.
+///   Cross-spelling alias needs the binding and/or a producer receipt shard.
+/// - **Prune:** capacity pressure removes one terminal, inactive receipt per
+///   owner shard. The receipt file is removed first; the binding is removed only
+///   when no receipt remains for that owner+request id.
+/// - **Sweep (open):** drops bindings with no receipts; **reconcile (open):**
+///   rebuilds a missing binding from surviving terminal receipts (manager/routine
+///   paths without `response.work.workId` included).
+/// - **Crash points:** receipt-before-binding prune ordering plus open reconcile
+///   recover from a legacy binding-first crash that left receipts without bindings.
+///
+/// Durable workspace scope for an idempotent request. Survives creation-intent
+/// cleanup so alias replay can find the producer-bound receipt shard.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct IdempotencyRequestScopeBinding {
+    schema_version: u32,
+    owner_id: String,
+    session_id: Uuid,
+    request_id: String,
+    tool: String,
+    payload_hash: String,
+    workspace_digest: String,
+    workspace_display: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    payload_workspace: String,
+}
+
+const IDEMPOTENCY_REQUEST_SCOPE_BINDING_SCHEMA_VERSION: u32 = 1;
+
+fn idempotency_request_identity_conflict() -> OrchError {
+    OrchError::new(
+        OrchErrorCode::Conflict,
+        "request_id reused with different payload",
+    )
+}
+
+fn idempotency_scope_binding_invalid() -> OrchError {
+    OrchError::new(
+        OrchErrorCode::Conflict,
+        "idempotency scope binding is invalid",
+    )
 }
 
 impl WorkRequestBinding {
@@ -1118,11 +1190,20 @@ impl WorkRequestBinding {
             session_id: scope.session_id,
             workspace_digest: scope.workspace_digest.clone(),
             workspace_display: workspace_display.into(),
+            payload_workspace: String::new(),
             payload_hash: payload_hash.into(),
             shape: shape.into(),
             target_work_id: None,
             target_attempt_id: None,
             expected_revision: None,
+        }
+    }
+
+    fn payload_workspace_for_hash(&self) -> &str {
+        if self.payload_workspace.is_empty() {
+            self.workspace_display.as_str()
+        } else {
+            self.payload_workspace.as_str()
         }
     }
 }
@@ -1169,6 +1250,8 @@ struct WorkLifecycleIntent {
     item: WorkItem,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     creation_item_digest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    creation_request_digest: Option<String>,
     prior_attempts: Vec<WorkAttempt>,
     attempts: Vec<WorkAttempt>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1490,6 +1573,7 @@ impl WorkLifecycleIntent {
             prior_item: Some(prior_item),
             item,
             creation_item_digest: None,
+            creation_request_digest: None,
             prior_attempts,
             attempts,
             request: None,
@@ -1945,6 +2029,9 @@ impl OrchStore {
         store.recover_agent_activation_intents()?;
         store.recover_finalization_intents()?;
         store.recover_routine_intents()?;
+        store.load_ledger_reconciliation_marker()?;
+        store.load_ledger_admission_recovery_marker()?;
+        store.maybe_finalize_post_commit_prune_recovery()?;
         store.recover_manager_creation_intents()?;
         // An absent-prior creation must exist before a dependent update is
         // recovered, and before pending receipts are classified as orphaned.
@@ -1954,9 +2041,18 @@ impl OrchStore {
         store.recover_apply_admissions()?;
         store.recover_apply_source_intents()?;
         store.recover_managed_finalization_intents()?;
-        store.load_ledger_reconciliation_marker()?;
         store.mark_unfinished_interrupted()?;
         store.fail_orphaned_idempotency_claims()?;
+        // Derived request-scope bindings are repair metadata. Do not mutate the
+        // ledger while admission is closed after a refused recovery finalize.
+        if store.ledger_admission_closed().is_none() {
+            store
+                .reconcile_idempotency_scope_bindings_from_receipts_unlocked()
+                .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+            store
+                .sweep_orphan_idempotency_scope_bindings_unlocked()
+                .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        }
         store.reconcile_workloads()?;
         // Cleanup is best-effort at the record level, but directory access
         // failures still surface so a broken ledger cannot look healthy.
@@ -2009,6 +2105,380 @@ impl OrchStore {
             .join("v2")
             .join(scope.owner_path_digest())
             .join(format!("{safe}.json")))
+    }
+
+    fn idempotency_request_scope_binding_path(
+        &self,
+        owner_id: &str,
+        request_id: &str,
+    ) -> Result<PathBuf, OrchError> {
+        let owner_scope = IdempotencyScope::new(owner_id, Uuid::nil(), Path::new("/"))?;
+        let safe = safe_id_filename(request_id)?;
+        Ok(self
+            .inner
+            .root
+            .join("idempotency")
+            .join("v2")
+            .join(owner_scope.owner_path_digest())
+            .join("request-scopes")
+            .join(format!("{safe}.json")))
+    }
+
+    fn persist_idempotency_request_scope_binding_unlocked(
+        &self,
+        request: &WorkRequestBinding,
+    ) -> Result<(), OrchError> {
+        let binding = IdempotencyRequestScopeBinding {
+            schema_version: IDEMPOTENCY_REQUEST_SCOPE_BINDING_SCHEMA_VERSION,
+            owner_id: request.owner_id.clone(),
+            session_id: request.session_id,
+            request_id: request.request_id.clone(),
+            tool: request.tool.clone(),
+            payload_hash: request.payload_hash.clone(),
+            workspace_digest: request.workspace_digest.clone(),
+            workspace_display: request.workspace_display.clone(),
+            payload_workspace: request.payload_workspace.clone(),
+        };
+        Self::validated_scope_binding_shard(&binding)?;
+        let path =
+            self.idempotency_request_scope_binding_path(&request.owner_id, &request.request_id)?;
+        atomic_write_json(&self.lease(), &path, &binding)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))
+    }
+
+    fn load_idempotency_request_scope_binding_unlocked(
+        &self,
+        owner_id: &str,
+        request_id: &str,
+    ) -> Result<Option<IdempotencyRequestScopeBinding>, OrchError> {
+        let path = self.idempotency_request_scope_binding_path(owner_id, request_id)?;
+        if !path.is_file() {
+            return Ok(None);
+        }
+        let binding: IdempotencyRequestScopeBinding = serde_json::from_str(
+            &fs::read_to_string(&path)
+                .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?,
+        )
+        .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        if binding.schema_version != IDEMPOTENCY_REQUEST_SCOPE_BINDING_SCHEMA_VERSION {
+            return Ok(None);
+        }
+        if binding.owner_id != owner_id || binding.request_id != request_id {
+            return Err(idempotency_scope_binding_invalid());
+        }
+        Ok(Some(binding))
+    }
+
+    fn validated_scope_binding_shard(
+        binding: &IdempotencyRequestScopeBinding,
+    ) -> Result<IdempotencyScope, OrchError> {
+        let bound_scope = IdempotencyScope::new(
+            &binding.owner_id,
+            binding.session_id,
+            Path::new(&binding.workspace_display),
+        )?;
+        if bound_scope.workspace_digest != binding.workspace_digest {
+            return Err(idempotency_scope_binding_invalid());
+        }
+        Ok(bound_scope)
+    }
+
+    fn owner_has_idempotency_receipt_for_request_unlocked(
+        &self,
+        owner_id: &str,
+        request_id: &str,
+    ) -> Result<bool, OrchError> {
+        let owner_scope = IdempotencyScope::new(owner_id, Uuid::nil(), Path::new("/"))?;
+        let owner_dir = self
+            .inner
+            .root
+            .join("idempotency")
+            .join("v2")
+            .join(owner_scope.owner_path_digest());
+        for path in owner_receipt_files(&owner_dir)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
+        {
+            let Ok(text) = fs::read_to_string(&path) else {
+                continue;
+            };
+            let Ok(receipt) = serde_json::from_str::<IdempotencyReceipt>(&text) else {
+                continue;
+            };
+            if receipt.owner_id == owner_id && receipt.request_id == request_id {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    fn idempotency_workspace_display_from_receipt_unlocked(
+        &self,
+        receipt: &IdempotencyReceipt,
+    ) -> Option<String> {
+        if let Some(workspace) = receipt
+            .response
+            .get("workspace")
+            .and_then(|value| value.as_str())
+        {
+            return Some(workspace.to_string());
+        }
+        if let Some(workspace) = receipt
+            .response
+            .pointer("/work/workspace")
+            .and_then(|value| value.as_str())
+        {
+            return Some(workspace.to_string());
+        }
+        if let Some(plan_id) = receipt
+            .response
+            .pointer("/plan/planId")
+            .and_then(|value| value.as_str())
+        {
+            if let Ok(Some(plan)) = self.load_manager_plan_unlocked(plan_id) {
+                return Some(plan.workspace.clone());
+            }
+        }
+        if let Some(routine_id) = receipt
+            .response
+            .get("routineId")
+            .and_then(|value| value.as_str())
+        {
+            if let Ok(Some(routine)) = self.load_routine_unlocked(routine_id) {
+                return Some(routine.workspace.clone());
+            }
+        }
+        if let Some(work_id) = receipt
+            .response
+            .pointer("/work/workId")
+            .and_then(|value| value.as_str())
+        {
+            if let Ok(Some(item)) = self.load_work_item_unlocked(work_id) {
+                return Some(item.workspace.clone());
+            }
+        }
+        None
+    }
+
+    fn idempotency_scope_binding_receipt_live_unlocked(
+        &self,
+        binding: &IdempotencyRequestScopeBinding,
+    ) -> bool {
+        Self::validated_scope_binding_shard(binding)
+            .ok()
+            .and_then(|scope| self.idemp_path(&scope, &binding.request_id).ok())
+            .is_some_and(|path| path.is_file())
+    }
+
+    fn persist_idempotency_scope_binding_from_receipt_unlocked(
+        &self,
+        receipt: &IdempotencyReceipt,
+        workspace_display: &str,
+    ) -> Result<(), OrchError> {
+        let binding = IdempotencyRequestScopeBinding {
+            schema_version: IDEMPOTENCY_REQUEST_SCOPE_BINDING_SCHEMA_VERSION,
+            owner_id: receipt.owner_id.clone(),
+            session_id: receipt.session_id,
+            request_id: receipt.request_id.clone(),
+            tool: receipt.tool.clone(),
+            payload_hash: receipt.payload_hash.clone(),
+            workspace_digest: receipt.workspace_digest.clone(),
+            workspace_display: workspace_display.to_string(),
+            payload_workspace: String::new(),
+        };
+        Self::validated_scope_binding_shard(&binding)?;
+        self.persist_idempotency_request_scope_binding_unlocked(&WorkRequestBinding {
+            request_id: binding.request_id.clone(),
+            owner_id: binding.owner_id.clone(),
+            tool: binding.tool.clone(),
+            session_id: binding.session_id,
+            workspace_digest: binding.workspace_digest.clone(),
+            workspace_display: binding.workspace_display.clone(),
+            payload_workspace: binding.payload_workspace.clone(),
+            payload_hash: binding.payload_hash.clone(),
+            shape: String::new(),
+            target_work_id: None,
+            target_attempt_id: None,
+            expected_revision: None,
+        })
+    }
+
+    fn repoint_idempotency_scope_binding_for_request_unlocked(
+        &self,
+        owner_id: &str,
+        request_id: &str,
+    ) -> Result<bool, OrchError> {
+        let owner_scope = IdempotencyScope::new(owner_id, Uuid::nil(), Path::new("/"))?;
+        let owner_dir = self
+            .inner
+            .root
+            .join("idempotency")
+            .join("v2")
+            .join(owner_scope.owner_path_digest());
+        let mut survivors = Vec::new();
+        for receipt_path in owner_receipt_files(&owner_dir)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
+        {
+            let Ok(text) = fs::read_to_string(&receipt_path) else {
+                continue;
+            };
+            let Ok(receipt) = serde_json::from_str::<IdempotencyReceipt>(&text) else {
+                continue;
+            };
+            if receipt.owner_id != owner_id || receipt.request_id != request_id {
+                continue;
+            }
+            if !matches!(receipt.status.as_str(), "complete" | "failed") {
+                continue;
+            }
+            if !receipt_path_matches_identity(&receipt_path, &receipt) {
+                continue;
+            }
+            survivors.push(receipt);
+        }
+        if survivors.is_empty() {
+            return Ok(false);
+        }
+        survivors.sort_by_key(|receipt| receipt.created_at);
+        let receipt = survivors
+            .iter()
+            .rev()
+            .find(|receipt| {
+                self.idempotency_workspace_display_from_receipt_unlocked(receipt)
+                    .is_some()
+            })
+            .or(survivors.last())
+            .expect("non-empty survivors");
+        let Some(workspace_display) =
+            self.idempotency_workspace_display_from_receipt_unlocked(receipt)
+        else {
+            return Ok(false);
+        };
+        self.persist_idempotency_scope_binding_from_receipt_unlocked(receipt, &workspace_display)?;
+        Ok(true)
+    }
+
+    fn reconcile_idempotency_scope_bindings_from_receipts_unlocked(&self) -> Result<(), OrchError> {
+        let owners_root = self.inner.root.join("idempotency").join("v2");
+        if !owners_root.is_dir() {
+            return Ok(());
+        }
+        for owner_entry in fs::read_dir(&owners_root)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
+        {
+            let owner_dir = owner_entry
+                .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
+                .path();
+            if !owner_dir.is_dir() {
+                continue;
+            }
+            let mut repaired = 0usize;
+            let mut seen_requests = std::collections::BTreeSet::new();
+            for receipt_path in owner_receipt_files(&owner_dir)
+                .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
+            {
+                if repaired >= MAX_IDEMPOTENCY_RECEIPTS_PER_OWNER {
+                    break;
+                }
+                let Ok(text) = fs::read_to_string(&receipt_path) else {
+                    continue;
+                };
+                let Ok(receipt) = serde_json::from_str::<IdempotencyReceipt>(&text) else {
+                    continue;
+                };
+                if !matches!(receipt.status.as_str(), "complete" | "failed") {
+                    continue;
+                }
+                if !seen_requests.insert(receipt.request_id.clone()) {
+                    continue;
+                }
+                let binding = self.load_idempotency_request_scope_binding_unlocked(
+                    &receipt.owner_id,
+                    &receipt.request_id,
+                )?;
+                let needs_repair = match binding.as_ref() {
+                    None => true,
+                    Some(binding) => !self.idempotency_scope_binding_receipt_live_unlocked(binding),
+                };
+                if !needs_repair {
+                    continue;
+                }
+                if self.repoint_idempotency_scope_binding_for_request_unlocked(
+                    &receipt.owner_id,
+                    &receipt.request_id,
+                )? {
+                    repaired += 1;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn remove_idempotency_scope_binding_unlocked(
+        &self,
+        owner_id: &str,
+        request_id: &str,
+    ) -> Result<(), OrchError> {
+        let path = self.idempotency_request_scope_binding_path(owner_id, request_id)?;
+        if path.is_file() {
+            crate::verified_change::fail_durable_write_if_armed(&path)
+                .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+            remove_file_durable(&self.lease(), &path)
+                .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        }
+        Ok(())
+    }
+
+    fn sweep_orphan_idempotency_scope_bindings_unlocked(&self) -> Result<(), OrchError> {
+        let owners_root = self.inner.root.join("idempotency").join("v2");
+        if !owners_root.is_dir() {
+            return Ok(());
+        }
+        for owner_entry in fs::read_dir(&owners_root)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
+        {
+            let owner_dir = owner_entry
+                .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
+                .path();
+            if !owner_dir.is_dir() {
+                continue;
+            }
+            let scopes_dir = owner_dir.join("request-scopes");
+            if !scopes_dir.is_dir() {
+                continue;
+            }
+            let mut removed = 0usize;
+            for entry in fs::read_dir(&scopes_dir)
+                .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
+            {
+                if removed >= MAX_IDEMPOTENCY_RECEIPTS_PER_OWNER {
+                    break;
+                }
+                let path = entry
+                    .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
+                    .path();
+                if !path.is_file() {
+                    continue;
+                }
+                let binding: IdempotencyRequestScopeBinding =
+                    serde_json::from_str(&fs::read_to_string(&path).map_err(|error| {
+                        OrchError::new(OrchErrorCode::Internal, error.to_string())
+                    })?)
+                    .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+                if binding.schema_version != IDEMPOTENCY_REQUEST_SCOPE_BINDING_SCHEMA_VERSION {
+                    continue;
+                }
+                if self.owner_has_idempotency_receipt_for_request_unlocked(
+                    &binding.owner_id,
+                    &binding.request_id,
+                )? {
+                    continue;
+                }
+                remove_file_durable(&self.lease(), &path)
+                    .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+                removed += 1;
+            }
+        }
+        Ok(())
     }
 
     fn idemp_path(&self, scope: &IdempotencyScope, request_id: &str) -> Result<PathBuf, OrchError> {
@@ -2121,10 +2591,53 @@ impl OrchStore {
             }
         }
         eligible.sort_by_key(|(_, created_at)| *created_at);
-        if let Some((path, _)) = eligible.first() {
+        if let Some((path, _created_at)) = eligible.first() {
+            let receipt = fs::read_to_string(path)
+                .ok()
+                .and_then(|text| serde_json::from_str::<IdempotencyReceipt>(&text).ok());
+            crate::verified_change::fail_durable_write_if_armed(path)
+                .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
             remove_file_durable(&self.lease(), path)
                 .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+            crash_process_if_stage("idempotency_prune_after_receipt_remove");
+            if let Some(receipt) = receipt {
+                if self.owner_has_idempotency_receipt_for_request_unlocked(
+                    &receipt.owner_id,
+                    &receipt.request_id,
+                )? {
+                    self.repoint_idempotency_scope_binding_for_request_unlocked(
+                        &receipt.owner_id,
+                        &receipt.request_id,
+                    )?;
+                } else {
+                    crash_process_if_stage("idempotency_prune_before_binding_remove");
+                    self.remove_idempotency_scope_binding_unlocked(
+                        &receipt.owner_id,
+                        &receipt.request_id,
+                    )?;
+                    crash_process_if_stage("idempotency_prune_after_binding_remove");
+                }
+            }
         }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn simulate_legacy_prune_binding_before_receipt_crash_unlocked(
+        &self,
+        scope: &IdempotencyScope,
+        request_id: &str,
+    ) -> Result<(), OrchError> {
+        let path = self.idemp_path(scope, request_id)?;
+        let receipt = fs::read_to_string(&path)
+            .ok()
+            .and_then(|text| serde_json::from_str::<IdempotencyReceipt>(&text).ok());
+        if let Some(receipt) = receipt {
+            self.remove_idempotency_scope_binding_unlocked(&receipt.owner_id, &receipt.request_id)?;
+        }
+        crash_process_if_stage("idempotency_prune_binding_before_receipt_legacy");
+        remove_file_durable(&self.lease(), &path)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
         Ok(())
     }
 
@@ -2854,6 +3367,7 @@ impl OrchStore {
             prior_item: None,
             item: item.clone(),
             creation_item_digest: Some(Self::work_digest(item)?),
+            creation_request_digest: Some(request.payload_hash.clone()),
             prior_attempts: Vec::new(),
             attempts: Vec::new(),
             request: Some(request),
@@ -3430,11 +3944,23 @@ impl OrchStore {
         crash_process_if_stage("manager_mutation_after_intent");
         self.commit_manager_mutation_unlocked(&intent)
             .map_err(|error| self.note_work_recovery_required(error))?;
-        self.clear_related_intent_unlocked(&path)
+        let mut prune_failed = false;
+        if let Err(error) = self.prune_messages_unlocked() {
+            self.persist_ledger_admission_recovery_unlocked(&intent)?;
+            self.note_work_recovery_required(error);
+            prune_failed = true;
+        }
+        if !prune_failed {
+            self.complete_bound_request_unlocked(
+                intent.request.as_ref().map(|request| &request.binding),
+                &intent.response(),
+            )
             .map_err(|error| self.note_work_recovery_required(error))?;
-        crash_process_if_stage("manager_mutation_after_commit");
-        self.prune_messages_unlocked()
-            .map_err(|error| self.note_work_recovery_required(error))?;
+            crash_process_if_stage("manager_mutation_after_receipt");
+            crash_process_if_stage("manager_mutation_after_commit");
+            self.clear_related_intent_unlocked(&path)
+                .map_err(|error| self.note_work_recovery_required(error))?;
+        }
         Ok(intent.response())
     }
 
@@ -3506,50 +4032,40 @@ impl OrchStore {
             .map_err(|_| related_creation_conflict("manager message sequence is malformed"))
     }
 
-    fn preflight_manager_mutation_unlocked(
+    fn preflight_manager_mutation_observed_work_snapshots_unlocked(
         &self,
         intent: &ManagerMutationIntent,
+        allow_missing_committed_work: bool,
     ) -> Result<(), OrchError> {
-        intent.validate()?;
         if let Some(observation) = &intent.observation {
             for item in &observation.work_items {
-                if !self
-                    .related_record_matches_unlocked(&self.work_item_path(&item.work_id)?, item)?
-                {
-                    return Err(related_creation_conflict(
-                        "manager observation Work disappeared",
-                    ));
-                }
-            }
-            // An unobserved adopted child is a conflicting writer, not a
-            // reason to materialize another child for that logical step.
-            for item in self
-                .list_work_items_unlocked()
-                .map_err(Self::orch_error_from_anyhow)?
-            {
-                if item.session_id == intent.plan.session_id
-                    && item.workspace == intent.plan.workspace
-                    && item.kind != "manager-decision"
-                    && intent.plan.steps.iter().any(|step| {
-                        item.source_manager_step_id.as_deref() == Some(step.step_id.as_str())
-                    })
-                    && item.source_manager_plan_id.as_deref() == Some(intent.plan.plan_id.as_str())
-                    && !observation
-                        .work_items
-                        .iter()
-                        .any(|known| known.work_id == item.work_id)
-                    && !intent
-                        .work_writes
-                        .iter()
-                        .any(|write| write.item.work_id == item.work_id)
-                {
-                    return Err(related_creation_conflict(
-                        "manager found an unobserved child",
-                    ));
+                let path = self.work_item_path(&item.work_id)?;
+                match self.related_record_matches_unlocked(&path, item)? {
+                    true => {}
+                    false
+                        if allow_missing_committed_work
+                            && intent
+                                .work_writes
+                                .iter()
+                                .any(|write| write.item.work_id == item.work_id) => {}
+                    false => {
+                        return Err(related_creation_conflict(
+                            "manager observation Work disappeared",
+                        ));
+                    }
                 }
             }
         }
+        Ok(())
+    }
 
+    /// Read-only transition checks for every sealed manager effect. Returns
+    /// whether every committed successor is already present. Conflicting on-disk
+    /// evidence is refused even when some effects are still absent.
+    fn preflight_manager_mutation_effect_transitions_unlocked(
+        &self,
+        intent: &ManagerMutationIntent,
+    ) -> Result<bool, OrchError> {
         let mut present = self.manager_record_transition_unlocked(
             &self.manager_plan_path(&intent.plan.plan_id)?,
             Some(&intent.prior_plan),
@@ -3608,11 +4124,219 @@ impl OrchStore {
             }
             present &= current == Some(sequence.next);
         }
+        Ok(present)
+    }
+
+    fn preflight_manager_mutation_observation_conflicts_unlocked(
+        &self,
+        intent: &ManagerMutationIntent,
+    ) -> Result<(), OrchError> {
+        if let Some(observation) = &intent.observation {
+            // An unobserved adopted child is a conflicting writer, not a
+            // reason to materialize another child for that logical step.
+            for item in self
+                .list_work_items_unlocked()
+                .map_err(Self::orch_error_from_anyhow)?
+            {
+                if item.session_id == intent.plan.session_id
+                    && item.workspace == intent.plan.workspace
+                    && item.kind != "manager-decision"
+                    && intent.plan.steps.iter().any(|step| {
+                        item.source_manager_step_id.as_deref() == Some(step.step_id.as_str())
+                    })
+                    && item.source_manager_plan_id.as_deref() == Some(intent.plan.plan_id.as_str())
+                    && !observation
+                        .work_items
+                        .iter()
+                        .any(|known| known.work_id == item.work_id)
+                    && !intent
+                        .work_writes
+                        .iter()
+                        .any(|write| write.item.work_id == item.work_id)
+                {
+                    return Err(related_creation_conflict(
+                        "manager found an unobserved child",
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Post-commit prune recovery must prove authorization, seal integrity,
+    /// canonical receipt shape, and observation conflicts before replaying any
+    /// committed effect that was removed after the mutation committed.
+    fn preflight_post_commit_prune_recovery_unlocked(
+        &self,
+        intent: &ManagerMutationIntent,
+        sealed_binding: &WorkRequestBinding,
+        sealed_response: &serde_json::Value,
+    ) -> Result<(), OrchError> {
+        intent.validate()?;
+        if intent.snapshot_digest != intent.digest()? {
+            return Err(related_creation_conflict(
+                "manager mutation intent seal does not match its committed body",
+            ));
+        }
+        self.preflight_manager_mutation_observed_work_snapshots_unlocked(intent, true)?;
+        self.preflight_manager_mutation_observation_conflicts_unlocked(intent)?;
+        self.preflight_manager_mutation_effect_transitions_unlocked(intent)?;
+        let receipt = self.inspect_canonical_request_receipt_unlocked(sealed_binding)?;
+        if receipt.status == "failed" || receipt.error.is_some() {
+            return Err(related_creation_conflict(
+                "post-commit prune recovery refuses a failed caller receipt",
+            ));
+        }
+        if receipt.status == "pending" && !creation_receipt_is_pending(&receipt) {
+            return Err(related_creation_conflict(
+                "post-commit prune recovery refuses a tampered caller receipt",
+            ));
+        }
+        if receipt.status == "complete" {
+            let settled = receipt.error.is_none()
+                && receipt.response == *sealed_response
+                && receipt.run_id.as_deref() == Some(intent.plan.plan_id.as_str());
+            if !settled {
+                return Err(related_creation_conflict(
+                    "post-commit prune recovery refuses a caller receipt with a conflicting outcome",
+                ));
+            }
+        }
+        if receipt.payload_hash != sealed_binding.payload_hash {
+            return Err(related_creation_conflict(
+                "post-commit prune recovery refuses a caller receipt with a conflicting payload hash",
+            ));
+        }
+        if receipt.status == "pending" {
+            self.preflight_related_receipt_unlocked(
+                intent.request.as_ref(),
+                sealed_response,
+                &intent.plan.plan_id,
+                false,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn preflight_manager_mutation_unlocked(
+        &self,
+        intent: &ManagerMutationIntent,
+    ) -> Result<(), OrchError> {
+        intent.validate()?;
+        self.preflight_manager_mutation_observed_work_snapshots_unlocked(intent, false)?;
+        self.preflight_manager_mutation_observation_conflicts_unlocked(intent)?;
+        let present = self.preflight_manager_mutation_effect_transitions_unlocked(intent)?;
         self.preflight_related_receipt_unlocked(
             intent.request.as_ref(),
             &intent.response(),
             &intent.plan.plan_id,
             present,
+        )
+    }
+
+    /// Post-commit prune recovery must not settle a pending receipt while
+    /// committed manager effects are still absent. Replay only transitions
+    /// that are missing, then require every sealed effect to be present.
+    fn replay_missing_manager_mutation_effects_unlocked(
+        &self,
+        intent: &ManagerMutationIntent,
+    ) -> Result<(), OrchError> {
+        let plan_path = self.manager_plan_path(&intent.plan.plan_id)?;
+        if !self.manager_record_transition_unlocked(
+            &plan_path,
+            Some(&intent.prior_plan),
+            &intent.plan,
+        )? {
+            self.save_manager_plan_unlocked(&intent.plan)?;
+        }
+        for write in &intent.work_writes {
+            let path = self.work_item_path(&write.item.work_id)?;
+            if !self.manager_record_transition_unlocked(&path, write.prior.as_ref(), &write.item)? {
+                self.write_work_item_unlocked(&write.item)
+                    .map_err(Self::orch_error_from_anyhow)?;
+            }
+        }
+        if let Some(sequence) = &intent.sequence {
+            let current = self.read_manager_sequence_unlocked()?;
+            if current != Some(sequence.next) {
+                if current != sequence.prior && current != Some(sequence.next) {
+                    return Err(related_creation_conflict(
+                        "manager message sequence has conflicting evidence",
+                    ));
+                }
+                atomic_write_bytes(
+                    &self.lease(),
+                    &self.inner.root.join("messages/seq"),
+                    sequence.next.to_string().as_bytes(),
+                )
+                .map_err(Self::orch_error_from_anyhow)?;
+            }
+        }
+        for write in &intent.message_writes {
+            let path = self.message_path(&write.message.message_id)?;
+            if !self.manager_record_transition_unlocked(
+                &path,
+                write.prior.as_ref(),
+                &write.message,
+            )? {
+                atomic_write_json(&self.lease(), &path, &write.message)
+                    .map_err(Self::orch_error_from_anyhow)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn require_manager_mutation_committed_effects_unlocked(
+        &self,
+        intent: &ManagerMutationIntent,
+    ) -> Result<(), OrchError> {
+        let mut present = self.manager_record_transition_unlocked(
+            &self.manager_plan_path(&intent.plan.plan_id)?,
+            Some(&intent.prior_plan),
+            &intent.plan,
+        )?;
+        if !present {
+            return Err(related_creation_conflict(
+                "manager prune recovery is missing its committed plan",
+            ));
+        }
+        for write in &intent.work_writes {
+            present &= self.manager_record_transition_unlocked(
+                &self.work_item_path(&write.item.work_id)?,
+                write.prior.as_ref(),
+                &write.item,
+            )?;
+            if !present {
+                return Err(related_creation_conflict(
+                    "manager prune recovery is missing committed Work",
+                ));
+            }
+        }
+        for write in &intent.message_writes {
+            present &= self.manager_record_transition_unlocked(
+                &self.message_path(&write.message.message_id)?,
+                write.prior.as_ref(),
+                &write.message,
+            )?;
+            if !present {
+                return Err(related_creation_conflict(
+                    "manager prune recovery is missing committed notification",
+                ));
+            }
+        }
+        if let Some(sequence) = &intent.sequence {
+            let current = self.read_manager_sequence_unlocked()?;
+            if current != Some(sequence.next) {
+                return Err(related_creation_conflict(
+                    "manager prune recovery is missing committed message sequence",
+                ));
+            }
+        }
+        self.preflight_related_receipt_unlocked(
+            intent.request.as_ref(),
+            &intent.response(),
+            &intent.plan.plan_id,
+            true,
         )
     }
 
@@ -3652,15 +4376,18 @@ impl OrchStore {
         crash_process_if_stage("manager_mutation_after_messages");
         self.save_manager_plan_unlocked(&intent.plan)?;
         crash_process_if_stage("manager_mutation_after_plan");
-        self.complete_bound_request_unlocked(
-            intent.request.as_ref().map(|request| &request.binding),
-            &intent.response(),
-        )?;
-        crash_process_if_stage("manager_mutation_after_receipt");
         Ok(())
     }
 
     fn recover_manager_creation_intents(&self) -> Result<(), OrchError> {
+        if self
+            .inner
+            .root
+            .join("ledger-admission-recovery.json")
+            .is_file()
+        {
+            return Ok(());
+        }
         let _guard = self.inner.lock.lock();
         let mut intents = Vec::new();
         for entry in fs::read_dir(self.inner.root.join("manager-intents"))
@@ -3703,7 +4430,12 @@ impl OrchStore {
                     self.commit_manager_creation_intent_unlocked(&intent)?
                 }
                 ManagerIntent::Mutation(intent) => {
-                    self.commit_manager_mutation_unlocked(&intent)?
+                    self.commit_manager_mutation_unlocked(&intent)?;
+                    self.complete_bound_request_unlocked(
+                        intent.request.as_ref().map(|request| &request.binding),
+                        &intent.response(),
+                    )?;
+                    crash_process_if_stage("manager_mutation_after_receipt");
                 }
             }
             self.clear_related_intent_unlocked(&path)?;
@@ -3870,7 +4602,13 @@ impl OrchStore {
             } else {
                 error
             }
-        })
+        })?;
+        if intent.operation == "create" {
+            if let Some(request) = intent.request.as_ref() {
+                self.persist_idempotency_request_scope_binding_unlocked(request)?;
+            }
+        }
+        Ok(())
     }
 
     fn clear_work_lifecycle_intent_unlocked(&self, intent_id: &str) -> Result<(), OrchError> {
@@ -3885,6 +4623,26 @@ impl OrchStore {
         serde_json::to_value(item)
             .map(|value| super::hash_payload(&value))
             .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))
+    }
+
+    /// Caller-visible create payload (schema-2 / #585). Excludes server-assigned
+    /// work identity fields so recovery matches the original idempotency hash.
+    fn legacy_creation_request_payload_hash_from_item(
+        request: &WorkRequestBinding,
+        item: &WorkItem,
+    ) -> Result<String, OrchError> {
+        let payload = serde_json::json!({
+            "sessionId": request.session_id,
+            "workspace": request.payload_workspace_for_hash(),
+            "kind": item.kind,
+            "objective": item.objective,
+            "priority": item.priority,
+            "deadline": item.deadline,
+            "parentWorkId": item.parent_work_id,
+            "dependencies": item.dependencies,
+            "policy": item.policy,
+        });
+        Ok(super::hash_payload(&payload))
     }
 
     fn attempt_digest(attempt: &WorkAttempt) -> Result<String, OrchError> {
@@ -3924,6 +4682,11 @@ impl OrchStore {
             )?;
         }
         crash_process_if_stage("lifecycle_after_receipt");
+        if intent.operation == "create" {
+            if let Some(request) = intent.request.as_ref() {
+                self.persist_idempotency_request_scope_binding_unlocked(request)?;
+            }
+        }
         self.clear_work_lifecycle_intent_unlocked(&intent.intent_id)
             .map_err(|error| self.note_work_recovery_required(error))?;
         crash_process_if_stage("lifecycle_after_commit");
@@ -4075,6 +4838,20 @@ impl OrchStore {
             .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
         if intent.prior_item.is_none() {
             let request = intent.request.as_ref().expect("validated creation request");
+            let caller_inputs =
+                Self::legacy_creation_request_payload_hash_from_item(request, &intent.item)?;
+            if caller_inputs != request.payload_hash {
+                return Err(related_creation_conflict(
+                    "creation receipt does not match sealed caller inputs",
+                ));
+            }
+            if let Some(sealed) = intent.creation_request_digest.as_deref() {
+                if sealed != request.payload_hash.as_str() {
+                    return Err(related_creation_conflict(
+                        "creation request digest does not match the authenticated receipt hash",
+                    ));
+                }
+            }
             let receipt = self.inspect_canonical_request_receipt_unlocked(request)?;
             let response = lifecycle_response_value(intent)?;
             let settled = receipt.status == "complete"
@@ -5288,7 +6065,8 @@ impl OrchStore {
         }
         for activation in activations.into_iter().skip(MAX_ACTIVATION_HISTORY) {
             let path = self.routine_activation_path(routine_id, &activation.activation_id)?;
-            let _ = remove_file_durable(&self.lease(), &path);
+            remove_file_durable(&self.lease(), &path)
+                .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
         }
         // Dedupe receipts outlive activation history so a late replay cannot
         // mint a second Work item after the inspectable history window.
@@ -6681,7 +7459,7 @@ impl OrchStore {
         let path = self.message_path(&message.message_id)?;
         atomic_write_json(&self.lease(), &path, &message)
             .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
-        self.prune_messages_unlocked()?;
+        let _ = self.prune_messages_unlocked();
         Ok(message.clone())
     }
 
@@ -6926,7 +7704,14 @@ impl OrchStore {
         messages.sort_by_key(|message| message.seq);
         let drop = messages.len() - MAX_RETAINED_MESSAGES;
         for message in messages.into_iter().take(drop) {
-            let _ = remove_file_durable(&self.lease(), &self.message_path(&message.message_id)?);
+            if crate::verified_change::prune_remove_fault_armed() {
+                return Err(OrchError::new(
+                    OrchErrorCode::Internal,
+                    "injected prune remove failure",
+                ));
+            }
+            remove_file_durable(&self.lease(), &self.message_path(&message.message_id)?)
+                .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
         }
         Ok(())
     }
@@ -7958,10 +8743,27 @@ impl OrchStore {
         self.inner.ledger_admission_closed.lock().clone()
     }
 
+    pub fn post_commit_prune_recovery_marker_present(&self) -> bool {
+        self.inner
+            .root
+            .join("ledger-admission-recovery.json")
+            .is_file()
+    }
+
     /// Protect only this request's sealed Work outcome. Closing admission for
     /// another request must not turn an ordinary unrelated refusal into a
     /// recoverable mutation. Unreadable evidence is conservative: keep the
     /// claim rather than destroy an outcome which reopening must inspect.
+    ///
+    /// Truth table (durable admission / failure / recovery):
+    /// | Phase | Durable intent | Admission | Receipt on caller error | Recovery on reopen |
+    /// |-------|----------------|-----------|-------------------------|-------------------|
+    /// | Refusal before intent | none | open | failed (definite) | n/a |
+    /// | Intent persist fails | none/partial | closed | pending | replay or refuse |
+    /// | After intent, before commit | yes | closed | pending | commit intent |
+    /// | After intent, revoke/pre-commit fails | yes | closed | pending | commit intent |
+    /// | After commit, prune pending | marker+intent | closed | pending | finalize prune |
+    /// | Uncertain (open admission + intent) | yes | open | pending | must not fail receipt |
     pub(crate) fn work_request_recovery_is_pending(
         &self,
         scope: &IdempotencyScope,
@@ -7969,10 +8771,65 @@ impl OrchStore {
         request_id: &str,
         payload_hash: &str,
     ) -> bool {
+        if self.bound_request_has_durable_recovery_intent(scope, tool, request_id, payload_hash) {
+            return true;
+        }
         if self.ledger_admission_closed().is_none() {
             return false;
         }
+        if self.post_commit_prune_recovery_matches(scope, tool, request_id, payload_hash) {
+            return true;
+        }
+        self.bound_request_has_durable_recovery_intent_or_unreadable(
+            scope,
+            tool,
+            request_id,
+            payload_hash,
+        )
+    }
+
+    fn bound_request_has_durable_recovery_intent(
+        &self,
+        scope: &IdempotencyScope,
+        tool: &str,
+        request_id: &str,
+        payload_hash: &str,
+    ) -> bool {
         let _guard = self.inner.lock.lock();
+        self.bound_request_matches_durable_intent_unlocked(
+            scope,
+            tool,
+            request_id,
+            payload_hash,
+            false,
+        )
+    }
+
+    fn bound_request_has_durable_recovery_intent_or_unreadable(
+        &self,
+        scope: &IdempotencyScope,
+        tool: &str,
+        request_id: &str,
+        payload_hash: &str,
+    ) -> bool {
+        let _guard = self.inner.lock.lock();
+        self.bound_request_matches_durable_intent_unlocked(
+            scope,
+            tool,
+            request_id,
+            payload_hash,
+            true,
+        )
+    }
+
+    fn bound_request_matches_durable_intent_unlocked(
+        &self,
+        scope: &IdempotencyScope,
+        tool: &str,
+        request_id: &str,
+        payload_hash: &str,
+        treat_unreadable_as_pending: bool,
+    ) -> bool {
         for directory in [
             "work-intents",
             "work-lifecycle-intents",
@@ -7980,28 +8837,47 @@ impl OrchStore {
             "routine-intents",
         ] {
             let Ok(entries) = fs::read_dir(self.inner.root.join(directory)) else {
-                return true;
+                if treat_unreadable_as_pending {
+                    return true;
+                }
+                continue;
             };
             for entry in entries {
                 let Ok(entry) = entry else {
-                    return true;
+                    if treat_unreadable_as_pending {
+                        return true;
+                    }
+                    continue;
                 };
                 let path = entry.path();
                 if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
                     continue;
                 }
                 let Ok(bytes) = fs::read(path) else {
-                    return true;
+                    if treat_unreadable_as_pending {
+                        return true;
+                    }
+                    continue;
                 };
                 let request = match directory {
                     "work-intents" => match serde_json::from_slice::<WorkMutationIntent>(&bytes) {
                         Ok(intent) if intent.validate().is_ok() => intent.request,
-                        _ => return true,
+                        _ => {
+                            if treat_unreadable_as_pending {
+                                return true;
+                            }
+                            continue;
+                        }
                     },
                     "work-lifecycle-intents" => {
                         match serde_json::from_slice::<WorkLifecycleIntent>(&bytes) {
                             Ok(intent) if intent.validate().is_ok() => intent.request,
-                            _ => return true,
+                            _ => {
+                                if treat_unreadable_as_pending {
+                                    return true;
+                                }
+                                continue;
+                            }
                         }
                     }
                     "manager-intents" => match ManagerIntent::decode(&bytes) {
@@ -8011,14 +8887,24 @@ impl OrchStore {
                         Ok(ManagerIntent::Mutation(intent)) => {
                             intent.request.map(|request| request.binding)
                         }
-                        _ => return true,
+                        _ => {
+                            if treat_unreadable_as_pending {
+                                return true;
+                            }
+                            continue;
+                        }
                     },
                     "routine-intents" => {
                         match serde_json::from_slice::<RoutineFireIntent>(&bytes) {
                             Ok(intent) if intent.validate().is_ok() => {
                                 intent.request.map(|request| request.binding)
                             }
-                            _ => return true,
+                            _ => {
+                                if treat_unreadable_as_pending {
+                                    return true;
+                                }
+                                continue;
+                            }
                         }
                     }
                     _ => unreachable!("fixed intent directory list"),
@@ -8050,6 +8936,295 @@ impl OrchStore {
         *self.inner.ledger_admission_closed.lock() = Some(message.clone());
         *self.inner.last_run_error.lock() = Some(message);
         error
+    }
+
+    fn post_commit_prune_recovery_matches(
+        &self,
+        scope: &IdempotencyScope,
+        tool: &str,
+        request_id: &str,
+        payload_hash: &str,
+    ) -> bool {
+        let path = self.inner.root.join("ledger-admission-recovery.json");
+        if !path.is_file() {
+            return false;
+        }
+        let marker = match fs::read_to_string(&path)
+            .ok()
+            .and_then(|text| serde_json::from_str::<LedgerAdmissionRecoveryMarker>(&text).ok())
+        {
+            Some(marker) => marker,
+            None => return true,
+        };
+        marker.owner_id == scope.owner_id
+            && marker.session_id == scope.session_id
+            && marker.workspace_digest == scope.workspace_digest
+            && marker.tool == tool
+            && marker.request_id == request_id
+            && marker.payload_hash == payload_hash
+    }
+
+    fn persist_ledger_admission_recovery_unlocked(
+        &self,
+        intent: &ManagerMutationIntent,
+    ) -> Result<(), OrchError> {
+        let request = intent.request.as_ref().ok_or_else(|| {
+            OrchError::new(
+                OrchErrorCode::Internal,
+                "manager mutation lost its request binding before prune recovery",
+            )
+        })?;
+        let marker = LedgerAdmissionRecoveryMarker {
+            schema_version: 2,
+            intent_id: intent.intent_id.clone(),
+            owner_id: request.binding.owner_id.clone(),
+            session_id: request.binding.session_id,
+            workspace_digest: request.binding.workspace_digest.clone(),
+            tool: request.binding.tool.clone(),
+            request_id: request.binding.request_id.clone(),
+            payload_hash: request.binding.payload_hash.clone(),
+            sealed_binding: Some(request.binding.clone()),
+            sealed_response: Some(intent.response()),
+            sealed_mutation_intent: Some(intent.clone()),
+        };
+        atomic_write_json(
+            &self.lease(),
+            &self.inner.root.join("ledger-admission-recovery.json"),
+            &marker,
+        )
+        .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        Ok(())
+    }
+
+    fn load_ledger_admission_recovery_marker(&self) -> Result<(), OrchError> {
+        let path = self.inner.root.join("ledger-admission-recovery.json");
+        if !path.is_file() {
+            return Ok(());
+        }
+        self.mark_admission_closed_until_reopen();
+        Ok(())
+    }
+
+    fn mark_admission_closed_until_reopen(&self) {
+        let message = "ledger admission is closed until the store is reopened".to_string();
+        *self.inner.ledger_admission_closed.lock() = Some(message.clone());
+        *self.inner.last_run_error.lock() = Some(message);
+    }
+
+    fn maybe_finalize_post_commit_prune_recovery(&self) -> Result<(), OrchError> {
+        let path = self.inner.root.join("ledger-admission-recovery.json");
+        if !path.is_file() {
+            return Ok(());
+        }
+        self.finalize_post_commit_prune_recovery_unlocked()
+    }
+
+    fn validate_ledger_admission_recovery_marker_unlocked(
+        &self,
+        marker: &LedgerAdmissionRecoveryMarker,
+    ) -> Result<(WorkRequestBinding, serde_json::Value), OrchError> {
+        let binding = marker.sealed_binding.as_ref().ok_or_else(|| {
+            related_creation_conflict("post-commit prune recovery marker lacks sealed binding")
+        })?;
+        let response = marker.sealed_response.as_ref().ok_or_else(|| {
+            related_creation_conflict("post-commit prune recovery marker lacks sealed response")
+        })?;
+        if marker.schema_version < 2 {
+            return Err(related_creation_conflict(
+                "post-commit prune recovery marker is too old to seal caller evidence",
+            ));
+        }
+        if marker.owner_id != binding.owner_id
+            || marker.session_id != binding.session_id
+            || marker.workspace_digest != binding.workspace_digest
+            || marker.tool != binding.tool
+            || marker.request_id != binding.request_id
+            || marker.payload_hash != binding.payload_hash
+        {
+            return Err(related_creation_conflict(
+                "post-commit prune recovery marker identity does not match its sealed binding",
+            ));
+        }
+        Ok((binding.clone(), response.clone()))
+    }
+
+    fn rehydrate_manager_mutation_intent_from_prune_marker_unlocked(
+        &self,
+        marker: &LedgerAdmissionRecoveryMarker,
+        response: &serde_json::Value,
+    ) -> Result<ManagerMutationIntent, OrchError> {
+        let plan: ManagerPlan = serde_json::from_value(
+            response
+                .get("plan")
+                .cloned()
+                .ok_or_else(|| related_creation_conflict("prune recovery response lacks plan"))?,
+        )
+        .map_err(|_| related_creation_conflict("prune recovery response plan is malformed"))?;
+        let work_items: Vec<WorkItem> = response
+            .get("createdWork")
+            .map(|value| serde_json::from_value(value.clone()))
+            .transpose()
+            .map_err(|_| related_creation_conflict("prune recovery createdWork is malformed"))?
+            .unwrap_or_default();
+        let messages: Vec<WorkMessage> = response
+            .get("messages")
+            .map(|value| serde_json::from_value(value.clone()))
+            .transpose()
+            .map_err(|_| related_creation_conflict("prune recovery messages are malformed"))?
+            .unwrap_or_default();
+        let native_executor = response
+            .get("nativeExecutor")
+            .map(|value| serde_json::from_value(value.clone()))
+            .transpose()
+            .map_err(|_| related_creation_conflict("prune recovery nativeExecutor is malformed"))?;
+        let operation = if !messages.is_empty() {
+            "tick"
+        } else if work_items.is_empty() {
+            "advance"
+        } else {
+            "tick"
+        };
+        let work_writes = work_items
+            .iter()
+            .map(|item| {
+                Ok(ManagerWorkWrite {
+                    prior: self
+                        .read_manager_record_unlocked(&self.work_item_path(&item.work_id)?)?,
+                    item: item.clone(),
+                })
+            })
+            .collect::<Result<Vec<_>, OrchError>>()?;
+        let sequence_prior = if messages.is_empty() {
+            None
+        } else {
+            self.read_manager_sequence_unlocked()?
+        };
+        let message_writes = messages
+            .iter()
+            .map(|message| {
+                Ok(ManagerMessageWrite {
+                    prior: self
+                        .read_manager_record_unlocked(&self.message_path(&message.message_id)?)?,
+                    message: message.clone(),
+                })
+            })
+            .collect::<Result<Vec<_>, OrchError>>()?;
+        let sequence = (!messages.is_empty()).then_some(ManagerSequenceWrite {
+            prior: sequence_prior,
+            next: messages
+                .iter()
+                .map(|message| message.seq)
+                .max()
+                .unwrap_or(sequence_prior.unwrap_or(0)),
+        });
+        let mut intent = ManagerMutationIntent {
+            schema_version: 3,
+            intent_id: marker.intent_id.clone(),
+            operation: operation.into(),
+            prior_plan: plan.clone(),
+            plan,
+            work_writes,
+            message_writes,
+            sequence,
+            observation: None,
+            native_executor,
+            snapshot_digest: String::new(),
+            request: None,
+        };
+        intent.snapshot_digest = intent.digest()?;
+        Ok(intent)
+    }
+
+    fn finalize_post_commit_prune_recovery_unlocked(&self) -> Result<(), OrchError> {
+        let path = self.inner.root.join("ledger-admission-recovery.json");
+        if !path.is_file() {
+            return Ok(());
+        }
+        let marker: LedgerAdmissionRecoveryMarker = serde_json::from_str(
+            &fs::read_to_string(&path)
+                .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?,
+        )
+        .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        let intent_path = self.manager_creation_intent_path(&marker.intent_id)?;
+        let _guard = self.inner.lock.lock();
+        let refusal = (|| -> Result<(), OrchError> {
+            let (sealed_binding, sealed_response) =
+                self.validate_ledger_admission_recovery_marker_unlocked(&marker)?;
+            let intent = if intent_path.is_file() {
+                let intent = ManagerIntent::decode(&fs::read(&intent_path).map_err(|error| {
+                    OrchError::new(OrchErrorCode::Internal, error.to_string())
+                })?)?;
+                match intent {
+                    ManagerIntent::Mutation(intent) => intent,
+                    ManagerIntent::Creation(_) => {
+                        return Err(OrchError::new(
+                            OrchErrorCode::Internal,
+                            "post-commit prune recovery expected a manager mutation intent",
+                        ));
+                    }
+                }
+            } else if let Some(intent) = marker.sealed_mutation_intent.clone() {
+                Box::new(intent)
+            } else {
+                Box::new(
+                    self.rehydrate_manager_mutation_intent_from_prune_marker_unlocked(
+                        &marker,
+                        &sealed_response,
+                    )?,
+                )
+            };
+            if intent.intent_id != marker.intent_id {
+                return Err(related_creation_conflict(
+                    "post-commit prune recovery marker does not match its manager intent",
+                ));
+            }
+            if intent.response() != sealed_response {
+                return Err(related_creation_conflict(
+                    "post-commit prune recovery marker response does not match committed effects",
+                ));
+            }
+            if let Some(request) = intent.request.as_ref() {
+                if request.binding.owner_id != sealed_binding.owner_id
+                    || request.binding.session_id != sealed_binding.session_id
+                    || request.binding.workspace_digest != sealed_binding.workspace_digest
+                    || request.binding.tool != sealed_binding.tool
+                    || request.binding.request_id != sealed_binding.request_id
+                    || request.binding.payload_hash != sealed_binding.payload_hash
+                {
+                    return Err(related_creation_conflict(
+                        "post-commit prune recovery marker binding does not match its manager intent",
+                    ));
+                }
+            }
+            self.preflight_post_commit_prune_recovery_unlocked(
+                &intent,
+                &sealed_binding,
+                &sealed_response,
+            )?;
+            self.replay_missing_manager_mutation_effects_unlocked(&intent)?;
+            self.require_manager_mutation_committed_effects_unlocked(&intent)?;
+            if let Err(error) = self.prune_messages_unlocked() {
+                self.note_work_recovery_required(error);
+                return Ok(());
+            }
+            self.complete_bound_request_unlocked(Some(&sealed_binding), &sealed_response)?;
+            remove_file_durable(&self.lease(), &path)
+                .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+            if intent_path.is_file() {
+                self.clear_related_intent_unlocked(&intent_path)?;
+            }
+            *self.inner.ledger_admission_closed.lock() = None;
+            *self.inner.last_run_error.lock() = None;
+            Ok(())
+        })();
+        match refusal {
+            Ok(()) => Ok(()),
+            Err(error) if error.code == OrchErrorCode::Conflict => {
+                self.mark_admission_closed_until_reopen();
+                Ok(())
+            }
+            Err(error) => Err(error),
+        }
     }
 
     fn refuse_closed_admission(&self) -> Result<(), OrchError> {
@@ -8157,6 +9332,7 @@ impl OrchStore {
         if response.is_null() {
             return Ok(());
         }
+        self.persist_idempotency_request_scope_binding_unlocked(request)?;
         let scope = IdempotencyScope {
             owner_id: request.owner_id.clone(),
             session_id: request.session_id,
@@ -9589,6 +10765,24 @@ impl OrchStore {
 
     fn admission_guarded_receipt_paths(&self) -> Vec<PathBuf> {
         let mut guarded = Vec::new();
+        let marker_path = self.inner.root.join("ledger-admission-recovery.json");
+        if marker_path.is_file() {
+            if let Ok(text) = fs::read_to_string(&marker_path) {
+                if let Ok(marker) = serde_json::from_str::<LedgerAdmissionRecoveryMarker>(&text) {
+                    let scope = IdempotencyScope {
+                        owner_id: marker.owner_id,
+                        session_id: marker.session_id,
+                        workspace_digest: marker.workspace_digest,
+                    };
+                    if let Ok(receipt_path) = self.idemp_path(&scope, &marker.request_id) {
+                        guarded.push(receipt_path);
+                    }
+                    if let Ok(legacy_path) = self.legacy_owner_v2_path(&scope, &marker.request_id) {
+                        guarded.push(legacy_path);
+                    }
+                }
+            }
+        }
         let Ok(entries) = fs::read_dir(self.inner.root.join("apply-admissions")) else {
             return guarded;
         };
@@ -11084,6 +12278,16 @@ impl OrchStore {
         reason: &str,
         expected_revision: Option<u64>,
     ) -> Result<(WorkItem, Vec<WorkAttempt>), OrchError> {
+        self.cancel_work_checked_with_pre_commit(work_id, reason, expected_revision, |_| Ok(()))
+    }
+
+    pub fn cancel_work_checked_with_pre_commit(
+        &self,
+        work_id: &str,
+        reason: &str,
+        expected_revision: Option<u64>,
+        pre_commit: impl FnOnce(&[ManagedExecutionIntent]) -> Result<(), OrchError>,
+    ) -> Result<(WorkItem, Vec<WorkAttempt>), OrchError> {
         let request = self.adopt_operation_request();
         let _guard = self.inner.lock.lock();
         let mut item = self
@@ -11098,6 +12302,7 @@ impl OrchStore {
                     .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?,
             ));
         }
+        let revision_fence = item.revision;
         let now = Utc::now();
         let prior_item = item.clone();
         let prior_attempts = self
@@ -11123,14 +12328,74 @@ impl OrchStore {
             candidate_verification: None,
         });
         item.bump();
-        self.commit_lifecycle_with_request_unlocked(
+        let managed_intents = self
+            .list_managed_intents_unlocked()?
+            .into_iter()
+            .filter(|intent| intent.work_id == work_id && intent.grok.is_some())
+            .collect::<Vec<_>>();
+        let fresh = self
+            .load_work_item_unlocked(work_id)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
+            .ok_or_else(|| OrchError::new(OrchErrorCode::Conflict, "work item not found"))?;
+        if fresh.revision != revision_fence {
+            return Err(OrchError::new(
+                OrchErrorCode::StaleVersion,
+                format!(
+                    "work item revision is {}, expected {}",
+                    fresh.revision, revision_fence
+                ),
+            ));
+        }
+        Self::require_work_revision(&fresh, expected_revision)?;
+        let mut lifecycle_intent = WorkLifecycleIntent::new(
             "cancel",
             prior_item,
             item.clone(),
             prior_attempts,
             attempts.clone(),
-            request,
         )?;
+        if let Some(request) = request {
+            self.validate_bound_request_unlocked(
+                &request,
+                lifecycle_intent
+                    .prior_item
+                    .as_ref()
+                    .expect("cancel constructor seals a prior item"),
+                &lifecycle_intent.prior_attempts,
+                &lifecycle_intent.attempts,
+            )?;
+            lifecycle_intent.request = Some(request);
+        }
+        if Self::lifecycle_settles_service_receipt(&lifecycle_intent) {
+            self.preflight_bound_work_outcome_unlocked(
+                lifecycle_intent.request.as_ref(),
+                &lifecycle_response_value(&lifecycle_intent)?,
+                &lifecycle_intent.work_id,
+                false,
+            )?;
+        }
+        crash_process_if_stage("lifecycle_before_intent");
+        self.persist_work_lifecycle_intent_unlocked(&lifecycle_intent)?;
+        crash_process_if_stage("lifecycle_after_intent");
+        crash_process_if_stage("cancel_after_intent");
+        pre_commit(&managed_intents).map_err(|error| self.note_work_recovery_required(error))?;
+        crash_process_if_stage("cancel_after_revoke");
+        let fresh = self
+            .load_work_item_unlocked(work_id)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
+            .ok_or_else(|| OrchError::new(OrchErrorCode::Conflict, "work item not found"))?;
+        if fresh.revision != revision_fence {
+            return Err(OrchError::new(
+                OrchErrorCode::StaleVersion,
+                format!(
+                    "work item revision is {}, expected {}",
+                    fresh.revision, revision_fence
+                ),
+            ));
+        }
+        Self::require_work_revision(&fresh, expected_revision)?;
+        self.commit_work_lifecycle_intent_unlocked(&lifecycle_intent)
+            .map_err(|error| self.note_work_recovery_required(error))?;
         Ok((item, attempts))
     }
 
@@ -12162,6 +13427,238 @@ impl OrchStore {
         Ok(receipts)
     }
 
+    fn idempotency_receipt_path_via_bound_workspace_alias_unlocked(
+        &self,
+        scope: &IdempotencyScope,
+        tool: &str,
+        request_id: &str,
+        payload_hash: &str,
+        claimed_canonical_workspace: &str,
+    ) -> Result<Option<(PathBuf, IdempotencyScope)>, OrchError> {
+        if let Some(binding) =
+            self.load_idempotency_request_scope_binding_unlocked(&scope.owner_id, request_id)?
+        {
+            if binding.session_id != scope.session_id {
+                return Err(idempotency_scope_binding_invalid());
+            }
+            if idempotency_scope_binding_matches_claim_scope(
+                scope,
+                Some(claimed_canonical_workspace),
+                &binding.workspace_display,
+                &binding.workspace_digest,
+            ) {
+                if binding.tool != tool || binding.payload_hash != payload_hash {
+                    return Err(idempotency_request_identity_conflict());
+                }
+                let bound_scope = Self::validated_scope_binding_shard(&binding)?;
+                if bound_scope.workspace_digest != scope.workspace_digest {
+                    let receipt_path = self.idemp_path(&bound_scope, request_id)?;
+                    if receipt_path.is_file() {
+                        return Ok(Some((receipt_path, bound_scope)));
+                    }
+                }
+            }
+        }
+        let dir = self.inner.root.join("work-lifecycle-intents");
+        if dir.is_dir() {
+            for entry in fs::read_dir(&dir)
+                .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
+            {
+                let path = entry
+                    .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
+                    .path();
+                if path.extension().and_then(|value| value.to_str()) != Some("json") {
+                    continue;
+                }
+                let intent: WorkLifecycleIntent =
+                    serde_json::from_str(&fs::read_to_string(&path).map_err(|error| {
+                        OrchError::new(OrchErrorCode::Internal, error.to_string())
+                    })?)
+                    .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+                if intent.validate().is_err() || intent.operation != "create" {
+                    continue;
+                }
+                let Some(request) = intent.request.as_ref() else {
+                    continue;
+                };
+                if request.owner_id != scope.owner_id
+                    || request.session_id != scope.session_id
+                    || request.request_id != request_id
+                {
+                    continue;
+                }
+                if !workspaces_match(&request.workspace_display, claimed_canonical_workspace) {
+                    continue;
+                }
+                if request.tool != tool || request.payload_hash != payload_hash {
+                    return Err(idempotency_request_identity_conflict());
+                }
+                let bound_scope = IdempotencyScope::new(
+                    &request.owner_id,
+                    request.session_id,
+                    Path::new(&request.workspace_display),
+                )?;
+                if bound_scope.workspace_digest == scope.workspace_digest {
+                    continue;
+                }
+                let receipt_path = self.idemp_path(&bound_scope, request_id)?;
+                if receipt_path.is_file() {
+                    return Ok(Some((receipt_path, bound_scope)));
+                }
+            }
+        }
+        let owner_dir = self
+            .inner
+            .root
+            .join("idempotency")
+            .join("v2")
+            .join(scope.owner_path_digest());
+        for receipt_path in owner_receipt_files(&owner_dir)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
+        {
+            let Ok(text) = fs::read_to_string(&receipt_path) else {
+                continue;
+            };
+            let Ok(receipt) = serde_json::from_str::<IdempotencyReceipt>(&text) else {
+                continue;
+            };
+            if receipt.owner_id != scope.owner_id
+                || receipt.session_id != scope.session_id
+                || receipt.request_id != request_id
+            {
+                continue;
+            }
+            let alias_workspace =
+                self.idempotency_workspace_display_from_receipt_unlocked(&receipt);
+            if !idempotency_receipt_matches_claim_scope(
+                scope,
+                Some(claimed_canonical_workspace),
+                &receipt.workspace_digest,
+                alias_workspace.as_deref(),
+            ) {
+                continue;
+            }
+            if receipt.tool != tool || receipt.payload_hash != payload_hash {
+                return Err(idempotency_request_identity_conflict());
+            }
+            if receipt.workspace_digest == scope.workspace_digest {
+                continue;
+            }
+            let Some(alias_workspace) = alias_workspace else {
+                continue;
+            };
+            if !workspaces_match(&alias_workspace, claimed_canonical_workspace) {
+                continue;
+            }
+            let bound_scope = IdempotencyScope {
+                owner_id: receipt.owner_id.clone(),
+                session_id: receipt.session_id,
+                workspace_digest: receipt.workspace_digest.clone(),
+            };
+            return Ok(Some((receipt_path, bound_scope)));
+        }
+        Ok(None)
+    }
+
+    fn reject_idempotency_identity_reuse_unlocked(
+        &self,
+        scope: &IdempotencyScope,
+        tool: &str,
+        request_id: &str,
+        payload_hash: &str,
+        claimed_canonical_workspace: Option<&str>,
+    ) -> Result<(), OrchError> {
+        if let Some(binding) =
+            self.load_idempotency_request_scope_binding_unlocked(&scope.owner_id, request_id)?
+        {
+            if binding.session_id == scope.session_id
+                && idempotency_scope_binding_matches_claim_scope(
+                    scope,
+                    claimed_canonical_workspace,
+                    &binding.workspace_display,
+                    &binding.workspace_digest,
+                )
+                && (binding.tool != tool || binding.payload_hash != payload_hash)
+            {
+                return Err(idempotency_request_identity_conflict());
+            }
+        }
+        let dir = self.inner.root.join("work-lifecycle-intents");
+        if dir.is_dir() {
+            for entry in fs::read_dir(&dir)
+                .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
+            {
+                let path = entry
+                    .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
+                    .path();
+                if path.extension().and_then(|value| value.to_str()) != Some("json") {
+                    continue;
+                }
+                let intent: WorkLifecycleIntent =
+                    serde_json::from_str(&fs::read_to_string(&path).map_err(|error| {
+                        OrchError::new(OrchErrorCode::Internal, error.to_string())
+                    })?)
+                    .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+                let Some(request) = intent.request.as_ref() else {
+                    continue;
+                };
+                if request.owner_id != scope.owner_id
+                    || request.session_id != scope.session_id
+                    || request.request_id != request_id
+                {
+                    continue;
+                }
+                if !idempotency_scope_binding_matches_claim_scope(
+                    scope,
+                    claimed_canonical_workspace,
+                    &request.workspace_display,
+                    &request.workspace_digest,
+                ) {
+                    continue;
+                }
+                if request.tool != tool || request.payload_hash != payload_hash {
+                    return Err(idempotency_request_identity_conflict());
+                }
+            }
+        }
+        let owner_dir = self
+            .inner
+            .root
+            .join("idempotency")
+            .join("v2")
+            .join(scope.owner_path_digest());
+        for receipt_path in owner_receipt_files(&owner_dir)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
+        {
+            let Ok(text) = fs::read_to_string(&receipt_path) else {
+                continue;
+            };
+            let Ok(receipt) = serde_json::from_str::<IdempotencyReceipt>(&text) else {
+                continue;
+            };
+            if receipt.owner_id != scope.owner_id
+                || receipt.session_id != scope.session_id
+                || receipt.request_id != request_id
+            {
+                continue;
+            }
+            let alias_workspace =
+                self.idempotency_workspace_display_from_receipt_unlocked(&receipt);
+            if !idempotency_receipt_matches_claim_scope(
+                scope,
+                claimed_canonical_workspace,
+                &receipt.workspace_digest,
+                alias_workspace.as_deref(),
+            ) {
+                continue;
+            }
+            if receipt.tool != tool || receipt.payload_hash != payload_hash {
+                return Err(idempotency_request_identity_conflict());
+            }
+        }
+        Ok(())
+    }
+
     /// Atomically claim a request_id for mutation.
     /// - Existing complete receipt with same hash → `Replay(response)`
     /// - Existing complete receipt with different hash → Conflict
@@ -12173,10 +13670,27 @@ impl OrchStore {
         tool: &str,
         request_id: &str,
         payload_hash: &str,
+        claimed_canonical_workspace: Option<&str>,
     ) -> Result<IdempotencyClaim, OrchError> {
-        let path = self.idemp_path(scope, request_id)?;
         let _g = self.inner.lock.lock();
         self.adopt_legacy_owner_receipt_unlocked(scope, request_id, Some((tool, payload_hash)))?;
+        let primary = self.idemp_path(scope, request_id)?;
+        let (path, alias_scope) = if primary.is_file() {
+            (primary, None)
+        } else if let Some(claimed) = claimed_canonical_workspace {
+            match self.idempotency_receipt_path_via_bound_workspace_alias_unlocked(
+                scope,
+                tool,
+                request_id,
+                payload_hash,
+                claimed,
+            )? {
+                Some((alias_path, bound_scope)) => (alias_path, Some(bound_scope)),
+                None => (primary, None),
+            }
+        } else {
+            (primary, None)
+        };
         // Count, compact, and claim under one critical section so concurrent
         // callers cannot discard more terminal evidence than the one slot
         // needed for the winning claim.
@@ -12203,7 +13717,11 @@ impl OrchStore {
                 .map_err(|e| OrchError::new(OrchErrorCode::Internal, e.to_string()))?;
             let prev: IdempotencyReceipt = serde_json::from_str(&text)
                 .map_err(|e| OrchError::new(OrchErrorCode::Internal, e.to_string()))?;
-            if !prev.is_in_scope(scope)
+            let in_scope = prev.is_in_scope(scope)
+                || alias_scope
+                    .as_ref()
+                    .is_some_and(|bound| prev.is_in_scope(bound));
+            if !in_scope
                 || prev.request_id != request_id
                 || prev.tool != tool
                 || prev.payload_hash != payload_hash
@@ -12237,6 +13755,14 @@ impl OrchStore {
                 "principal idempotency receipt capacity is exhausted",
             ));
         }
+
+        self.reject_idempotency_identity_reuse_unlocked(
+            scope,
+            tool,
+            request_id,
+            payload_hash,
+            claimed_canonical_workspace,
+        )?;
 
         let pending = IdempotencyReceipt {
             schema_version: IDEMPOTENCY_RECEIPT_SCHEMA_VERSION,
@@ -12872,6 +14398,68 @@ pub(crate) fn workspaces_match(left: &str, right: &str) -> bool {
     }
 }
 
+fn idempotency_scope_binding_matches_claim_scope(
+    scope: &IdempotencyScope,
+    claimed_canonical_workspace: Option<&str>,
+    workspace_display: &str,
+    workspace_digest: &str,
+) -> bool {
+    if workspace_digest == scope.workspace_digest {
+        return true;
+    }
+    if let Some(claimed) = claimed_canonical_workspace {
+        return workspaces_match(workspace_display, claimed);
+    }
+    false
+}
+
+fn idempotency_receipt_matches_claim_scope(
+    scope: &IdempotencyScope,
+    claimed_canonical_workspace: Option<&str>,
+    receipt_workspace_digest: &str,
+    alias_workspace_display: Option<&str>,
+) -> bool {
+    if receipt_workspace_digest == scope.workspace_digest {
+        return true;
+    }
+    match (claimed_canonical_workspace, alias_workspace_display) {
+        (Some(claimed), Some(display)) => workspaces_match(display, claimed),
+        _ => false,
+    }
+}
+
+pub(crate) fn idempotency_workspace_digest_for_path(
+    owner_id: &str,
+    session_id: Uuid,
+    workspace: &str,
+) -> Result<String, OrchError> {
+    Ok(IdempotencyScope::new(owner_id, session_id, Path::new(workspace))?.workspace_digest)
+}
+
+/// True when `workspace` names the same v2 receipt shard as the sealed binding,
+/// including producer-bound displays that canonicalize differently on this host.
+pub(crate) fn idempotency_binding_matches_workspace(
+    binding: &WorkRequestBinding,
+    session_id: Uuid,
+    workspace: &str,
+) -> Result<bool, OrchError> {
+    if idempotency_workspace_digest_for_path(&binding.owner_id, session_id, workspace)?
+        == binding.workspace_digest
+    {
+        return Ok(true);
+    }
+    if workspaces_match(&binding.workspace_display, workspace)
+        && idempotency_workspace_digest_for_path(
+            &binding.owner_id,
+            session_id,
+            &binding.workspace_display,
+        )? == binding.workspace_digest
+    {
+        return Ok(true);
+    }
+    Ok(false)
+}
+
 fn owner_receipt_files(owner_dir: &Path) -> anyhow::Result<Vec<PathBuf>> {
     let mut paths = Vec::new();
     if !owner_dir.is_dir() {
@@ -12882,6 +14470,13 @@ fn owner_receipt_files(owner_dir: &Path) -> anyhow::Result<Vec<PathBuf>> {
         let path = entry.path();
         let file_type = entry.file_type()?;
         if file_type.is_dir() {
+            if path
+                .file_name()
+                .and_then(|value| value.to_str())
+                .is_some_and(|name| name == "request-scopes")
+            {
+                continue;
+            }
             for child in fs::read_dir(&path)? {
                 let child = child?;
                 let child_path = child.path();
@@ -14280,11 +15875,837 @@ mod tests {
     }
 
     #[test]
+    fn idempotency_replays_producer_bound_receipt_after_scope_binding_survives_intent_cleanup() {
+        let dir = tempdir().unwrap();
+        let workspace = dir.path().join("workspace");
+        let alias = dir.path().join("alias");
+        fs::create_dir_all(&workspace).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&workspace, &alias).unwrap();
+        #[cfg(not(unix))]
+        {
+            return;
+        }
+        let sealed = crate::orchestration::authz::canonical_workspace(&workspace).unwrap();
+        let sealed_scope = IdempotencyScope::new("owner-a", Uuid::nil(), &sealed).unwrap();
+        let claim_scope = IdempotencyScope::new(
+            "owner-a",
+            Uuid::nil(),
+            Path::new("/tmp/foreign-idempotency-scope-spelling"),
+        )
+        .unwrap();
+        assert_ne!(claim_scope.workspace_digest, sealed_scope.workspace_digest);
+        let store = OrchStore::open(dir.path()).unwrap();
+        let binding = WorkRequestBinding::bound(
+            &sealed_scope,
+            sealed.display().to_string(),
+            "create-alias-replay",
+            "ptah_create_work",
+            "payload-hash",
+            "work_attempts",
+        );
+        store
+            .persist_idempotency_request_scope_binding_unlocked(&binding)
+            .unwrap();
+        let response = serde_json::json!({
+            "work": {
+                "workId": "work-alias-replay",
+                "workspace": sealed.display().to_string(),
+            }
+        });
+        assert!(matches!(
+            store
+                .claim_idempotency(
+                    &sealed_scope,
+                    "ptah_create_work",
+                    "create-alias-replay",
+                    "payload-hash",
+                    None,
+                )
+                .unwrap(),
+            IdempotencyClaim::Perform
+        ));
+        store
+            .complete_idempotency(
+                &sealed_scope,
+                "ptah_create_work",
+                "create-alias-replay",
+                "payload-hash",
+                Some("work-alias-replay".into()),
+                response.clone(),
+            )
+            .unwrap();
+        let replay = store
+            .claim_idempotency(
+                &claim_scope,
+                "ptah_create_work",
+                "create-alias-replay",
+                "payload-hash",
+                Some(sealed.to_str().unwrap()),
+            )
+            .unwrap();
+        match replay {
+            IdempotencyClaim::Replay(Ok(value)) => {
+                assert_eq!(value["work"]["workId"], "work-alias-replay");
+            }
+            other => panic!("expected replay after intent cleanup path: {other:?}"),
+        }
+        assert_eq!(
+            json_paths(&dir.path().join("idempotency"))
+                .into_iter()
+                .filter(|path| {
+                    serde_json::from_slice::<IdempotencyReceipt>(&fs::read(path).unwrap())
+                        .map(|receipt| receipt.request_id == "create-alias-replay")
+                        .unwrap_or(false)
+                })
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn idempotency_scope_binding_rejects_tampered_owner_redirect() {
+        let dir = tempdir().unwrap();
+        let store = OrchStore::open(dir.path()).unwrap();
+        let scope =
+            IdempotencyScope::new("owner-a", Uuid::nil(), Path::new("/tmp/workspace-a")).unwrap();
+        let binding_path = store
+            .idempotency_request_scope_binding_path("owner-a", "shared-request")
+            .unwrap();
+        fs::create_dir_all(binding_path.parent().unwrap()).unwrap();
+        let tampered = serde_json::json!({
+            "schemaVersion": 1,
+            "ownerId": "owner-b",
+            "sessionId": Uuid::nil(),
+            "requestId": "shared-request",
+            "tool": "ptah_create_work",
+            "payloadHash": "hash-a",
+            "workspaceDigest": scope.workspace_digest,
+            "workspaceDisplay": "/tmp/workspace-a",
+        });
+        fs::write(binding_path, serde_json::to_vec_pretty(&tampered).unwrap()).unwrap();
+        let claim_scope =
+            IdempotencyScope::new("owner-a", Uuid::nil(), Path::new("/tmp/workspace-b")).unwrap();
+        let error = store
+            .claim_idempotency(
+                &claim_scope,
+                "ptah_create_work",
+                "shared-request",
+                "hash-a",
+                Some("/tmp/workspace-a"),
+            )
+            .unwrap_err();
+        assert_eq!(error.code, OrchErrorCode::Conflict);
+        assert!(error.message.contains("scope binding"));
+    }
+
+    #[test]
+    fn idempotency_alias_rejects_changed_payload_for_same_request() {
+        let dir = tempdir().unwrap();
+        let sealed = dir.path().join("workspace");
+        fs::create_dir_all(&sealed).unwrap();
+        let sealed_scope = IdempotencyScope::new("owner-a", Uuid::nil(), &sealed).unwrap();
+        let claim_scope = IdempotencyScope::new(
+            "owner-a",
+            Uuid::nil(),
+            Path::new("/tmp/foreign-idempotency-scope-spelling"),
+        )
+        .unwrap();
+        let store = OrchStore::open(dir.path()).unwrap();
+        let binding = WorkRequestBinding::bound(
+            &sealed_scope,
+            sealed.display().to_string(),
+            "shared-request",
+            "ptah_create_work",
+            "hash-a",
+            "work_attempts",
+        );
+        store
+            .persist_idempotency_request_scope_binding_unlocked(&binding)
+            .unwrap();
+        store
+            .claim_idempotency(
+                &sealed_scope,
+                "ptah_create_work",
+                "shared-request",
+                "hash-a",
+                None,
+            )
+            .unwrap();
+        store
+            .complete_idempotency(
+                &sealed_scope,
+                "ptah_create_work",
+                "shared-request",
+                "hash-a",
+                None,
+                serde_json::json!({"work": {"workId": "work-1", "workspace": sealed}}),
+            )
+            .unwrap();
+        let error = store
+            .claim_idempotency(
+                &claim_scope,
+                "ptah_create_work",
+                "shared-request",
+                "hash-b",
+                Some(sealed.to_str().unwrap()),
+            )
+            .unwrap_err();
+        assert_eq!(error.code, OrchErrorCode::Conflict);
+        assert!(error.message.contains("different payload"));
+        assert!(matches!(
+            store
+                .claim_idempotency(
+                    &claim_scope,
+                    "ptah_create_work",
+                    "shared-request",
+                    "hash-b",
+                    None,
+                )
+                .unwrap(),
+            IdempotencyClaim::Perform
+        ));
+    }
+
+    #[test]
+    fn idempotency_scope_binding_is_pruned_with_terminal_receipt() {
+        let dir = tempdir().unwrap();
+        let workspace = dir.path().join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+        let scope = IdempotencyScope::new("owner-a", Uuid::nil(), &workspace).unwrap();
+        let store = OrchStore::open(dir.path().join("ledger")).unwrap();
+        let workspace_display = workspace.display().to_string();
+        let binding = WorkRequestBinding::bound(
+            &scope,
+            workspace_display,
+            "prune-binding",
+            "tool",
+            "hash",
+            "work_attempts",
+        );
+        store
+            .persist_idempotency_request_scope_binding_unlocked(&binding)
+            .unwrap();
+        store
+            .claim_idempotency(&scope, "tool", "prune-binding", "hash", None)
+            .unwrap();
+        store
+            .complete_idempotency(
+                &scope,
+                "tool",
+                "prune-binding",
+                "hash",
+                None,
+                serde_json::json!({"ok": true}),
+            )
+            .unwrap();
+        let binding_path = store
+            .idempotency_request_scope_binding_path(&scope.owner_id, "prune-binding")
+            .unwrap();
+        assert!(binding_path.is_file());
+        store.prune_one_owner_receipt_unlocked(&scope).unwrap();
+        assert!(!store.idemp_path(&scope, "prune-binding").unwrap().is_file());
+        assert!(!binding_path.is_file());
+    }
+
+    #[test]
+    fn open_sweeps_stranded_idempotency_scope_bindings_after_receipt_loss() {
+        let dir = tempdir().unwrap();
+        let workspace = dir.path().join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+        let scope = IdempotencyScope::new("owner-a", Uuid::nil(), &workspace).unwrap();
+        let ledger = dir.path().join("ledger");
+        let store = OrchStore::open(&ledger).unwrap();
+        let binding = WorkRequestBinding::bound(
+            &scope,
+            workspace.display().to_string(),
+            "stranded-binding",
+            "tool",
+            "hash",
+            "work_attempts",
+        );
+        store
+            .persist_idempotency_request_scope_binding_unlocked(&binding)
+            .unwrap();
+        store
+            .claim_idempotency(&scope, "tool", "stranded-binding", "hash", None)
+            .unwrap();
+        store
+            .complete_idempotency(
+                &scope,
+                "tool",
+                "stranded-binding",
+                "hash",
+                None,
+                serde_json::json!({"ok": true}),
+            )
+            .unwrap();
+        let binding_path = store
+            .idempotency_request_scope_binding_path(&scope.owner_id, "stranded-binding")
+            .unwrap();
+        let receipt_path = store.idemp_path(&scope, "stranded-binding").unwrap();
+        assert!(binding_path.is_file());
+        fs::remove_file(receipt_path).unwrap();
+        drop(store);
+        let _store = OrchStore::open(&ledger).unwrap();
+        assert!(!binding_path.is_file());
+    }
+
+    #[test]
+    fn prune_does_not_remove_receipt_when_scope_binding_removal_fails() {
+        let dir = tempdir().unwrap();
+        let workspace = dir.path().join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+        let scope = IdempotencyScope::new("owner-a", Uuid::nil(), &workspace).unwrap();
+        let store = OrchStore::open(dir.path().join("ledger")).unwrap();
+        let binding = WorkRequestBinding::bound(
+            &scope,
+            workspace.display().to_string(),
+            "fault-binding",
+            "tool",
+            "hash",
+            "work_attempts",
+        );
+        store
+            .persist_idempotency_request_scope_binding_unlocked(&binding)
+            .unwrap();
+        store
+            .claim_idempotency(&scope, "tool", "fault-binding", "hash", None)
+            .unwrap();
+        store
+            .complete_idempotency(
+                &scope,
+                "tool",
+                "fault-binding",
+                "hash",
+                None,
+                serde_json::json!({"ok": true}),
+            )
+            .unwrap();
+        let binding_path = store
+            .idempotency_request_scope_binding_path(&scope.owner_id, "fault-binding")
+            .unwrap();
+        let receipt_path = store.idemp_path(&scope, "fault-binding").unwrap();
+        let receipt_needle = {
+            let safe = crate::orchestration::types::safe_id_filename("fault-binding").unwrap();
+            Box::leak(safe.into_boxed_str())
+        };
+        *crate::verified_change::DURABLE_WRITE_FAULT.lock().unwrap() =
+            Some(crate::DurableWriteFault {
+                needle: receipt_needle,
+                skips_remaining: 0,
+            });
+        assert!(
+            crate::verified_change::fail_durable_write_if_armed(&receipt_path).is_err(),
+            "fault injection must arm on the receipt path"
+        );
+        *crate::verified_change::DURABLE_WRITE_FAULT.lock().unwrap() =
+            Some(crate::DurableWriteFault {
+                needle: receipt_needle,
+                skips_remaining: 0,
+            });
+        assert!(store.prune_one_owner_receipt_unlocked(&scope).is_err());
+        assert!(receipt_path.is_file());
+        assert!(binding_path.is_file());
+        *crate::verified_change::DURABLE_WRITE_FAULT.lock().unwrap() = None;
+    }
+
+    #[test]
+    fn prune_does_not_remove_scope_binding_while_sibling_workspace_receipt_survives() {
+        let dir = tempdir().unwrap();
+        let workspace_a = dir.path().join("workspace-a");
+        let workspace_b = dir.path().join("workspace-b");
+        fs::create_dir_all(&workspace_a).unwrap();
+        fs::create_dir_all(&workspace_b).unwrap();
+        #[cfg(unix)]
+        let alias_b = dir.path().join("alias-b");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&workspace_b, &alias_b).unwrap();
+        #[cfg(not(unix))]
+        return;
+        let sealed_b = crate::orchestration::authz::canonical_workspace(&workspace_b).unwrap();
+        let scope_a = IdempotencyScope::new("owner-a", Uuid::nil(), &workspace_a).unwrap();
+        let scope_b = IdempotencyScope::new("owner-a", Uuid::nil(), &workspace_b).unwrap();
+        let claim_scope_b = IdempotencyScope::new(
+            "owner-a",
+            Uuid::nil(),
+            Path::new("/tmp/foreign-prune-sibling-scope"),
+        )
+        .unwrap();
+        let store = OrchStore::open(dir.path()).unwrap();
+        let binding = WorkRequestBinding::bound(
+            &scope_a,
+            workspace_a.display().to_string(),
+            "shared-prune",
+            "ptah_create_work",
+            "hash-a",
+            "work_attempts",
+        );
+        store
+            .persist_idempotency_request_scope_binding_unlocked(&binding)
+            .unwrap();
+        store
+            .claim_idempotency(&scope_a, "ptah_create_work", "shared-prune", "hash-a", None)
+            .unwrap();
+        store
+            .complete_idempotency(
+                &scope_a,
+                "ptah_create_work",
+                "shared-prune",
+                "hash-a",
+                None,
+                serde_json::json!({"work": {"workId": "work-a", "workspace": workspace_a}}),
+            )
+            .unwrap();
+        let receipt_a_path = store.idemp_path(&scope_a, "shared-prune").unwrap();
+        let receipt_a = serde_json::from_str::<IdempotencyReceipt>(
+            &fs::read_to_string(&receipt_a_path).unwrap(),
+        )
+        .unwrap();
+        store
+            .save_idempotency(&IdempotencyReceipt {
+                created_at: Utc::now() - Duration::days(40),
+                ..receipt_a
+            })
+            .unwrap();
+        store
+            .claim_idempotency(&scope_b, "ptah_create_work", "shared-prune", "hash-b", None)
+            .unwrap();
+        store
+            .complete_idempotency(
+                &scope_b,
+                "ptah_create_work",
+                "shared-prune",
+                "hash-b",
+                None,
+                serde_json::json!({"work": {"workId": "work-b", "workspace": workspace_b}}),
+            )
+            .unwrap();
+        let binding_path = store
+            .idempotency_request_scope_binding_path(&scope_a.owner_id, "shared-prune")
+            .unwrap();
+        store.prune_one_owner_receipt_unlocked(&scope_a).unwrap();
+        assert!(!receipt_a_path.is_file());
+        assert!(store
+            .idemp_path(&scope_b, "shared-prune")
+            .unwrap()
+            .is_file());
+        assert!(binding_path.is_file());
+        let work_b = WorkItem::new_at(
+            "triage",
+            "sibling workspace work",
+            Uuid::nil(),
+            workspace_b.display().to_string(),
+            "owner-a",
+            Default::default(),
+            Utc::now(),
+        )
+        .unwrap();
+        let mut work_b = work_b;
+        work_b.work_id = "work-b".into();
+        store.save_work_item(&work_b).unwrap();
+        match store
+            .claim_idempotency(
+                &claim_scope_b,
+                "ptah_create_work",
+                "shared-prune",
+                "hash-b",
+                Some(sealed_b.to_str().unwrap()),
+            )
+            .unwrap()
+        {
+            IdempotencyClaim::Replay(Ok(value)) => {
+                assert_eq!(value["work"]["workId"], "work-b");
+            }
+            other => panic!("expected sibling workspace alias replay: {other:?}"),
+        }
+        match store
+            .claim_idempotency(&scope_b, "ptah_create_work", "shared-prune", "hash-b", None)
+            .unwrap()
+        {
+            IdempotencyClaim::Replay(Ok(value)) => {
+                assert_eq!(value["work"]["workId"], "work-b");
+            }
+            other => panic!("expected sibling workspace shard replay: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn prune_manager_sibling_receipt_repoints_binding_on_reopen_and_replays_b() {
+        use crate::orchestration::manager::{ManagerPlan, ManagerStepSpec};
+
+        let dir = tempdir().unwrap();
+        let workspace_a = dir.path().join("workspace-a");
+        let workspace_b = dir.path().join("workspace-b");
+        fs::create_dir_all(&workspace_a).unwrap();
+        fs::create_dir_all(&workspace_b).unwrap();
+        #[cfg(unix)]
+        let alias_b = dir.path().join("alias-b");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&workspace_b, &alias_b).unwrap();
+        #[cfg(not(unix))]
+        return;
+        let sealed_b = crate::orchestration::authz::canonical_workspace(&workspace_b).unwrap();
+        let scope_a = IdempotencyScope::new("owner-a", Uuid::nil(), &workspace_a).unwrap();
+        let scope_b = IdempotencyScope::new("owner-a", Uuid::nil(), &workspace_b).unwrap();
+        let claim_scope_b = IdempotencyScope::new(
+            "owner-a",
+            Uuid::nil(),
+            Path::new("/tmp/foreign-manager-prune-sibling"),
+        )
+        .unwrap();
+        let ledger = dir.path().join("ledger");
+        let store = OrchStore::open(&ledger).unwrap();
+        let now = Utc::now();
+        let step = ManagerStepSpec {
+            step_id: "step-1".into(),
+            objective: "do".into(),
+            kind: "work".into(),
+            priority: 0,
+            dependencies: vec![],
+            assigned_agent_id: None,
+            policy: WorkPolicy::default(),
+        };
+        let plan_a = ManagerPlan::new(
+            Uuid::nil(),
+            workspace_a.display().to_string(),
+            "manager-agent",
+            "objective-a",
+            "root-a",
+            vec![step.clone()],
+            1,
+            1,
+            now,
+        )
+        .unwrap();
+        let plan_b = ManagerPlan::new(
+            Uuid::nil(),
+            workspace_b.display().to_string(),
+            "manager-agent",
+            "objective-b",
+            "root-b",
+            vec![step],
+            1,
+            1,
+            now,
+        )
+        .unwrap();
+        store.save_manager_plan(&plan_a).unwrap();
+        store.save_manager_plan(&plan_b).unwrap();
+        let binding = WorkRequestBinding::bound(
+            &scope_a,
+            workspace_a.display().to_string(),
+            "shared-manager-prune",
+            "ptah_create_manager_plan",
+            "hash-a",
+            "work_attempts",
+        );
+        store
+            .persist_idempotency_request_scope_binding_unlocked(&binding)
+            .unwrap();
+        store
+            .claim_idempotency(
+                &scope_a,
+                "ptah_create_manager_plan",
+                "shared-manager-prune",
+                "hash-a",
+                None,
+            )
+            .unwrap();
+        store
+            .complete_idempotency(
+                &scope_a,
+                "ptah_create_manager_plan",
+                "shared-manager-prune",
+                "hash-a",
+                Some(plan_a.plan_id.clone()),
+                serde_json::json!({"plan": {"planId": plan_a.plan_id}}),
+            )
+            .unwrap();
+        let receipt_a_path = store.idemp_path(&scope_a, "shared-manager-prune").unwrap();
+        let receipt_a = serde_json::from_str::<IdempotencyReceipt>(
+            &fs::read_to_string(&receipt_a_path).unwrap(),
+        )
+        .unwrap();
+        store
+            .save_idempotency(&IdempotencyReceipt {
+                created_at: Utc::now() - Duration::days(40),
+                ..receipt_a
+            })
+            .unwrap();
+        store
+            .claim_idempotency(
+                &scope_b,
+                "ptah_create_manager_plan",
+                "shared-manager-prune",
+                "hash-b",
+                None,
+            )
+            .unwrap();
+        store
+            .complete_idempotency(
+                &scope_b,
+                "ptah_create_manager_plan",
+                "shared-manager-prune",
+                "hash-b",
+                Some(plan_b.plan_id.clone()),
+                serde_json::json!({"plan": {"planId": plan_b.plan_id}}),
+            )
+            .unwrap();
+        let binding_path = store
+            .idempotency_request_scope_binding_path(&scope_a.owner_id, "shared-manager-prune")
+            .unwrap();
+        let stale_binding = serde_json::from_str::<IdempotencyRequestScopeBinding>(
+            &fs::read_to_string(&binding_path).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(stale_binding.workspace_digest, scope_a.workspace_digest);
+        store.prune_one_owner_receipt_unlocked(&scope_a).unwrap();
+        assert!(!receipt_a_path.is_file());
+        drop(store);
+        let store = OrchStore::open(&ledger).unwrap();
+        let repaired_binding = serde_json::from_str::<IdempotencyRequestScopeBinding>(
+            &fs::read_to_string(&binding_path).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(repaired_binding.workspace_digest, scope_b.workspace_digest);
+        assert_eq!(repaired_binding.payload_hash, "hash-b");
+        match store
+            .claim_idempotency(
+                &claim_scope_b,
+                "ptah_create_manager_plan",
+                "shared-manager-prune",
+                "hash-b",
+                Some(sealed_b.to_str().unwrap()),
+            )
+            .unwrap()
+        {
+            IdempotencyClaim::Replay(Ok(value)) => {
+                assert_eq!(value["plan"]["planId"], plan_b.plan_id);
+            }
+            other => panic!("expected manager sibling alias replay: {other:?}"),
+        }
+        assert_eq!(
+            store
+                .claim_idempotency(
+                    &scope_b,
+                    "ptah_create_manager_plan",
+                    "shared-manager-prune",
+                    "hash-a",
+                    None,
+                )
+                .unwrap_err()
+                .code,
+            OrchErrorCode::Conflict
+        );
+    }
+
+    #[test]
+    fn idempotency_retention_crash_child() {
+        let Ok(root) = std::env::var("IDEMPOTENCY_RETENTION_CHILD_ROOT") else {
+            return;
+        };
+        let phase = std::env::var("IDEMPOTENCY_RETENTION_CHILD_PHASE").unwrap();
+        let ledger = PathBuf::from(root);
+        let store = OrchStore::open(&ledger).unwrap();
+        if phase == "legacy_prune_crash" {
+            let workspace = ledger.parent().expect("ledger directory").join("workspace");
+            let sealed = crate::orchestration::authz::canonical_workspace(&workspace).unwrap();
+            let sealed_scope = IdempotencyScope::new("owner-a", Uuid::nil(), &sealed).unwrap();
+            store
+                .simulate_legacy_prune_binding_before_receipt_crash_unlocked(
+                    &sealed_scope,
+                    "manager-routine-replay",
+                )
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn reopen_repairs_binding_after_legacy_prune_crash_and_manager_alias_replays() {
+        use crate::orchestration::manager::{ManagerPlan, ManagerStepSpec};
+        use std::process::Command;
+
+        let dir = tempdir().unwrap();
+        let workspace = dir.path().join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+        #[cfg(unix)]
+        let alias = dir.path().join("alias");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&workspace, &alias).unwrap();
+        #[cfg(not(unix))]
+        return;
+        let sealed = crate::orchestration::authz::canonical_workspace(&workspace).unwrap();
+        let sealed_scope = IdempotencyScope::new("owner-a", Uuid::nil(), &sealed).unwrap();
+        let claim_scope = IdempotencyScope::new(
+            "owner-a",
+            Uuid::nil(),
+            Path::new("/tmp/foreign-manager-idempotency-scope"),
+        )
+        .unwrap();
+        let ledger = dir.path().join("ledger");
+        let store = OrchStore::open(&ledger).unwrap();
+        let now = Utc::now();
+        let plan = ManagerPlan::new(
+            Uuid::nil(),
+            sealed.display().to_string(),
+            "manager-agent",
+            "objective",
+            "root-work",
+            vec![ManagerStepSpec {
+                step_id: "step-1".into(),
+                objective: "do".into(),
+                kind: "work".into(),
+                priority: 0,
+                dependencies: vec![],
+                assigned_agent_id: None,
+                policy: WorkPolicy::default(),
+            }],
+            1,
+            1,
+            now,
+        )
+        .unwrap();
+        store.save_manager_plan(&plan).unwrap();
+        let binding = WorkRequestBinding::bound(
+            &sealed_scope,
+            sealed.display().to_string(),
+            "manager-routine-replay",
+            "ptah_create_manager_plan",
+            "manager-hash",
+            "work_attempts",
+        );
+        store
+            .persist_idempotency_request_scope_binding_unlocked(&binding)
+            .unwrap();
+        store
+            .claim_idempotency(
+                &sealed_scope,
+                "ptah_create_manager_plan",
+                "manager-routine-replay",
+                "manager-hash",
+                None,
+            )
+            .unwrap();
+        let response = serde_json::json!({"plan": {"planId": plan.plan_id}});
+        store
+            .complete_idempotency(
+                &sealed_scope,
+                "ptah_create_manager_plan",
+                "manager-routine-replay",
+                "manager-hash",
+                Some(plan.plan_id.clone()),
+                response.clone(),
+            )
+            .unwrap();
+        let binding_path = store
+            .idempotency_request_scope_binding_path(
+                &sealed_scope.owner_id,
+                "manager-routine-replay",
+            )
+            .unwrap();
+        let receipt_path = store
+            .idemp_path(&sealed_scope, "manager-routine-replay")
+            .unwrap();
+        assert!(binding_path.is_file());
+        drop(store);
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "idempotency_retention_crash_child",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("IDEMPOTENCY_RETENTION_CHILD_ROOT", &ledger)
+            .env("IDEMPOTENCY_RETENTION_CHILD_PHASE", "legacy_prune_crash")
+            .env(
+                "GROKPTAH_CRASH_STAGE",
+                "idempotency_prune_binding_before_receipt_legacy",
+            )
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(86),
+            "stdout={}\nstderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!binding_path.is_file());
+        assert!(receipt_path.is_file());
+        let store = OrchStore::open(&ledger).unwrap();
+        assert!(binding_path.is_file());
+        match store
+            .claim_idempotency(
+                &claim_scope,
+                "ptah_create_manager_plan",
+                "manager-routine-replay",
+                "manager-hash",
+                Some(sealed.to_str().unwrap()),
+            )
+            .unwrap()
+        {
+            IdempotencyClaim::Replay(Ok(value)) => {
+                assert_eq!(value["plan"]["planId"], plan.plan_id);
+            }
+            other => panic!("expected manager alias replay after reopen repair: {other:?}"),
+        }
+    }
+
+    fn json_paths(dir: &Path) -> Vec<PathBuf> {
+        let mut paths = Vec::new();
+        if !dir.is_dir() {
+            return paths;
+        }
+        for entry in fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                paths.extend(json_paths(&path));
+            } else if path.extension().and_then(|ext| ext.to_str()) == Some("json") {
+                paths.push(path);
+            }
+        }
+        paths
+    }
+
+    #[test]
+    fn idempotency_tmp_and_private_tmp_project_use_independent_receipt_shards() {
+        let session = Uuid::nil();
+        let tmp_scope =
+            IdempotencyScope::new("owner-a", session, Path::new("/tmp/project")).unwrap();
+        let private_scope =
+            IdempotencyScope::new("owner-a", session, Path::new("/private/tmp/project")).unwrap();
+        assert_ne!(tmp_scope.workspace_digest, private_scope.workspace_digest);
+        assert!(!workspaces_match("/tmp/project", "/private/tmp/project"));
+
+        let dir = tempdir().unwrap();
+        let store = OrchStore::open(dir.path()).unwrap();
+        assert!(matches!(
+            store
+                .claim_idempotency(&tmp_scope, "tool", "shared-request", "hash", None)
+                .unwrap(),
+            IdempotencyClaim::Perform
+        ));
+        assert!(matches!(
+            store
+                .claim_idempotency(&private_scope, "tool", "shared-request", "hash", None)
+                .unwrap(),
+            IdempotencyClaim::Perform
+        ));
+        assert_ne!(
+            store.idemp_path(&tmp_scope, "shared-request").unwrap(),
+            store.idemp_path(&private_scope, "shared-request").unwrap(),
+        );
+    }
+
+    #[test]
     fn idempotency_claim_exclusive() {
         let d = tempdir().unwrap();
         let store = OrchStore::open(d.path()).unwrap();
         let scope = receipt_scope(d.path());
-        match store.claim_idempotency(&scope, "t", "req", "h").unwrap() {
+        match store
+            .claim_idempotency(&scope, "t", "req", "h", None)
+            .unwrap()
+        {
             IdempotencyClaim::Perform => {}
             _ => panic!("first claim should perform"),
         }
@@ -14298,12 +16719,15 @@ mod tests {
                 serde_json::json!({"ok": true}),
             )
             .unwrap();
-        match store.claim_idempotency(&scope, "t", "req", "h").unwrap() {
+        match store
+            .claim_idempotency(&scope, "t", "req", "h", None)
+            .unwrap()
+        {
             IdempotencyClaim::Replay(Ok(v)) => assert_eq!(v["ok"], true),
             _ => panic!("replay"),
         }
         assert!(store
-            .claim_idempotency(&scope, "t", "req", "other")
+            .claim_idempotency(&scope, "t", "req", "other", None)
             .is_err());
     }
 
@@ -14313,7 +16737,9 @@ mod tests {
         let store = OrchStore::open(d.path()).unwrap();
         let scope = receipt_scope(d.path());
         assert!(matches!(
-            store.claim_idempotency(&scope, "t", "failed", "h").unwrap(),
+            store
+                .claim_idempotency(&scope, "t", "failed", "h", None)
+                .unwrap(),
             IdempotencyClaim::Perform
         ));
         let error = OrchError::new(OrchErrorCode::Internal, "failed once");
@@ -14330,7 +16756,10 @@ mod tests {
                 serde_json::json!({"ok": true}),
             )
             .is_err());
-        match store.claim_idempotency(&scope, "t", "failed", "h").unwrap() {
+        match store
+            .claim_idempotency(&scope, "t", "failed", "h", None)
+            .unwrap()
+        {
             IdempotencyClaim::Replay(Err(replayed)) => {
                 assert_eq!(replayed.code.as_str(), error.code.as_str());
                 assert_eq!(replayed.message, error.message);
@@ -14349,7 +16778,7 @@ mod tests {
 
         assert!(matches!(
             store
-                .claim_idempotency(&owner_a, "tool", "shared-request", "hash-a")
+                .claim_idempotency(&owner_a, "tool", "shared-request", "hash-a", None)
                 .unwrap(),
             IdempotencyClaim::Perform
         ));
@@ -14366,13 +16795,13 @@ mod tests {
 
         assert!(matches!(
             store
-                .claim_idempotency(&owner_b, "tool", "shared-request", "hash-b")
+                .claim_idempotency(&owner_b, "tool", "shared-request", "hash-b", None)
                 .unwrap(),
             IdempotencyClaim::Perform
         ));
         assert!(matches!(
             store
-                .claim_idempotency(&owner_a, "tool", "shared-request", "hash-a")
+                .claim_idempotency(&owner_a, "tool", "shared-request", "hash-a", None)
                 .unwrap(),
             IdempotencyClaim::Replay(Ok(value)) if value["owner"] == "a"
         ));
@@ -14381,7 +16810,8 @@ mod tests {
                 &other_session,
                 "tool",
                 "shared-request",
-                "hash-a"
+                "hash-a",
+                None,
             ),
             Err(error) if error.code == OrchErrorCode::Conflict
         ));
@@ -14392,14 +16822,20 @@ mod tests {
             .unwrap();
         assert!(matches!(
             store
-                .claim_idempotency(&other_workspace, "tool", "shared-request", "foreign-hash")
+                .claim_idempotency(
+                    &other_workspace,
+                    "tool",
+                    "shared-request",
+                    "foreign-hash",
+                    None
+                )
                 .unwrap(),
             IdempotencyClaim::Perform
         ));
         let foreign_bytes = fs::read(&foreign_path).unwrap();
         assert!(matches!(
             store
-                .claim_idempotency(&owner_a, "tool", "shared-request", "hash-a")
+                .claim_idempotency(&owner_a, "tool", "shared-request", "hash-a", None)
                 .unwrap(),
             IdempotencyClaim::Replay(Ok(value)) if value["owner"] == "a"
         ));
@@ -14464,7 +16900,7 @@ mod tests {
         for index in 0..MAX_IDEMPOTENCY_RECEIPTS_PER_OWNER {
             fs::write(owner_dir.join(format!("synthetic-{index}.json")), b"{}").unwrap();
         }
-        match store.claim_idempotency(&scope, "tool", "new-request", "hash") {
+        match store.claim_idempotency(&scope, "tool", "new-request", "hash", None) {
             Err(error) => assert_eq!(error.code, OrchErrorCode::CapacityExhausted),
             Ok(_) => panic!("receipt admission must stop at the hard owner bound"),
         }
@@ -14519,7 +16955,7 @@ mod tests {
         );
         assert!(matches!(
             store
-                .claim_idempotency(&scope, "tool", "fresh", "hash")
+                .claim_idempotency(&scope, "tool", "fresh", "hash", None)
                 .unwrap(),
             IdempotencyClaim::Perform
         ));
@@ -14611,12 +17047,24 @@ mod tests {
             let left_store = store.clone();
             let left_scope = scope.clone();
             let left = threads.spawn(move || {
-                left_store.claim_idempotency(&left_scope, "tool", "concurrent-request", "hash")
+                left_store.claim_idempotency(
+                    &left_scope,
+                    "tool",
+                    "concurrent-request",
+                    "hash",
+                    None,
+                )
             });
             let right_store = store.clone();
             let right_scope = scope.clone();
             let right = threads.spawn(move || {
-                right_store.claim_idempotency(&right_scope, "tool", "concurrent-request", "hash")
+                right_store.claim_idempotency(
+                    &right_scope,
+                    "tool",
+                    "concurrent-request",
+                    "hash",
+                    None,
+                )
             });
             let outcomes = [
                 left.join().unwrap().unwrap(),
@@ -14671,7 +17119,7 @@ mod tests {
         let scope = receipt_scope(d.path());
         assert!(matches!(
             store
-                .claim_idempotency(&scope, "tool", "created-at", "hash")
+                .claim_idempotency(&scope, "tool", "created-at", "hash", None)
                 .unwrap(),
             IdempotencyClaim::Perform
         ));
@@ -14723,6 +17171,7 @@ mod tests {
             "tool",
             "legacy-secret",
             "new-hash",
+            None,
         ) {
             Err(error) => error,
             Ok(_) => panic!("an unscoped legacy request id must never execute again"),
@@ -14737,6 +17186,7 @@ mod tests {
             "tool",
             "legacy-secret",
             "new-hash",
+            None,
         ) {
             Err(error) => error,
             Ok(_) => panic!("legacy request tombstone must survive restart"),
@@ -14972,14 +17422,16 @@ mod tests {
         let store = OrchStore::open(d.path()).unwrap();
         let scope = receipt_scope(d.path());
         assert!(matches!(
-            store.claim_idempotency(&scope, "t", "orphan", "h").unwrap(),
+            store
+                .claim_idempotency(&scope, "t", "orphan", "h", None)
+                .unwrap(),
             IdempotencyClaim::Perform
         ));
         drop(store);
 
         let reopened = OrchStore::open(d.path()).unwrap();
         match reopened
-            .claim_idempotency(&scope, "t", "orphan", "h")
+            .claim_idempotency(&scope, "t", "orphan", "h", None)
             .unwrap()
         {
             IdempotencyClaim::Replay(Err(e)) => {
@@ -15044,7 +17496,9 @@ mod tests {
         let d = tempdir().unwrap();
         let store = OrchStore::open(d.path()).unwrap();
         let scope = receipt_scope(d.path());
-        assert!(store.claim_idempotency(&scope, "t", "../x", "h").is_err());
+        assert!(store
+            .claim_idempotency(&scope, "t", "../x", "h", None)
+            .is_err());
     }
 
     #[test]
@@ -15905,7 +18359,7 @@ mod tests {
         fs::create_dir_all(receipt_path.parent().unwrap()).unwrap();
         assert!(matches!(
             store
-                .claim_idempotency(&scope, "ptah_cancel", &intent_id, "hash")
+                .claim_idempotency(&scope, "ptah_cancel", &intent_id, "hash", None)
                 .unwrap(),
             IdempotencyClaim::Perform
         ));
@@ -16077,7 +18531,13 @@ mod tests {
         let legacy = write_legacy_v2(dir.path(), &scope, &receipt);
         let before = fs::read(&legacy).unwrap();
         let claim = store
-            .claim_idempotency(&scope, "ptah_claim_work", request_id, "shared-ledger-hash")
+            .claim_idempotency(
+                &scope,
+                "ptah_claim_work",
+                request_id,
+                "shared-ledger-hash",
+                None,
+            )
             .unwrap();
         match claim {
             IdempotencyClaim::Replay(Ok(value)) => assert_eq!(value, response),
@@ -16110,6 +18570,7 @@ mod tests {
                 "ptah_discard_verified_change",
                 "legacy-failed",
                 "shared-ledger-hash",
+                None,
             )
             .unwrap();
         match claim {
@@ -16160,6 +18621,7 @@ mod tests {
                 "ptah_claim_work",
                 "legacy-pending",
                 "shared-ledger-hash",
+                None,
             )
             .unwrap();
         assert!(
@@ -16214,6 +18676,7 @@ mod tests {
                 "ptah_claim_work",
                 "legacy-conflict",
                 "shared-ledger-hash",
+                None,
             )
             .unwrap_err();
         assert_eq!(error.code, OrchErrorCode::Conflict);
@@ -16242,6 +18705,7 @@ mod tests {
                 "ptah_claim_work",
                 "legacy-restart",
                 "shared-ledger-hash",
+                None,
             )
             .unwrap();
         drop(store);
@@ -16252,6 +18716,7 @@ mod tests {
                 "ptah_claim_work",
                 "legacy-restart",
                 "shared-ledger-hash",
+                None,
             )
             .unwrap();
         match (first, second) {

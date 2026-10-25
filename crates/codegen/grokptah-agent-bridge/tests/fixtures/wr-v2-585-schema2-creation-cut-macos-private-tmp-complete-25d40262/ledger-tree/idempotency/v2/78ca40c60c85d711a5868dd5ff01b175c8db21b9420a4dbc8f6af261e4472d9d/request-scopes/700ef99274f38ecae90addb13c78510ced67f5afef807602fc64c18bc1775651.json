@@ -1,0 +1,10 @@
+{
+  "schemaVersion": 1,
+  "ownerId": "primary",
+  "sessionId": "102bc2b2-62b7-47e5-907b-ffcfe2faae81",
+  "requestId": "create-original-request",
+  "tool": "ptah_create_work",
+  "payloadHash": "f9bb0d058f425c42a2ebb1233340bfaabfdea94564bbf6eca6b04322354495e6",
+  "workspaceDigest": "fc461db136aadc1c047675f98cc35d7af84522e1a01e7c3aa3c9908645da9ee7",
+  "workspaceDisplay": "/tmp/grokptah-585-cut-root.wu1Qcc/workspace"
+}

@@ -1,19 +1,22 @@
 //! Production authenticated Work creation, process death and fresh-process replay.
 mod common;
+#[path = "common/copy_tree.rs"]
+mod copy_tree;
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 use grokptah_agent_bridge::orchestration::{
-    canonical_workspace, safe_id_filename, OrchStore, OrchestrationConfig, OrchestrationService,
-    RunBounds, WorkItem, WorkPolicy, WorkspaceAllowlist, MAX_GRAPH_SCOPE_ITEMS,
-    WORK_PAGE_TRANSPORT_CEILING_BYTES,
+    canonical_workspace, hash_payload, safe_id_filename, OrchStore, OrchestrationConfig,
+    OrchestrationService, RunBounds, WorkItem, WorkPolicy, WorkspaceAllowlist,
+    MAX_GRAPH_SCOPE_ITEMS, WORK_PAGE_TRANSPORT_CEILING_BYTES,
 };
 use grokptah_agent_bridge::{
     set_grokptah_home_override, start_control_server, AgentHost, DurableWriteFault, HostConfig,
     McpControlClient, SessionKind, DURABLE_WRITE_FAULT,
 };
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 const BEARER: &str = "synthetic-work-creation-v2";
@@ -51,9 +54,15 @@ fn json_paths(dir: &Path) -> Vec<PathBuf> {
     paths
 }
 
+fn idempotency_receipt_paths(dir: &Path) -> Vec<PathBuf> {
+    json_paths(dir)
+        .into_iter()
+        .filter(|path| read_json(path).get("status").is_some())
+        .collect()
+}
+
 fn receipt_path(root: &Path) -> PathBuf {
-    let paths = json_paths(&root.join("ledger/idempotency"));
-    paths
+    idempotency_receipt_paths(&root.join("ledger/idempotency"))
         .into_iter()
         .find(|path| read_json(path)["requestId"] == REQUEST)
         .unwrap()
@@ -68,15 +77,18 @@ fn child(root: &Path, phase: &str, stage: &str) -> Output {
 }
 
 fn child_with(root: &Path, phase: &str, stage: &str, extra: &[(&str, &str)]) -> Output {
-    Command::new(std::env::current_exe().unwrap())
+    let mut command = Command::new(std::env::current_exe().unwrap());
+    command
         .args(["--exact", "creation_service_child", "--nocapture"])
         .env("WORK_CREATION_CHILD_ROOT", root)
         .env("WORK_CREATION_PHASE", phase)
         .env("WORK_CREATION_STAGE", stage)
         .env_remove("GROKPTAH_CRASH_STAGE")
-        .envs(extra.iter().copied())
-        .output()
-        .unwrap()
+        .env_remove("WORK_CREATION_WORKSPACE_ALIAS");
+    if phase == "create" {
+        command.env("GROKPTAH_CRASH_STAGE", stage);
+    }
+    command.envs(extra.iter().copied()).output().unwrap()
 }
 
 fn assert_exit(output: &Output, code: i32) {
@@ -120,7 +132,10 @@ fn creation_service_child() {
                 host.session_inspect(id).expect("reload original session");
                 id
             };
-            host.session_set_cwd(session, &workspace).unwrap();
+            let invoke_workspace = std::env::var("WORK_CREATION_WORKSPACE_ALIAS")
+                .map(PathBuf::from)
+                .unwrap_or_else(|_| workspace.clone());
+            host.session_set_cwd(session, &invoke_workspace).unwrap();
             let store = OrchStore::open(root.join("ledger")).unwrap();
             if phase == "create" {
                 let count: usize = std::env::var("WORK_CREATION_SEED_COUNT")
@@ -135,13 +150,18 @@ fn creation_service_child() {
                     write_json(store.root().join("work-items").join(format!("{}.json", safe_id_filename(&item.work_id).unwrap())), &json!(item));
                 }
             }
+            let allowlist = if invoke_workspace == workspace {
+                WorkspaceAllowlist::new([workspace.clone()])
+            } else {
+                WorkspaceAllowlist::new([workspace.clone(), invoke_workspace.clone()])
+            };
             let orch = OrchestrationService::new(
                 host.clone(),
                 host.event_bus(),
                 store.clone(),
                 OrchestrationConfig {
                     bearer_token: BEARER.into(),
-                    allowlist: WorkspaceAllowlist::new([workspace.clone()]),
+                    allowlist,
                     max_concurrent_runs: 2,
                     bounds: RunBounds::default(),
                 },
@@ -169,12 +189,19 @@ fn creation_service_child() {
                     env.set("GROKPTAH_CRASH_STAGE", stage);
                 }
             }
+            if phase == "create" && std::env::var("WORK_CREATION_WORKSPACE_ALIAS").is_ok() {
+                let stopped = orch.stop_background_tasks().await;
+                assert!(
+                    stopped.fully_stopped && stopped.errors.is_empty(),
+                    "aliased intent-cut create must not race the workload supervisor"
+                );
+            }
             let result = orch
                 .create_work(
                     &auth,
                     REQUEST,
                     session,
-                    &workspace,
+                    &invoke_workspace,
                     "test".into(),
                     "recover the original Work creation".into(),
                     7,
@@ -463,6 +490,7 @@ fn creation_recovery_refuses_conflicting_evidence_without_writing_work() {
         "schema",
         "filename",
         "foreign_work",
+        "substituted_creation_digest",
     ] {
         let root = tempfile::tempdir().unwrap();
         assert_exit(&child(root.path(), "create", "lifecycle_after_intent"), 86);
@@ -473,6 +501,11 @@ fn creation_recovery_refuses_conflicting_evidence_without_writing_work() {
         match corruption {
             "snapshot" => {
                 intent["item"]["objective"] = json!("changed after seal");
+                write_json(&path, &intent);
+            }
+            "substituted_creation_digest" => {
+                intent["item"]["objective"] = json!("changed after seal");
+                intent["creationItemDigest"] = json!(hash_payload(&intent["item"]));
                 write_json(&path, &intent);
             }
             "owner" => {
@@ -548,6 +581,476 @@ fn creation_recovery_refuses_conflicting_evidence_without_writing_work() {
             );
         }
     }
+}
+
+fn spawn_aliased_create_crash(root: &Path, workspace: &Path, stage: &str) -> Output {
+    let alias_display = workspace.join(".").display().to_string();
+    child_with(
+        root,
+        "create",
+        stage,
+        &[("WORK_CREATION_WORKSPACE_ALIAS", alias_display.as_str())],
+    )
+}
+
+fn aliased_creation_crash_fixture(stage: &str) -> (tempfile::TempDir, PathBuf) {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(root.path().join("workspace")).unwrap();
+    let workspace = canonical_workspace(&root.path().join("workspace")).unwrap();
+    assert_exit(
+        &spawn_aliased_create_crash(root.path(), &workspace, stage),
+        86,
+    );
+    (root, workspace)
+}
+
+#[test]
+fn aliased_creation_replays_after_intent_cut_without_closing_admission() {
+    let (root, workspace) = aliased_creation_crash_fixture("lifecycle_after_intent");
+    let _expected = read_json(intent_paths(root.path()).remove(0));
+    let alias_display = workspace.join(".").display().to_string();
+    for reopen in 0..3 {
+        assert_exit(
+            &child_with(
+                root.path(),
+                "replay",
+                "",
+                &[("WORK_CREATION_WORKSPACE_ALIAS", alias_display.as_str())],
+            ),
+            0,
+        );
+        let outcome = read_json(root.path().join("outcome.json"));
+        assert!(
+            outcome.get("response").is_some(),
+            "reopen {reopen}: {outcome}"
+        );
+        assert!(outcome["admissionClosed"].is_null());
+        assert_eq!(
+            outcome["response"]["work"]["workspace"],
+            workspace.display().to_string()
+        );
+        assert_eq!(read_json(receipt_path(root.path()))["status"], "complete");
+        assert_eq!(records(&root.path().join("ledger/work-items")).len(), 1);
+    }
+}
+
+#[test]
+fn aliased_substituted_creation_digest_refuses_recovery() {
+    let (root, _workspace) = aliased_creation_crash_fixture("lifecycle_after_intent");
+    let path = intent_paths(root.path()).remove(0);
+    let mut intent = read_json(&path);
+    intent["item"]["objective"] = json!("changed after seal");
+    intent["creationItemDigest"] = json!(hash_payload(&intent["item"]));
+    write_json(&path, &intent);
+    for _ in 0..3 {
+        assert!(
+            OrchStore::open(root.path().join("ledger")).is_err(),
+            "aliased substituted digest must refuse recovery"
+        );
+        assert!(records(&root.path().join("ledger/work-items")).is_empty());
+    }
+}
+
+#[test]
+fn substituted_both_digests_with_untouched_receipt_refuses_recovery() {
+    let (root, _workspace) = aliased_creation_crash_fixture("lifecycle_after_intent");
+    let path = intent_paths(root.path()).remove(0);
+    let mut intent = read_json(&path);
+    intent["item"]["objective"] = json!("changed after seal");
+    intent["creationItemDigest"] = json!(hash_payload(&intent["item"]));
+    let request = &intent["request"];
+    let caller_payload = json!({
+        "sessionId": request["sessionId"],
+        "workspace": request["workspaceDisplay"],
+        "kind": intent["item"]["kind"],
+        "objective": intent["item"]["objective"],
+        "priority": intent["item"]["priority"],
+        "deadline": intent["item"]["deadline"],
+        "parentWorkId": intent["item"]["parentWorkId"],
+        "dependencies": intent["item"]["dependencies"],
+        "policy": intent["item"]["policy"],
+    });
+    intent["creationRequestDigest"] = json!(hash_payload(&caller_payload));
+    write_json(&path, &intent);
+    let receipt = read_json(receipt_path(root.path()));
+    assert_ne!(
+        intent["creationRequestDigest"], receipt["payloadHash"],
+        "receipt must remain bound to the original caller hash"
+    );
+    for _ in 0..3 {
+        assert!(
+            OrchStore::open(root.path().join("ledger")).is_err(),
+            "recomputed digests must not bypass the sealed receipt hash"
+        );
+        assert!(records(&root.path().join("ledger/work-items")).is_empty());
+    }
+}
+
+#[test]
+fn legacy_schema2_585_producer_cut_reopens_on_candidate() {
+    let bundle = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/wr-v2-585-schema2-creation-cut-25d40262");
+    assert!(
+        bundle.join("PRODUCER_SHA").is_file(),
+        "missing #585 producer bundle at {}; run scripts/produce_585_creation_cut.sh",
+        bundle.display()
+    );
+    let producer_sha = std::fs::read_to_string(bundle.join("PRODUCER_SHA"))
+        .unwrap()
+        .trim()
+        .to_string();
+    assert_eq!(
+        producer_sha.as_str(),
+        "25d40262a3b530227af850f26974c19dfc2935fd",
+        "producer bundle must be from exact #585 base"
+    );
+    let root = tempfile::tempdir().unwrap();
+    copy_tree::copy_dir_all(&bundle.join("ledger-tree"), &root.path().join("ledger")).unwrap();
+    copy_tree::copy_dir_all(&bundle.join("home-tree"), &root.path().join("home")).unwrap();
+    std::fs::copy(
+        bundle.join("fixture.json"),
+        root.path().join("fixture.json"),
+    )
+    .unwrap();
+    let intent = read_json(intent_paths(root.path()).first().expect("intent"));
+    assert!(
+        intent.get("creationRequestDigest").is_none(),
+        "real #585 cuts do not carry creationRequestDigest"
+    );
+    let receipt_file = receipt_path(root.path());
+    let receipt = read_json(&receipt_file);
+    let expected_sha = expected_receipt_sha256(&bundle);
+    let actual = sha256_file(&receipt_file);
+    assert_eq!(
+        actual, expected_sha,
+        "receipt bytes must match preserved artifact"
+    );
+    let fixture = read_json(root.path().join("fixture.json"));
+    let invoke_workspace = intent["request"]["workspaceDisplay"]
+        .as_str()
+        .expect("producer-bound request scope");
+    std::fs::create_dir_all(invoke_workspace).unwrap();
+    let original_work_id = intent["workId"].as_str().unwrap();
+    let original_objective = intent["item"]["objective"].as_str().unwrap();
+    let anchored_payload_hash = receipt["payloadHash"].clone();
+    let anchored_request_id = receipt["requestId"].clone();
+    let anchored_scope = json!({
+        "ownerId": receipt["ownerId"].clone(),
+        "sessionId": receipt["sessionId"].clone(),
+        "workspaceDigest": receipt["workspaceDigest"].clone(),
+        "tool": receipt["tool"].clone(),
+    });
+    for reopen in 0..3 {
+        assert_exit(
+            &child_with(
+                root.path(),
+                "replay",
+                "",
+                &[("WORK_CREATION_WORKSPACE_ALIAS", invoke_workspace)],
+            ),
+            0,
+        );
+        let outcome = read_json(root.path().join("outcome.json"));
+        assert!(
+            outcome.get("response").is_some(),
+            "legacy #585 reopen {reopen}: {outcome}"
+        );
+        let work = &outcome["response"]["work"];
+        assert_eq!(work["workId"].as_str().unwrap(), original_work_id);
+        assert_eq!(work["objective"].as_str().unwrap(), original_objective);
+        assert_eq!(work["sessionId"], fixture["sessionId"]);
+        assert_eq!(work["createdBy"], fixture["ownerId"]);
+        let settled = read_json(&receipt_file);
+        assert_eq!(settled["status"], "complete");
+        assert_eq!(settled["payloadHash"], anchored_payload_hash);
+        assert_eq!(settled["requestId"], anchored_request_id);
+        assert_eq!(settled["ownerId"], anchored_scope["ownerId"]);
+        assert_eq!(settled["sessionId"], anchored_scope["sessionId"]);
+        assert_eq!(
+            settled["workspaceDigest"],
+            anchored_scope["workspaceDigest"]
+        );
+        assert_eq!(settled["tool"], anchored_scope["tool"]);
+        assert_eq!(records(&root.path().join("ledger/work-items")).len(), 1);
+        assert_eq!(
+            records(&root.path().join("ledger/work-items"))[0]["workId"],
+            original_work_id
+        );
+        let matching_receipts = idempotency_receipt_paths(&root.path().join("ledger/idempotency"))
+            .into_iter()
+            .filter(|path| read_json(path)["requestId"] == REQUEST)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            matching_receipts.len(),
+            1,
+            "replay must not mint a second receipt for the original request"
+        );
+        assert_eq!(matching_receipts[0], receipt_file);
+    }
+}
+
+#[test]
+fn synthetic_macos_relocated_pending_fixture_passes_creation_integrity() {
+    let bundle = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/wr-v2-585-schema2-creation-cut-macos-private-tmp-pending-25d40262");
+    assert!(
+        bundle.join("FIXTURE_PROVENANCE").is_file(),
+        "relocated macOS fixture must declare synthetic provenance"
+    );
+    let provenance = std::fs::read_to_string(bundle.join("FIXTURE_PROVENANCE")).unwrap();
+    assert!(
+        provenance.contains("synthetic_relocated"),
+        "fixture must not be labeled as a genuine historical macOS capture"
+    );
+    let root = tempfile::tempdir().unwrap();
+    copy_tree::copy_dir_all(&bundle.join("ledger-tree"), &root.path().join("ledger")).unwrap();
+    OrchStore::open(root.path().join("ledger")).expect("relocated fixture must pass recovery");
+}
+
+#[test]
+fn legacy_schema2_585_producer_cut_replays_after_creation_intent_removed() {
+    let bundle = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/wr-v2-585-schema2-creation-cut-25d40262");
+    let root = tempfile::tempdir().unwrap();
+    copy_tree::copy_dir_all(&bundle.join("ledger-tree"), &root.path().join("ledger")).unwrap();
+    copy_tree::copy_dir_all(&bundle.join("home-tree"), &root.path().join("home")).unwrap();
+    std::fs::copy(
+        bundle.join("fixture.json"),
+        root.path().join("fixture.json"),
+    )
+    .unwrap();
+    let intent = read_json(intent_paths(root.path()).first().expect("intent"));
+    let invoke_workspace = intent["request"]["workspaceDisplay"]
+        .as_str()
+        .expect("producer-bound request scope");
+    std::fs::create_dir_all(invoke_workspace).unwrap();
+    let original_work_id = intent["workId"].as_str().unwrap();
+    assert_exit(
+        &child_with(
+            root.path(),
+            "replay",
+            "",
+            &[("WORK_CREATION_WORKSPACE_ALIAS", invoke_workspace)],
+        ),
+        0,
+    );
+    assert!(
+        intent_paths(root.path()).is_empty(),
+        "recovery must clear intents"
+    );
+    for _reopen in 0..3 {
+        assert_exit(
+            &child_with(
+                root.path(),
+                "replay",
+                "",
+                &[("WORK_CREATION_WORKSPACE_ALIAS", invoke_workspace)],
+            ),
+            0,
+        );
+        let outcome = read_json(root.path().join("outcome.json"));
+        assert_eq!(
+            outcome["response"]["work"]["workId"].as_str().unwrap(),
+            original_work_id
+        );
+        let matching_receipts = idempotency_receipt_paths(&root.path().join("ledger/idempotency"))
+            .into_iter()
+            .filter(|path| read_json(path)["requestId"] == REQUEST)
+            .collect::<Vec<_>>();
+        assert_eq!(matching_receipts.len(), 1);
+    }
+}
+
+#[test]
+fn derive_relocated_creation_fixture_integrity_from_env() {
+    let Ok(item_path) = std::env::var("DERIVE_RELOCATED_CREATION_ITEM") else {
+        return;
+    };
+    let Ok(workspace) = std::env::var("DERIVE_RELOCATED_CREATION_WORKSPACE") else {
+        return;
+    };
+    let item: WorkItem = serde_json::from_slice(&std::fs::read(item_path).unwrap()).unwrap();
+    let item_digest = hash_payload(&serde_json::to_value(&item).unwrap());
+    let payload = json!({
+        "sessionId": item.session_id,
+        "workspace": workspace,
+        "kind": item.kind,
+        "objective": item.objective,
+        "priority": item.priority,
+        "deadline": item.deadline,
+        "parentWorkId": item.parent_work_id,
+        "dependencies": item.dependencies,
+        "policy": item.policy,
+    });
+    println!("creation_item_digest={item_digest}");
+    println!("payload_hash={}", hash_payload(&payload));
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn legacy_schema2_585_macos_private_tmp_pending_producer_cut_reopens_on_candidate() {
+    let bundle = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/wr-v2-585-schema2-creation-cut-macos-private-tmp-pending-25d40262");
+    assert!(
+        bundle.join("PRODUCER_SHA").is_file(),
+        "missing macOS pending producer bundle at {}",
+        bundle.display()
+    );
+    let producer_sha = std::fs::read_to_string(bundle.join("PRODUCER_SHA"))
+        .unwrap()
+        .trim()
+        .to_string();
+    assert_eq!(
+        producer_sha.as_str(),
+        "25d40262a3b530227af850f26974c19dfc2935fd",
+        "producer bundle must be from exact #585 base"
+    );
+    let root = tempfile::tempdir().unwrap();
+    copy_tree::copy_dir_all(&bundle.join("ledger-tree"), &root.path().join("ledger")).unwrap();
+    copy_tree::copy_dir_all(&bundle.join("home-tree"), &root.path().join("home")).unwrap();
+    std::fs::copy(
+        bundle.join("fixture.json"),
+        root.path().join("fixture.json"),
+    )
+    .unwrap();
+    let intent = read_json(intent_paths(root.path()).first().expect("intent"));
+    let receipt_file = receipt_path(root.path());
+    let receipt = read_json(&receipt_file);
+    let expected_sha = expected_receipt_sha256(&bundle);
+    assert_eq!(sha256_file(&receipt_file), expected_sha);
+    let fixture = read_json(root.path().join("fixture.json"));
+    let invoke_workspace = intent["request"]["workspaceDisplay"]
+        .as_str()
+        .expect("producer-bound request scope");
+    assert!(
+        invoke_workspace.starts_with("/private/tmp/"),
+        "macOS producer must seal /private/tmp display paths"
+    );
+    std::fs::create_dir_all(invoke_workspace).unwrap();
+    let original_work_id = intent["workId"].as_str().unwrap();
+    let original_objective = intent["item"]["objective"].as_str().unwrap();
+    let anchored_payload_hash = receipt["payloadHash"].clone();
+    let anchored_request_id = receipt["requestId"].clone();
+    let anchored_scope = json!({
+        "ownerId": receipt["ownerId"].clone(),
+        "sessionId": receipt["sessionId"].clone(),
+        "workspaceDigest": receipt["workspaceDigest"].clone(),
+        "tool": receipt["tool"].clone(),
+    });
+    for reopen in 0..3 {
+        assert_exit(
+            &child_with(
+                root.path(),
+                "replay",
+                "",
+                &[("WORK_CREATION_WORKSPACE_ALIAS", invoke_workspace)],
+            ),
+            0,
+        );
+        let outcome = read_json(root.path().join("outcome.json"));
+        assert!(
+            outcome.get("response").is_some(),
+            "macOS pending reopen {reopen}: {outcome}"
+        );
+        let work = &outcome["response"]["work"];
+        assert_eq!(work["workId"].as_str().unwrap(), original_work_id);
+        assert_eq!(work["objective"].as_str().unwrap(), original_objective);
+        assert_eq!(work["sessionId"], fixture["sessionId"]);
+        assert_eq!(work["createdBy"], fixture["ownerId"]);
+        let settled = read_json(&receipt_file);
+        assert_eq!(settled["status"], "complete");
+        assert_eq!(settled["payloadHash"], anchored_payload_hash);
+        assert_eq!(settled["requestId"], anchored_request_id);
+        assert_eq!(settled["ownerId"], anchored_scope["ownerId"]);
+        assert_eq!(settled["sessionId"], anchored_scope["sessionId"]);
+        assert_eq!(
+            settled["workspaceDigest"],
+            anchored_scope["workspaceDigest"]
+        );
+        assert_eq!(settled["tool"], anchored_scope["tool"]);
+        assert_eq!(records(&root.path().join("ledger/work-items")).len(), 1);
+        assert_eq!(
+            records(&root.path().join("ledger/work-items"))[0]["workId"],
+            original_work_id
+        );
+        let matching_receipts = idempotency_receipt_paths(&root.path().join("ledger/idempotency"))
+            .into_iter()
+            .filter(|path| read_json(path)["requestId"] == REQUEST)
+            .collect::<Vec<_>>();
+        assert_eq!(matching_receipts.len(), 1);
+        assert_eq!(matching_receipts[0], receipt_file);
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn legacy_schema2_585_macos_private_tmp_completed_producer_replays_without_duplicate_execution() {
+    let bundle = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/wr-v2-585-schema2-creation-cut-macos-private-tmp-complete-25d40262");
+    assert!(bundle.join("PRODUCER_SHA").is_file());
+    let root = tempfile::tempdir().unwrap();
+    copy_tree::copy_dir_all(&bundle.join("ledger-tree"), &root.path().join("ledger")).unwrap();
+    copy_tree::copy_dir_all(&bundle.join("home-tree"), &root.path().join("home")).unwrap();
+    std::fs::copy(
+        bundle.join("fixture.json"),
+        root.path().join("fixture.json"),
+    )
+    .unwrap();
+    let intent = read_json(intent_paths(root.path()).first().expect("intent"));
+    let receipt_file = receipt_path(root.path());
+    let receipt = read_json(&receipt_file);
+    assert_eq!(receipt["status"], "complete");
+    let invoke_workspace = intent["request"]["workspaceDisplay"]
+        .as_str()
+        .expect("producer-bound request scope");
+    std::fs::create_dir_all(invoke_workspace).unwrap();
+    let original_work_id = intent["workId"].as_str().unwrap();
+    let work_items_before = records(&root.path().join("ledger/work-items"));
+    assert_eq!(work_items_before.len(), 1);
+    for reopen in 0..3 {
+        assert_exit(
+            &child_with(
+                root.path(),
+                "replay",
+                "",
+                &[("WORK_CREATION_WORKSPACE_ALIAS", invoke_workspace)],
+            ),
+            0,
+        );
+        let outcome = read_json(root.path().join("outcome.json"));
+        assert!(
+            outcome.get("response").is_some(),
+            "macOS completed reopen {reopen}: {outcome}"
+        );
+        assert_eq!(
+            outcome["response"]["work"]["workId"].as_str().unwrap(),
+            original_work_id
+        );
+        assert_eq!(
+            records(&root.path().join("ledger/work-items")),
+            work_items_before
+        );
+        let matching_receipts = idempotency_receipt_paths(&root.path().join("ledger/idempotency"))
+            .into_iter()
+            .filter(|path| read_json(path)["requestId"] == REQUEST)
+            .collect::<Vec<_>>();
+        assert_eq!(matching_receipts.len(), 1);
+        assert_eq!(matching_receipts[0], receipt_file);
+        assert_eq!(read_json(&receipt_file)["status"], "complete");
+    }
+}
+
+fn expected_receipt_sha256(bundle: &Path) -> String {
+    std::fs::read_to_string(bundle.join("receipt.sha256"))
+        .unwrap()
+        .split_whitespace()
+        .next()
+        .unwrap()
+        .to_string()
+}
+
+fn sha256_file(path: &Path) -> String {
+    format!("{:x}", Sha256::digest(std::fs::read(path).unwrap()))
 }
 
 #[test]

@@ -2640,6 +2640,7 @@ impl AgentHostHandle {
             "persistent_agent_resume",
             &request_id,
             &payload_hash,
+            None,
         )? {
             crate::orchestration::IdempotencyClaim::Replay(Ok(value)) => value
                 .as_str()

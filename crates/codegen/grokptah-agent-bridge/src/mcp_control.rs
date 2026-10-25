@@ -5095,7 +5095,7 @@ mod tests {
         for request_id in ["receipt-a", "receipt-b"] {
             assert!(matches!(
                 orch.store()
-                    .claim_idempotency(&scope, "ptah_probe", request_id, "payload-secret")
+                    .claim_idempotency(&scope, "ptah_probe", request_id, "payload-secret", None)
                     .unwrap(),
                 crate::orchestration::IdempotencyClaim::Perform
             ));
@@ -5117,6 +5117,7 @@ mod tests {
                 "ptah_probe",
                 "other-session-receipt",
                 "other-secret",
+                None,
             )
             .unwrap();
 

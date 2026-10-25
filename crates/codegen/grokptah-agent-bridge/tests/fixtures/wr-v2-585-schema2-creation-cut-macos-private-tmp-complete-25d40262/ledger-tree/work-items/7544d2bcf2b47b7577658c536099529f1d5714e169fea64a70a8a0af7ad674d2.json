@@ -1,0 +1,41 @@
+{
+  "schemaVersion": 1,
+  "workId": "6449ac1f-1b2c-46eb-8d4d-a922edb64ce9",
+  "kind": "test",
+  "objective": "recover the original Work creation",
+  "sessionId": "102bc2b2-62b7-47e5-907b-ffcfe2faae81",
+  "workspace": "/private/tmp/grokptah-585-cut-root.wu1Qcc/workspace",
+  "createdBy": "primary",
+  "assignedAgentId": null,
+  "priority": 7,
+  "deadline": null,
+  "parentWorkId": null,
+  "dependencies": [],
+  "policy": {
+    "bounds": {
+      "maxPromptBytes": 100000,
+      "maxRounds": 24,
+      "maxDurationMs": 900000
+    },
+    "retry": {
+      "maxAttempts": 3,
+      "retryFailed": true,
+      "retryExpired": true,
+      "backoffMs": 0
+    },
+    "requiresApproval": false,
+    "maxConcurrentAttempts": 1,
+    "managedExecution": "inherit",
+    "allowedFiles": []
+  },
+  "state": "queued",
+  "revision": 1,
+  "attemptCount": 0,
+  "progress": null,
+  "result": null,
+  "isContainer": false,
+  "approval": null,
+  "assignmentStatus": "unassigned",
+  "createdAt": "2026-10-25T14:28:21.526070769Z",
+  "updatedAt": "2026-10-25T14:28:21.526070769Z"
+}

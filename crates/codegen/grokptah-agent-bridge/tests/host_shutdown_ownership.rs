@@ -1614,7 +1614,7 @@ async fn every_durable_primitive_refuses_a_stale_clone() {
     // Live: each primitive works.
     assert!(probe_store_write(&orch, session_id).is_ok(), "audit append");
     assert!(
-        orch.claim_idempotency(&receipt_scope, "probe", "req-live", "hash-live")
+        orch.claim_idempotency(&receipt_scope, "probe", "req-live", "hash-live", None)
             .is_ok(),
         "exclusive create"
     );
@@ -1631,7 +1631,7 @@ async fn every_durable_primitive_refuses_a_stale_clone() {
         refusals.push(("audit append", format!("{error:#}")));
     }
     if let Err(error) =
-        stale_orch.claim_idempotency(&receipt_scope, "probe", "req-stale", "hash-stale")
+        stale_orch.claim_idempotency(&receipt_scope, "probe", "req-stale", "hash-stale", None)
     {
         refusals.push(("exclusive create", format!("{error:?}")));
     }

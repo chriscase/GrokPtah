@@ -682,7 +682,7 @@ mod tests {
         json!({"input_tokens":100,"output_tokens":15,"total_tokens":115,"input_tokens_details":{"cached_tokens":20},"output_tokens_details":{"reasoning_tokens":5},"cost_in_usd_ticks":777})
     }
     fn stream(usage: Value, incomplete: bool) -> String {
-        super::super::offline_tests::responses_turn(0, false, usage, incomplete)
+        super::super::offline_fixtures::responses_turn(0, false, usage, incomplete)
     }
 
     #[test]
@@ -783,7 +783,7 @@ mod tests {
             )
             .is_err());
         }
-        let tools = super::super::offline_tests::responses_turn(0, true, usage(), false);
+        let tools = super::super::offline_fixtures::responses_turn(0, true, usage(), false);
         assert_eq!(
             validate_completion(
                 tools.as_bytes(),
@@ -1118,7 +1118,7 @@ mod tests {
             "/v1/responses",
             post(move || {
                 calls.fetch_add(1, Ordering::SeqCst);
-                async { super::super::offline_tests::responses_turn(0, true, usage(), false) }
+                async { super::super::offline_fixtures::responses_turn(0, true, usage(), false) }
             }),
         );
         let (relay, server) = super::super::tests::local_fixture_with_backend(

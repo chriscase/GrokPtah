@@ -5270,6 +5270,7 @@ fn plant_owner_collision(store: &OrchStore, session: Uuid, request_id: &str) -> 
             "ptah_apply_verified_change",
             request_id,
             "foreign-owner-payload",
+            None,
         )
         .unwrap();
     idempotency_files(store.root())
@@ -5287,6 +5288,7 @@ fn plant_workspace_collision(store: &OrchStore, session: Uuid, request_id: &str)
             "ptah_apply_verified_change",
             request_id,
             "foreign-workspace-payload",
+            None,
         )
         .unwrap();
     idempotency_files(store.root())

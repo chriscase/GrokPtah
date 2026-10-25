@@ -487,10 +487,12 @@ impl Drop for IdempotencyLease {
 }
 
 impl OrchestrationService {
+    #[allow(clippy::too_many_arguments)]
     fn bind_work_request(
         &self,
         lease: &IdempotencyLease,
         workspace_display: &str,
+        payload_workspace: &str,
         shape: &str,
         target_work_id: Option<&str>,
         target_attempt_id: Option<&str>,
@@ -504,6 +506,7 @@ impl OrchestrationService {
             lease.payload_hash.clone(),
             shape,
         );
+        binding.payload_workspace = payload_workspace.into();
         binding.target_work_id = target_work_id.map(str::to_string);
         binding.target_attempt_id = target_attempt_id.map(str::to_string);
         binding.expected_revision = expected_revision;
@@ -3983,10 +3986,18 @@ impl OrchestrationService {
         let scope = IdempotencyScope::new(&auth.owner_id, session_id, workspace)?;
         let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
         loop {
-            match self
-                .store
-                .claim_idempotency(&scope, tool, request_id, payload_hash)
-            {
+            match self.store.claim_idempotency(
+                &scope,
+                tool,
+                request_id,
+                payload_hash,
+                Some(workspace.to_str().ok_or_else(|| {
+                    OrchError::new(
+                        OrchErrorCode::InvalidRequest,
+                        "workspace must be valid UTF-8",
+                    )
+                })?),
+            ) {
                 Ok(IdempotencyClaim::Perform) => {
                     return Ok(IdempotencyStart::Perform(IdempotencyLease {
                         store: self.store.clone(),
@@ -5231,6 +5242,12 @@ impl OrchestrationService {
                 ))
             }
         };
+        if self.store.post_commit_prune_recovery_marker_present()
+            || self.store.ledger_admission_closed().is_some()
+        {
+            lease.leave_pending();
+            return Ok(response);
+        }
         lease
             .complete(Some(plan_id.to_string()), response.clone())
             .map_err(|error| {
@@ -5489,6 +5506,7 @@ impl OrchestrationService {
         let _bound = self.bind_work_request(
             &lease,
             &claimed.display().to_string(),
+            &workspace.display().to_string(),
             "work_attempts",
             None,
             None,
@@ -5576,6 +5594,7 @@ impl OrchestrationService {
         let _bound = self.bind_work_request(
             &lease,
             &claimed.display().to_string(),
+            &workspace.display().to_string(),
             "claim",
             Some(work_id),
             None,
@@ -5677,6 +5696,7 @@ impl OrchestrationService {
         let _bound = self.bind_work_request(
             &lease,
             &claimed.display().to_string(),
+            &workspace.display().to_string(),
             "lease_view",
             Some(work_id),
             attempt_id,
@@ -5779,6 +5799,7 @@ impl OrchestrationService {
         let _bound = self.bind_work_request(
             &lease,
             &claimed.display().to_string(),
+            &workspace.display().to_string(),
             "work_attempt",
             Some(work_id),
             Some(attempt_id),
@@ -5924,6 +5945,7 @@ impl OrchestrationService {
         let _bound = self.bind_work_request(
             &lease,
             &claimed.display().to_string(),
+            &workspace.display().to_string(),
             "work_attempt",
             Some(work_id),
             attempt_id,
@@ -5983,14 +6005,23 @@ impl OrchestrationService {
         let _bound = self.bind_work_request(
             &lease,
             &claimed.display().to_string(),
+            &workspace.display().to_string(),
             "work_attempts",
             Some(work_id),
             None,
             expected_revision,
         )?;
-        let cancel_result = self
-            .store
-            .cancel_work_checked(work_id, &reason, expected_revision);
+        let cancel_result = self.store.cancel_work_checked_with_pre_commit(
+            work_id,
+            &reason,
+            expected_revision,
+            |intents| {
+                for intent in intents {
+                    self.revoke_managed_grok_credentials(intent)?;
+                }
+                Ok(())
+            },
+        );
         let (item, attempts) = match cancel_result {
             Ok(value) => value,
             Err(error) => {
@@ -6003,7 +6034,7 @@ impl OrchestrationService {
             .into_iter()
             .filter(|intent| intent.work_id == work_id && intent.grok.is_some())
         {
-            self.cancel_managed_grok_authority(&intent)?;
+            self.stop_managed_grok_task(&intent);
         }
         let attempts = attempts
             .iter()
@@ -6024,13 +6055,10 @@ impl OrchestrationService {
         Ok(response)
     }
 
-    fn cancel_managed_grok_authority(
+    fn revoke_managed_grok_credentials(
         &self,
         intent: &ManagedExecutionIntent,
     ) -> Result<(), OrchError> {
-        if let Some(task) = self.managed_grok_tasks.lock().get(&intent.intent_id) {
-            task.cancel.cancel();
-        }
         if let Some(id) = intent
             .grok
             .as_ref()
@@ -6049,6 +6077,21 @@ impl OrchestrationService {
                 }
             }
         }
+        Ok(())
+    }
+
+    fn stop_managed_grok_task(&self, intent: &ManagedExecutionIntent) {
+        if let Some(task) = self.managed_grok_tasks.lock().get(&intent.intent_id) {
+            task.cancel.cancel();
+        }
+    }
+
+    fn cancel_managed_grok_authority(
+        &self,
+        intent: &ManagedExecutionIntent,
+    ) -> Result<(), OrchError> {
+        self.revoke_managed_grok_credentials(intent)?;
+        self.stop_managed_grok_task(intent);
         Ok(())
     }
 
@@ -6267,6 +6310,7 @@ impl OrchestrationService {
         let _bound = self.bind_work_request(
             &lease,
             &claimed.display().to_string(),
+            &workspace.display().to_string(),
             "decision",
             Some(work_id),
             None,
@@ -6417,6 +6461,7 @@ impl OrchestrationService {
         let _bound = self.bind_work_request(
             &lease,
             &claimed.display().to_string(),
+            &workspace.display().to_string(),
             "decision",
             Some(work_id),
             None,
@@ -6552,6 +6597,7 @@ impl OrchestrationService {
         let _bound = self.bind_work_request(
             &lease,
             &claimed.display().to_string(),
+            &workspace.display().to_string(),
             "unblock",
             Some(work_id),
             None,
@@ -7333,6 +7379,7 @@ impl OrchestrationService {
         let _bound = self.bind_work_request(
             &lease,
             &claimed.display().to_string(),
+            &workspace.display().to_string(),
             "work_scope",
             Some(work_id),
             None,
@@ -7424,6 +7471,7 @@ impl OrchestrationService {
         let _bound = self.bind_work_request(
             &lease,
             &claimed.display().to_string(),
+            &workspace.display().to_string(),
             "decision_scope",
             Some(work_id),
             None,
@@ -7708,6 +7756,7 @@ impl OrchestrationService {
         let _bound = self.bind_work_request(
             &lease,
             &claimed.display().to_string(),
+            &workspace.display().to_string(),
             "decision",
             Some(work_id),
             None,

@@ -1529,9 +1529,26 @@ pub struct DurableWriteFault {
     pub skips_remaining: u32,
 }
 
+#[cfg(debug_assertions)]
 pub static DURABLE_WRITE_FAULT: std::sync::Mutex<Option<DurableWriteFault>> =
     std::sync::Mutex::new(None);
 
+/// Debug-only switch that makes the next message-prune removal fail closed.
+#[cfg(debug_assertions)]
+pub static PRUNE_REMOVE_FAULT: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(debug_assertions)]
+pub(crate) fn prune_remove_fault_armed() -> bool {
+    PRUNE_REMOVE_FAULT.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+#[cfg(not(debug_assertions))]
+pub(crate) fn prune_remove_fault_armed() -> bool {
+    false
+}
+
+#[cfg(debug_assertions)]
 pub(crate) fn fail_durable_write_if_armed(path: &std::path::Path) -> anyhow::Result<()> {
     let mut guard = DURABLE_WRITE_FAULT
         .lock()
@@ -1548,6 +1565,11 @@ pub(crate) fn fail_durable_write_if_armed(path: &std::path::Path) -> anyhow::Res
     }
     *guard = None;
     anyhow::bail!("injected durable write failure");
+}
+
+#[cfg(not(debug_assertions))]
+pub(crate) fn fail_durable_write_if_armed(_path: &std::path::Path) -> anyhow::Result<()> {
+    Ok(())
 }
 
 pub(crate) struct PromotionRecord {

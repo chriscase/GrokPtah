@@ -1,18 +1,21 @@
 //! Actual authenticated manager mutation callers, process death and replay.
 mod common;
+#[path = "common/copy_tree.rs"]
+mod copy_tree;
 
 use grokptah_agent_bridge::orchestration::{
     canonical_workspace, safe_id_filename, AuthContext, ManagerCoordinationMode, ManagerStepSpec,
-    MessageKind, OrchStore, OrchestrationConfig, OrchestrationService, RunBounds, WorkItem,
-    WorkMessage, WorkPolicy, WorkspaceAllowlist,
+    MessageKind, OrchStore, OrchestrationConfig, OrchestrationService, RunBounds, WorkAttempt,
+    WorkItem, WorkMessage, WorkPolicy, WorkspaceAllowlist,
 };
 use grokptah_agent_bridge::{
     set_grokptah_home_override, start_control_server, AgentHost, DurableWriteFault, HostConfig,
-    McpControlClient, SessionKind, DURABLE_WRITE_FAULT,
+    McpControlClient, SessionKind, DURABLE_WRITE_FAULT, PRUNE_REMOVE_FAULT,
 };
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::sync::atomic::Ordering;
 use uuid::Uuid;
 
 const TOKEN: &str = "synthetic-manager-mutation-v2";
@@ -368,11 +371,17 @@ async fn run_child(root: PathBuf, env: &mut common::ProcessEnvGuard) {
         }
         json!({"response":{"plan":store.load_manager_plan(args["planId"].as_str().unwrap()).unwrap().unwrap()}})
     } else {
+        if phase == "prune_remove_fault" {
+            PRUNE_REMOVE_FAULT.store(true, Ordering::SeqCst);
+        }
         match invoke(&orch, &auth, &args, &operation).await {
             Ok(response) => json!({"response":response}),
             Err(error) => json!({"error":error}),
         }
     };
+    if phase == "prune_remove_fault" {
+        PRUNE_REMOVE_FAULT.store(false, Ordering::SeqCst);
+    }
     *DURABLE_WRITE_FAULT.lock().unwrap() = None;
     write(root.join(format!("{phase}.json")), &outcome);
     if phase == "fault" || phase == "refusal" {
@@ -426,7 +435,7 @@ async fn run_child(root: PathBuf, env: &mut common::ProcessEnvGuard) {
                 )
                 .is_err());
         }
-    } else {
+    } else if phase != "prune_remove_fault" {
         assert!(
             outcome.get("response").is_some(),
             "caller failed: {outcome}; durable receipt: {}",
@@ -737,6 +746,131 @@ fn disk_json(root: &Path) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
     }
     result
 }
+
+fn manager_mutation_intent_digest(intent: &Value) -> String {
+    grokptah_agent_bridge::orchestration::hash_payload(&json!([
+        intent["operation"],
+        intent["priorPlan"],
+        intent["plan"],
+        intent["workWrites"],
+        intent["messageWrites"],
+        intent["sequence"],
+        intent["nativeExecutor"],
+        intent["observation"]
+    ]))
+}
+
+fn prune_tick_prune_fault_root() -> tempfile::TempDir {
+    let root = tempfile::tempdir().unwrap();
+    write(
+        root.path().join("options.json"),
+        &json!({"seedMessages":500}),
+    );
+    exited(
+        &child(root.path(), "tick-message", "prune_remove_fault", ""),
+        0,
+    );
+    root
+}
+
+fn prune_fault_notification_path(root: &Path) -> PathBuf {
+    let outcome = read(root.join("prune_remove_fault.json"));
+    let message_id = outcome["response"]["messages"][0]["messageId"]
+        .as_str()
+        .unwrap();
+    root.join("home/ledger/messages")
+        .join(format!("{}.json", safe_id_filename(message_id).unwrap()))
+}
+
+fn delete_prune_fault_notification(root: &Path) {
+    std::fs::remove_file(prune_fault_notification_path(root)).unwrap();
+}
+
+fn prune_advance_prune_fault_root() -> tempfile::TempDir {
+    let root = tempfile::tempdir().unwrap();
+    write(
+        root.path().join("options.json"),
+        &json!({"seedMessages":501}),
+    );
+    exited(&child(root.path(), "advance", "prune_remove_fault", ""), 0);
+    root
+}
+
+fn sealed_prune_fault_message_agents(root: &Path) -> Value {
+    let intent_paths = paths(&root.join("home/ledger/manager-intents"));
+    if let Some(path) = intent_paths.last() {
+        read(path)["messageWrites"][0]["message"].clone()
+    } else {
+        read(root.join("home/ledger/ledger-admission-recovery.json"))["sealedMutationIntent"]
+            ["messageWrites"][0]["message"]
+            .clone()
+    }
+}
+
+fn delete_notification_and_foreign_scope_message_agents(root: &Path) {
+    delete_prune_fault_notification(root);
+    let message = sealed_prune_fault_message_agents(root);
+    for key in ["fromAgentId", "toAgentId"] {
+        if let Some(agent_id) = message[key].as_str() {
+            let path = root
+                .join("home/ledger/agents")
+                .join(format!("{}.json", safe_id_filename(agent_id).unwrap()));
+            if path.is_file() {
+                let mut agent = read(&path);
+                agent["workspace"] = json!("/tmp/foreign-manager-mutation-scope");
+                write(&path, &agent);
+            }
+        }
+    }
+}
+
+fn delete_created_child_and_seed_orphan_attempt(root: &Path) {
+    let outcome = read(root.join("prune_remove_fault.json"));
+    let created = outcome["response"]["createdWork"]
+        .as_array()
+        .and_then(|items| items.first())
+        .expect("advance prune fault must seal created Work");
+    let work_id = created["workId"].as_str().unwrap();
+    let work_path = root
+        .join("home/ledger/work-items")
+        .join(format!("{}.json", safe_id_filename(work_id).unwrap()));
+    std::fs::remove_file(&work_path).unwrap();
+    let attempt = WorkAttempt::new(
+        work_id,
+        1,
+        "synthetic-orphan-actor",
+        "synthetic-orphan-lease",
+    );
+    attempt.validate().unwrap();
+    let attempt_path = root.join("home/ledger/work-attempts").join(format!(
+        "{}.json",
+        safe_id_filename(&attempt.attempt_id).unwrap()
+    ));
+    write(&attempt_path, &json!(attempt));
+}
+
+fn receipt_path_for_request(root: &Path) -> PathBuf {
+    paths(&root.join("home/ledger/idempotency"))
+        .into_iter()
+        .find(|path| read(path)["requestId"] == REQUEST)
+        .unwrap()
+}
+
+fn assert_refused_prune_recovery_preserves_evidence(root: &Path, expected_receipt_status: &str) {
+    let before = disk_json(root);
+    let _guard = common::ProcessEnvGuard::new();
+    set_grokptah_home_override(Some(root.join("home")));
+    std::env::remove_var("MANAGER_MUTATION_PHASE");
+    if let Ok(store) = OrchStore::open(root.join("home/ledger")) {
+        assert!(store.ledger_admission_closed().is_some());
+    }
+    assert_eq!(disk_json(root), before);
+    assert_eq!(receipt(root)["status"], expected_receipt_status);
+    assert!(root
+        .join("home/ledger/ledger-admission-recovery.json")
+        .is_file());
+}
+
 #[test]
 fn advance_child_written_cut_replays_the_original_request() {
     prove("advance", "manager_mutation_after_work");
@@ -1264,6 +1398,589 @@ fn recovered_tick_preserves_retention_and_existing_question_identity() {
         );
         assert_eq!(expected["messages"][0], original);
         assert_eq!(paths(&root.path().join("home/ledger/messages")).len(), 1);
+    }
+}
+
+#[test]
+fn manager_mutation_returns_success_when_only_post_commit_prune_fails() {
+    let root = tempfile::tempdir().unwrap();
+    write(
+        root.path().join("options.json"),
+        &json!({"seedMessages":500}),
+    );
+    exited(
+        &child(root.path(), "tick-message", "prune_remove_fault", ""),
+        0,
+    );
+    let outcome = read(root.path().join("prune_remove_fault.json"));
+    assert!(
+        outcome.get("response").is_some(),
+        "committed manager mutation must not surface as caller failure: {outcome}"
+    );
+    assert!(outcome.get("error").is_none(), "{outcome}");
+    let settled = receipt(root.path());
+    assert_eq!(settled["status"], "pending");
+    assert_eq!(
+        paths(&root.path().join("home/ledger/manager-intents")).len(),
+        1
+    );
+}
+
+#[test]
+fn manager_post_commit_prune_closes_admission_but_replays_the_original_tick() {
+    let root = tempfile::tempdir().unwrap();
+    write(
+        root.path().join("options.json"),
+        &json!({"seedMessages":500}),
+    );
+    exited(
+        &child(root.path(), "tick-message", "prune_remove_fault", ""),
+        0,
+    );
+    let expected = read(root.path().join("prune_remove_fault.json"))["response"].clone();
+    assert!(root
+        .path()
+        .join("home/ledger/ledger-admission-recovery.json")
+        .is_file());
+    assert_eq!(receipt(root.path())["status"], "pending");
+    for phase in ["replay", "reopen2"] {
+        exited(&child(root.path(), "tick-message", phase, ""), 0);
+        assert_eq!(
+            read(root.path().join(format!("{phase}.json")))["response"],
+            expected
+        );
+    }
+}
+
+#[test]
+fn manager_post_commit_prune_recovers_on_ordinary_reopen_without_test_phase_env() {
+    let root = tempfile::tempdir().unwrap();
+    write(
+        root.path().join("options.json"),
+        &json!({"seedMessages":500}),
+    );
+    exited(
+        &child(root.path(), "tick-message", "prune_remove_fault", ""),
+        0,
+    );
+    let expected = read(root.path().join("prune_remove_fault.json"))["response"].clone();
+    let _guard = common::ProcessEnvGuard::new();
+    set_grokptah_home_override(Some(root.path().join("home")));
+    std::env::remove_var("MANAGER_MUTATION_PHASE");
+    let store = OrchStore::open(root.path().join("home/ledger")).unwrap();
+    assert!(store.ledger_admission_closed().is_none());
+    assert_eq!(receipt(root.path())["status"], "complete");
+    assert!(!root
+        .path()
+        .join("home/ledger/ledger-admission-recovery.json")
+        .exists());
+    assert!(paths(&root.path().join("home/ledger/manager-intents")).is_empty());
+    assert_eq!(
+        read(root.path().join("prune_remove_fault.json"))["response"],
+        expected
+    );
+}
+
+#[test]
+fn manager_post_commit_prune_recovers_when_intent_unlinked_before_marker() {
+    let root = tempfile::tempdir().unwrap();
+    write(
+        root.path().join("options.json"),
+        &json!({"seedMessages":500}),
+    );
+    exited(
+        &child(root.path(), "tick-message", "prune_remove_fault", ""),
+        0,
+    );
+    let marker_path = root
+        .path()
+        .join("home/ledger/ledger-admission-recovery.json");
+    let intent_paths = paths(&root.path().join("home/ledger/manager-intents"));
+    assert_eq!(intent_paths.len(), 1);
+    let intent_path = intent_paths[0].clone();
+    std::fs::remove_file(&intent_path).unwrap();
+    assert!(marker_path.is_file());
+    let _guard = common::ProcessEnvGuard::new();
+    set_grokptah_home_override(Some(root.path().join("home")));
+    std::env::remove_var("MANAGER_MUTATION_PHASE");
+    let store = OrchStore::open(root.path().join("home/ledger")).unwrap();
+    assert!(store.ledger_admission_closed().is_none());
+    assert!(!marker_path.exists());
+    assert_eq!(receipt(root.path())["status"], "complete");
+}
+
+#[test]
+fn manager_post_commit_prune_keeps_intent_when_prune_fails_again_on_reopen() {
+    let root = tempfile::tempdir().unwrap();
+    write(
+        root.path().join("options.json"),
+        &json!({"seedMessages":500}),
+    );
+    exited(
+        &child(root.path(), "tick-message", "prune_remove_fault", ""),
+        0,
+    );
+    let _guard = common::ProcessEnvGuard::new();
+    set_grokptah_home_override(Some(root.path().join("home")));
+    std::env::remove_var("MANAGER_MUTATION_PHASE");
+    PRUNE_REMOVE_FAULT.store(true, Ordering::SeqCst);
+    {
+        let store = OrchStore::open(root.path().join("home/ledger")).unwrap();
+        PRUNE_REMOVE_FAULT.store(false, Ordering::SeqCst);
+        assert!(store.ledger_admission_closed().is_some());
+        assert_eq!(
+            receipt(root.path())["status"],
+            "pending",
+            "prune must not settle the caller receipt while recovery marker remains"
+        );
+        assert!(root
+            .path()
+            .join("home/ledger/ledger-admission-recovery.json")
+            .is_file());
+        assert_eq!(
+            paths(&root.path().join("home/ledger/manager-intents")).len(),
+            1
+        );
+    }
+    let store = OrchStore::open(root.path().join("home/ledger")).unwrap();
+    assert!(store.ledger_admission_closed().is_none());
+    assert!(!root
+        .path()
+        .join("home/ledger/ledger-admission-recovery.json")
+        .exists());
+    assert!(paths(&root.path().join("home/ledger/manager-intents")).is_empty());
+    assert_eq!(receipt(root.path())["status"], "complete");
+}
+
+#[test]
+fn manager_post_commit_prune_restores_deleted_notification_on_reopen() {
+    let root = tempfile::tempdir().unwrap();
+    write(
+        root.path().join("options.json"),
+        &json!({"seedMessages":500}),
+    );
+    exited(
+        &child(root.path(), "tick-message", "prune_remove_fault", ""),
+        0,
+    );
+    let outcome = read(root.path().join("prune_remove_fault.json"));
+    let expected_message = outcome["response"]["messages"][0].clone();
+    let message_id = expected_message["messageId"].as_str().unwrap();
+    let message_path = root
+        .path()
+        .join("home/ledger/messages")
+        .join(format!("{}.json", safe_id_filename(message_id).unwrap()));
+    assert!(message_path.is_file());
+    std::fs::remove_file(&message_path).unwrap();
+    assert!(!message_path.exists());
+    let _guard = common::ProcessEnvGuard::new();
+    set_grokptah_home_override(Some(root.path().join("home")));
+    std::env::remove_var("MANAGER_MUTATION_PHASE");
+    let store = OrchStore::open(root.path().join("home/ledger")).unwrap();
+    assert!(store.ledger_admission_closed().is_none());
+    assert!(!root
+        .path()
+        .join("home/ledger/ledger-admission-recovery.json")
+        .exists());
+    assert_eq!(receipt(root.path())["status"], "complete");
+    assert!(message_path.is_file());
+    assert_eq!(read(message_path), expected_message);
+}
+
+#[test]
+fn manager_post_commit_prune_restores_deleted_child_on_reopen() {
+    let root = tempfile::tempdir().unwrap();
+    // Retention pruning runs only when message count exceeds MAX_RETAINED_MESSAGES
+    // (500). Advance does not append a notification, so seed one extra message so
+    // post-commit prune fails while the mutation intent still seals created Work.
+    write(
+        root.path().join("options.json"),
+        &json!({"seedMessages":501}),
+    );
+    exited(&child(root.path(), "advance", "prune_remove_fault", ""), 0);
+    let outcome = read(root.path().join("prune_remove_fault.json"));
+    let created = outcome["response"]["createdWork"]
+        .as_array()
+        .expect("advance must seal created Work in its committed response");
+    assert!(!created.is_empty(), "advance must create child Work");
+    assert!(
+        root.path()
+            .join("home/ledger/ledger-admission-recovery.json")
+            .is_file(),
+        "post-commit prune failure must leave admission recovery evidence"
+    );
+    let expected_child = created[0].clone();
+    let work_id = expected_child["workId"].as_str().unwrap();
+    let work_path = root
+        .path()
+        .join("home/ledger/work-items")
+        .join(format!("{}.json", safe_id_filename(work_id).unwrap()));
+    assert!(work_path.is_file());
+    std::fs::remove_file(&work_path).unwrap();
+    assert!(!work_path.exists());
+    let _guard = common::ProcessEnvGuard::new();
+    set_grokptah_home_override(Some(root.path().join("home")));
+    std::env::remove_var("MANAGER_MUTATION_PHASE");
+    let store = OrchStore::open(root.path().join("home/ledger")).unwrap();
+    assert!(
+        work_path.is_file(),
+        "deleted child Work must be replayed before settlement"
+    );
+    assert_eq!(read(work_path), expected_child);
+    assert!(store.ledger_admission_closed().is_none());
+    assert_eq!(receipt(root.path())["status"], "complete");
+}
+
+#[test]
+fn manager_post_commit_prune_marker_only_restores_deleted_notification_on_reopen() {
+    let root = tempfile::tempdir().unwrap();
+    write(
+        root.path().join("options.json"),
+        &json!({"seedMessages":500}),
+    );
+    exited(
+        &child(root.path(), "tick-message", "prune_remove_fault", ""),
+        0,
+    );
+    let outcome = read(root.path().join("prune_remove_fault.json"));
+    let expected_message = outcome["response"]["messages"][0].clone();
+    let message_id = expected_message["messageId"].as_str().unwrap();
+    let message_path = root
+        .path()
+        .join("home/ledger/messages")
+        .join(format!("{}.json", safe_id_filename(message_id).unwrap()));
+    let intent_paths = paths(&root.path().join("home/ledger/manager-intents"));
+    assert_eq!(intent_paths.len(), 1);
+    std::fs::remove_file(&intent_paths[0]).unwrap();
+    std::fs::remove_file(&message_path).unwrap();
+    assert!(root
+        .path()
+        .join("home/ledger/ledger-admission-recovery.json")
+        .is_file());
+    let _guard = common::ProcessEnvGuard::new();
+    set_grokptah_home_override(Some(root.path().join("home")));
+    std::env::remove_var("MANAGER_MUTATION_PHASE");
+    let store = OrchStore::open(root.path().join("home/ledger")).unwrap();
+    assert!(store.ledger_admission_closed().is_none());
+    assert_eq!(receipt(root.path())["status"], "complete");
+    assert!(message_path.is_file());
+    assert_eq!(read(message_path), expected_message);
+}
+
+#[test]
+fn manager_post_commit_prune_refuses_altered_committed_effects() {
+    let root = tempfile::tempdir().unwrap();
+    write(
+        root.path().join("options.json"),
+        &json!({"seedMessages":500}),
+    );
+    exited(
+        &child(root.path(), "tick-message", "prune_remove_fault", ""),
+        0,
+    );
+    let outcome = read(root.path().join("prune_remove_fault.json"));
+    let message_id = outcome["response"]["messages"][0]["messageId"]
+        .as_str()
+        .unwrap();
+    let message_path = root
+        .path()
+        .join("home/ledger/messages")
+        .join(format!("{}.json", safe_id_filename(message_id).unwrap()));
+    let mut message = read(message_path.clone());
+    message["body"] = json!("tampered committed message effect");
+    write(message_path, &message);
+    let _guard = common::ProcessEnvGuard::new();
+    set_grokptah_home_override(Some(root.path().join("home")));
+    std::env::remove_var("MANAGER_MUTATION_PHASE");
+    let store = OrchStore::open(root.path().join("home/ledger")).unwrap();
+    assert!(store.ledger_admission_closed().is_some());
+    assert!(root
+        .path()
+        .join("home/ledger/ledger-admission-recovery.json")
+        .is_file());
+    assert_eq!(receipt(root.path())["status"], "pending");
+}
+
+#[test]
+fn manager_post_commit_prune_refusal_invalid_receipt_preserves_evidence_intent_present() {
+    let root = prune_tick_prune_fault_root();
+    delete_prune_fault_notification(root.path());
+    let receipt_path = receipt_path_for_request(root.path());
+    let mut claim = read(&receipt_path);
+    claim["status"] = json!("failed");
+    claim["error"] = json!({"code":"conflict","message":"foreign failure"});
+    write(&receipt_path, &claim);
+    assert_refused_prune_recovery_preserves_evidence(root.path(), "failed");
+}
+
+#[test]
+fn manager_post_commit_prune_refusal_invalid_receipt_preserves_evidence_marker_only() {
+    let root = prune_tick_prune_fault_root();
+    delete_prune_fault_notification(root.path());
+    for path in paths(&root.path().join("home/ledger/manager-intents")) {
+        std::fs::remove_file(path).unwrap();
+    }
+    let receipt_path = receipt_path_for_request(root.path());
+    let mut claim = read(&receipt_path);
+    claim["payloadHash"] = json!("deadbeef");
+    write(&receipt_path, &claim);
+    assert_refused_prune_recovery_preserves_evidence(root.path(), "pending");
+}
+
+#[test]
+fn manager_post_commit_prune_refusal_invalid_seal_preserves_evidence_intent_present() {
+    let root = prune_tick_prune_fault_root();
+    delete_prune_fault_notification(root.path());
+    let intent_path = paths(&root.path().join("home/ledger/manager-intents"))
+        .pop()
+        .unwrap();
+    let mut intent = read(&intent_path);
+    intent["messageWrites"][0]["message"]["body"] = json!("tampered sealed notification");
+    write(&intent_path, &intent);
+    assert_refused_prune_recovery_preserves_evidence(root.path(), "pending");
+}
+
+#[test]
+fn manager_post_commit_prune_refusal_invalid_seal_preserves_evidence_marker_only() {
+    let root = prune_tick_prune_fault_root();
+    delete_prune_fault_notification(root.path());
+    for path in paths(&root.path().join("home/ledger/manager-intents")) {
+        std::fs::remove_file(path).unwrap();
+    }
+    let marker_path = root
+        .path()
+        .join("home/ledger/ledger-admission-recovery.json");
+    let mut marker = read(&marker_path);
+    marker["sealedMutationIntent"]["messageWrites"][0]["message"]["body"] =
+        json!("tampered sealed notification");
+    write(&marker_path, &marker);
+    assert_refused_prune_recovery_preserves_evidence(root.path(), "pending");
+}
+
+#[test]
+fn manager_post_commit_prune_refusal_conflicting_observation_preserves_evidence_intent_present() {
+    let root = prune_tick_prune_fault_root();
+    delete_prune_fault_notification(root.path());
+    let intent_path = paths(&root.path().join("home/ledger/manager-intents"))
+        .pop()
+        .unwrap();
+    let mut intent = read(&intent_path);
+    intent["observation"]["actor"] = json!("foreign-actor");
+    intent["snapshotDigest"] = json!(manager_mutation_intent_digest(&intent));
+    write(&intent_path, &intent);
+    assert_refused_prune_recovery_preserves_evidence(root.path(), "pending");
+}
+
+#[test]
+fn manager_post_commit_prune_refusal_conflicting_observation_preserves_evidence_marker_only() {
+    let root = prune_tick_prune_fault_root();
+    delete_prune_fault_notification(root.path());
+    for path in paths(&root.path().join("home/ledger/manager-intents")) {
+        std::fs::remove_file(path).unwrap();
+    }
+    let marker_path = root
+        .path()
+        .join("home/ledger/ledger-admission-recovery.json");
+    let mut marker = read(&marker_path);
+    marker["sealedMutationIntent"]["observation"]["actor"] = json!("foreign-actor");
+    marker["sealedMutationIntent"]["snapshotDigest"] = json!(manager_mutation_intent_digest(
+        &marker["sealedMutationIntent"]
+    ));
+    write(&marker_path, &marker);
+    assert_refused_prune_recovery_preserves_evidence(root.path(), "pending");
+}
+
+fn tamper_observed_work_on_disk(root: &Path, intent: &Value) {
+    let observed = &intent["observation"]["workItems"][0];
+    let work_id = observed["workId"].as_str().unwrap();
+    let work_path = root
+        .join("home/ledger/work-items")
+        .join(format!("{}.json", safe_id_filename(work_id).unwrap()));
+    let mut work = read(&work_path);
+    work["objective"] = json!("tampered on-disk observed work snapshot");
+    write(&work_path, &work);
+}
+
+fn restore_prior_plan_with_tampered_notification(root: &Path, intent: &Value) {
+    let plan_id = intent["plan"]["planId"].as_str().unwrap();
+    let plan_path = root
+        .join("home/ledger/manager-plans")
+        .join(format!("{}.json", safe_id_filename(plan_id).unwrap()));
+    write(&plan_path, &intent["priorPlan"]);
+    let message = &intent["messageWrites"][0]["message"];
+    let message_path = root.join("home/ledger/messages").join(format!(
+        "{}.json",
+        safe_id_filename(message["messageId"].as_str().unwrap()).unwrap()
+    ));
+    let mut on_disk = read(&message_path);
+    on_disk["body"] = json!("tampered on-disk notification body");
+    write(&message_path, &on_disk);
+}
+
+#[test]
+fn manager_post_commit_prune_refusal_tampered_observed_work_preserves_evidence_intent_present() {
+    let root = prune_tick_prune_fault_root();
+    delete_prune_fault_notification(root.path());
+    let intent_path = paths(&root.path().join("home/ledger/manager-intents"))
+        .pop()
+        .unwrap();
+    let intent = read(&intent_path);
+    tamper_observed_work_on_disk(root.path(), &intent);
+    assert_refused_prune_recovery_preserves_evidence(root.path(), "pending");
+}
+
+#[test]
+fn manager_post_commit_prune_refusal_tampered_observed_work_preserves_evidence_marker_only() {
+    let root = prune_tick_prune_fault_root();
+    delete_prune_fault_notification(root.path());
+    let marker_path = root
+        .path()
+        .join("home/ledger/ledger-admission-recovery.json");
+    let intent = read(&marker_path)["sealedMutationIntent"].clone();
+    tamper_observed_work_on_disk(root.path(), &intent);
+    for path in paths(&root.path().join("home/ledger/manager-intents")) {
+        std::fs::remove_file(path).unwrap();
+    }
+    assert_refused_prune_recovery_preserves_evidence(root.path(), "pending");
+}
+
+#[test]
+fn manager_post_commit_prune_refusal_prior_plan_and_tampered_notification_preserves_evidence_intent_present(
+) {
+    let root = prune_tick_prune_fault_root();
+    let intent_path = paths(&root.path().join("home/ledger/manager-intents"))
+        .pop()
+        .unwrap();
+    let intent = read(&intent_path);
+    restore_prior_plan_with_tampered_notification(root.path(), &intent);
+    assert_refused_prune_recovery_preserves_evidence(root.path(), "pending");
+}
+
+#[test]
+fn manager_post_commit_prune_refusal_prior_plan_and_tampered_notification_preserves_evidence_marker_only(
+) {
+    let root = prune_tick_prune_fault_root();
+    let marker_path = root
+        .path()
+        .join("home/ledger/ledger-admission-recovery.json");
+    let intent = read(&marker_path)["sealedMutationIntent"].clone();
+    restore_prior_plan_with_tampered_notification(root.path(), &intent);
+    for path in paths(&root.path().join("home/ledger/manager-intents")) {
+        std::fs::remove_file(path).unwrap();
+    }
+    assert_refused_prune_recovery_preserves_evidence(root.path(), "pending");
+}
+
+#[test]
+fn manager_post_commit_prune_refusal_missing_notification_foreign_agent_preserves_evidence_intent_present(
+) {
+    let root = prune_tick_prune_fault_root();
+    delete_notification_and_foreign_scope_message_agents(root.path());
+    assert_refused_prune_recovery_preserves_evidence(root.path(), "pending");
+}
+
+#[test]
+fn manager_post_commit_prune_refusal_missing_notification_foreign_agent_preserves_evidence_marker_only(
+) {
+    let root = prune_tick_prune_fault_root();
+    delete_notification_and_foreign_scope_message_agents(root.path());
+    for path in paths(&root.path().join("home/ledger/manager-intents")) {
+        std::fs::remove_file(path).unwrap();
+    }
+    assert_refused_prune_recovery_preserves_evidence(root.path(), "pending");
+}
+
+#[test]
+fn manager_post_commit_prune_refusal_missing_child_orphan_attempt_preserves_evidence_intent_present(
+) {
+    let root = prune_advance_prune_fault_root();
+    delete_created_child_and_seed_orphan_attempt(root.path());
+    assert_refused_prune_recovery_preserves_evidence(root.path(), "complete");
+}
+
+#[test]
+fn manager_post_commit_prune_refusal_missing_child_orphan_attempt_preserves_evidence_marker_only() {
+    let root = prune_advance_prune_fault_root();
+    delete_created_child_and_seed_orphan_attempt(root.path());
+    for path in paths(&root.path().join("home/ledger/manager-intents")) {
+        std::fs::remove_file(path).unwrap();
+    }
+    assert_refused_prune_recovery_preserves_evidence(root.path(), "complete");
+}
+
+#[test]
+fn manager_post_commit_prune_refuses_tampered_marker_without_intent() {
+    let root = tempfile::tempdir().unwrap();
+    write(
+        root.path().join("options.json"),
+        &json!({"seedMessages":500}),
+    );
+    exited(
+        &child(root.path(), "tick-message", "prune_remove_fault", ""),
+        0,
+    );
+    let marker_path = root
+        .path()
+        .join("home/ledger/ledger-admission-recovery.json");
+    let intent_paths = paths(&root.path().join("home/ledger/manager-intents"));
+    assert_eq!(intent_paths.len(), 1);
+    std::fs::remove_file(&intent_paths[0]).unwrap();
+    let marker = read(marker_path.clone());
+    let cases: Vec<(&str, Value)> = vec![
+        ("altered-response", {
+            let mut tampered = marker.clone();
+            tampered["sealedResponse"]["plan"]["revision"] = json!(
+                tampered["sealedResponse"]["plan"]["revision"]
+                    .as_u64()
+                    .unwrap()
+                    + 99
+            );
+            tampered
+        }),
+        ("altered-identity", {
+            let mut tampered = marker.clone();
+            tampered["sealedBinding"]["ownerId"] = json!("foreign-owner");
+            tampered
+        }),
+        ("absent-sealed-binding", {
+            let mut tampered = marker.clone();
+            tampered.as_object_mut().unwrap().remove("sealedBinding");
+            tampered
+        }),
+        ("absent-sealed-response", {
+            let mut tampered = marker.clone();
+            tampered.as_object_mut().unwrap().remove("sealedResponse");
+            tampered
+        }),
+    ];
+    for (label, tampered) in cases {
+        let case_root = tempfile::tempdir().unwrap();
+        copy_tree::copy_dir_all(root.path(), case_root.path()).unwrap();
+        let case_marker = case_root
+            .path()
+            .join("home/ledger/ledger-admission-recovery.json");
+        write(&case_marker, &tampered);
+        let intent_paths = paths(&case_root.path().join("home/ledger/manager-intents"));
+        for path in intent_paths {
+            std::fs::remove_file(path).unwrap();
+        }
+        let _guard = common::ProcessEnvGuard::new();
+        set_grokptah_home_override(Some(case_root.path().join("home")));
+        std::env::remove_var("MANAGER_MUTATION_PHASE");
+        let store = OrchStore::open(case_root.path().join("home/ledger")).unwrap();
+        assert!(
+            store.ledger_admission_closed().is_some(),
+            "{label}: tampered marker must keep admission closed"
+        );
+        assert!(
+            case_marker.is_file(),
+            "{label}: tampered marker evidence must be preserved"
+        );
+        assert_eq!(
+            receipt(case_root.path())["status"],
+            "pending",
+            "{label}: caller receipt must stay pending until validated recovery"
+        );
     }
 }
 

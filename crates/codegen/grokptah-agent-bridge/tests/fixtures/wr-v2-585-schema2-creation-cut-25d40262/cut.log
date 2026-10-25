@@ -1,0 +1,3 @@
+
+running 1 test
+[grokptah] adopting an orchestration ledger governed by /tmp/grokptah-585-cut-root.wu1Qcc/ledger/.instance.lock, outside the home this runtime owns (/tmp/grokptah-585-cut-root.wu1Qcc/home/.instance.lock); it keeps the durable-write authority it established at open rather than borrowing this runtime's
