@@ -16506,10 +16506,11 @@ mod tests {
         let store = OrchStore::open(&ledger).unwrap();
         if phase == "legacy_prune_crash" {
             let workspace = ledger.parent().expect("ledger directory").join("workspace");
-            let scope = IdempotencyScope::new("owner-a", Uuid::nil(), &workspace).unwrap();
+            let sealed = crate::orchestration::authz::canonical_workspace(&workspace).unwrap();
+            let sealed_scope = IdempotencyScope::new("owner-a", Uuid::nil(), &sealed).unwrap();
             store
                 .simulate_legacy_prune_binding_before_receipt_crash_unlocked(
-                    &scope,
+                    &sealed_scope,
                     "manager-routine-replay",
                 )
                 .unwrap();
@@ -16531,7 +16532,7 @@ mod tests {
         #[cfg(not(unix))]
         return;
         let sealed = crate::orchestration::authz::canonical_workspace(&workspace).unwrap();
-        let scope = IdempotencyScope::new("owner-a", Uuid::nil(), &workspace).unwrap();
+        let sealed_scope = IdempotencyScope::new("owner-a", Uuid::nil(), &sealed).unwrap();
         let claim_scope = IdempotencyScope::new(
             "owner-a",
             Uuid::nil(),
@@ -16563,7 +16564,7 @@ mod tests {
         .unwrap();
         store.save_manager_plan(&plan).unwrap();
         let binding = WorkRequestBinding::bound(
-            &scope,
+            &sealed_scope,
             sealed.display().to_string(),
             "manager-routine-replay",
             "ptah_create_manager_plan",
@@ -16575,7 +16576,7 @@ mod tests {
             .unwrap();
         store
             .claim_idempotency(
-                &scope,
+                &sealed_scope,
                 "ptah_create_manager_plan",
                 "manager-routine-replay",
                 "manager-hash",
@@ -16585,7 +16586,7 @@ mod tests {
         let response = serde_json::json!({"plan": {"planId": plan.plan_id}});
         store
             .complete_idempotency(
-                &scope,
+                &sealed_scope,
                 "ptah_create_manager_plan",
                 "manager-routine-replay",
                 "manager-hash",
@@ -16594,9 +16595,14 @@ mod tests {
             )
             .unwrap();
         let binding_path = store
-            .idempotency_request_scope_binding_path(&scope.owner_id, "manager-routine-replay")
+            .idempotency_request_scope_binding_path(
+                &sealed_scope.owner_id,
+                "manager-routine-replay",
+            )
             .unwrap();
-        let receipt_path = store.idemp_path(&scope, "manager-routine-replay").unwrap();
+        let receipt_path = store
+            .idemp_path(&sealed_scope, "manager-routine-replay")
+            .unwrap();
         assert!(binding_path.is_file());
         drop(store);
         let output = Command::new(std::env::current_exe().unwrap())
