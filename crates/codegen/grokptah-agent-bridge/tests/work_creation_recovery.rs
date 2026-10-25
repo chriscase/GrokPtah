@@ -169,12 +169,15 @@ fn creation_service_child() {
                     env.set("GROKPTAH_CRASH_STAGE", stage);
                 }
             }
+            let invoke_workspace = std::env::var("WORK_CREATION_WORKSPACE_ALIAS")
+                .map(PathBuf::from)
+                .unwrap_or_else(|_| workspace.clone());
             let result = orch
                 .create_work(
                     &auth,
                     REQUEST,
                     session,
-                    &workspace,
+                    &invoke_workspace,
                     "test".into(),
                     "recover the original Work creation".into(),
                     7,
@@ -553,6 +556,73 @@ fn creation_recovery_refuses_conflicting_evidence_without_writing_work() {
                 usize::from(corruption == "foreign_work")
             );
         }
+    }
+}
+
+#[test]
+fn aliased_creation_replays_after_intent_cut_without_closing_admission() {
+    let root = tempfile::tempdir().unwrap();
+    let workspace = canonical_workspace(&root.path().join("workspace")).unwrap();
+    let alias = workspace.join(".");
+    assert_exit(
+        &child_with(
+            root.path(),
+            "create",
+            "lifecycle_after_intent",
+            &[(
+                "WORK_CREATION_WORKSPACE_ALIAS",
+                alias.display().to_string(),
+            )],
+        ),
+        86,
+    );
+    let expected = read_json(intent_paths(root.path()).remove(0));
+    for reopen in 0..3 {
+        assert_exit(&child(root.path(), "replay", ""), 0);
+        let outcome = read_json(root.path().join("outcome.json"));
+        assert!(
+            outcome.get("response").is_some(),
+            "reopen {reopen} must replay the aliased create: {outcome}"
+        );
+        assert!(
+            outcome["admissionClosed"].is_null(),
+            "aliased recovery must not close admission: {outcome}"
+        );
+        assert_eq!(
+            outcome["response"]["work"]["workspace"],
+            workspace.display().to_string()
+        );
+        assert_eq!(receipt_path(root.path()).exists(), true);
+        assert_eq!(read_json(receipt_path(root.path()))["status"], "complete");
+        assert_eq!(
+            records(&root.path().join("ledger/work-items")).len(),
+            1,
+            "reopen {reopen}"
+        );
+    }
+    assert_exit(
+        &child_with(
+            root.path(),
+            "create",
+            "lifecycle_after_intent",
+            &[(
+                "WORK_CREATION_WORKSPACE_ALIAS",
+                alias.display().to_string(),
+            )],
+        ),
+        86,
+    );
+    let path = intent_paths(root.path()).remove(0);
+    let mut intent = read_json(&path);
+    intent["item"]["objective"] = json!("changed after seal");
+    intent["creationItemDigest"] = json!(hash_payload(&intent["item"]));
+    write_json(&path, &intent);
+    for _ in 0..3 {
+        assert!(
+            OrchStore::open(root.path().join("ledger")).is_err(),
+            "aliased substituted digest must refuse recovery"
+        );
+        assert!(records(&root.path().join("ledger/work-items")).is_empty());
     }
 }
 

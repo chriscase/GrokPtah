@@ -2,7 +2,8 @@
 mod common;
 
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, Barrier, Mutex};
 
 use chrono::Utc;
 use grokptah_agent_bridge::grok_build::{
@@ -10,29 +11,30 @@ use grokptah_agent_bridge::grok_build::{
 };
 use grokptah_agent_bridge::managed_provider::ManagedProviderEvidence;
 use grokptah_agent_bridge::orchestration::{
-    canonical_workspace, hash_payload, safe_id_filename,
-    ManagedExecutionBudgetProfile, ManagedExecutionIntent, ManagedGrokCliPermissionMode,
-    ManagedGrokInvocation, ManagedGrokExecutorConfig, ManagedIntentState, MessageKind,
-    OrchStore, OrchestrationConfig, OrchestrationService, RunBounds, RunExecutionMode,
-    WorkMessage, WorkPolicy, WorkspaceAllowlist,
-    MANAGED_EXECUTION_SCHEMA_VERSION, MANAGED_GROK_INVOCATION_SCHEMA_VERSION,
+    canonical_workspace, hash_payload, safe_id_filename, ManagedExecutionBudgetProfile,
+    ManagedExecutionIntent, ManagedGrokCliPermissionMode, ManagedGrokExecutorConfig,
+    ManagedGrokInvocation, ManagedIntentState, MessageKind, OrchErrorCode, OrchStore,
+    OrchestrationConfig, OrchestrationService, RunBounds, RunExecutionMode, WorkPolicy,
+    WorkState, WorkspaceAllowlist, MANAGED_EXECUTION_SCHEMA_VERSION,
+    MANAGED_GROK_INVOCATION_SCHEMA_VERSION,
 };
-const MAX_RETAINED_MESSAGES: usize = 500;
 use grokptah_agent_bridge::{
-    set_grokptah_home_override, AgentHost, DurableWriteFault, HostConfig, SessionKind,
-    DURABLE_WRITE_FAULT,
+    set_grokptah_home_override, AgentHost, HostConfig, PRUNE_REMOVE_FAULT, SessionKind,
 };
 use serde_json::json;
+use uuid::Uuid;
+
+const TOKEN: &str = "wr-v2-585-repair";
+const MAX_RETAINED_MESSAGES: usize = 500;
 
 fn write_json(path: impl AsRef<std::path::Path>, value: &serde_json::Value) {
     std::fs::write(path, serde_json::to_vec_pretty(value).unwrap()).unwrap();
 }
-use uuid::Uuid;
 
-const TOKEN: &str = "wr-v2-585-repair";
 struct RevokeOrderResolver {
     receipt_status_at_revoke: Arc<Mutex<Option<String>>>,
     receipt_reader: Arc<dyn Fn() -> String + Send + Sync>,
+    revoke_count: Arc<AtomicU32>,
 }
 
 impl CredentialLeaseResolver for RevokeOrderResolver {
@@ -43,8 +45,8 @@ impl CredentialLeaseResolver for RevokeOrderResolver {
 
     fn revoke(&self, lease_id: &str) -> Result<(), GrokBuildAdapterError> {
         let _ = lease_id;
-        *self.receipt_status_at_revoke.lock().unwrap() =
-            Some((self.receipt_reader)());
+        self.revoke_count.fetch_add(1, Ordering::SeqCst);
+        *self.receipt_status_at_revoke.lock().unwrap() = Some((self.receipt_reader)());
         Ok(())
     }
 
@@ -79,74 +81,17 @@ fn minimal_grok_identity() -> grokptah_agent_sdk::GrokBuildGitIdentity {
     }
 }
 
-#[test]
-fn message_prune_remove_failures_surface_as_errors() {
-    let store = OrchStore::open(tempfile::tempdir().unwrap().path()).unwrap();
-    std::fs::create_dir_all(store.root().join("messages")).unwrap();
-    let session = Uuid::new_v4();
-    let workspace = "/tmp/wr-v2-prune-fail-closed".to_string();
-    for index in 1..=MAX_RETAINED_MESSAGES {
-        let mut message = WorkMessage::new(
-            MessageKind::Status,
-            "seed",
-            None,
-            None,
-            session,
-            workspace.clone(),
-            None,
-            "retention seed",
-            None,
-            Utc::now(),
-        )
-        .unwrap();
-        message.message_id = format!("seed-{index:04}");
-        message.seq = index as u64;
-        let path = store
-            .root()
-            .join(format!("messages/{}.json", safe_id_filename(&message.message_id).unwrap()));
-        write_json(path, &json!(message));
-    }
-    std::fs::write(store.root().join("messages/seq"), MAX_RETAINED_MESSAGES.to_string()).unwrap();
-
-    *DURABLE_WRITE_FAULT.lock().unwrap() = Some(DurableWriteFault {
-        needle: "messages/",
-        skips_remaining: 0,
-    });
-    let mut overflow = WorkMessage::new(
-        MessageKind::Status,
-        "seed",
-        None,
-        None,
-        session,
-        workspace.clone(),
-        None,
-        "overflow",
-        None,
-        Utc::now(),
-    )
-    .unwrap();
-    overflow.message_id = "overflow-0001".into();
-    let result = store.send_message(overflow);
-    *DURABLE_WRITE_FAULT.lock().unwrap() = None;
-
-    assert!(
-        result.is_err(),
-        "prune must fail closed when retention removal fails: {result:?}"
-    );
-    let messages = std::fs::read_dir(store.root().join("messages"))
-        .unwrap()
-        .filter_map(Result::ok)
-        .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "json"))
-        .count();
-    assert_eq!(
-        messages,
-        MAX_RETAINED_MESSAGES,
-        "overflow must not commit when prune fails closed"
-    );
-}
-
-#[tokio::test]
-async fn cancel_work_revokes_managed_capability_before_receipt_settles() {
+async fn managed_cancel_fixture() -> (
+    tempfile::TempDir,
+    OrchestrationService,
+    OrchStore,
+    grokptah_agent_bridge::orchestration::AuthContext,
+    Uuid,
+    PathBuf,
+    String,
+    Arc<AtomicU32>,
+    Arc<Mutex<Option<String>>>,
+) {
     let mut env = common::ProcessEnvGuard::new();
     env.set("GROKPTAH_AGENT_OFFLINE", "1");
     let root = tempfile::tempdir().unwrap();
@@ -190,9 +135,10 @@ async fn cancel_work_revokes_managed_capability_before_receipt_settles() {
         )
         .await
         .unwrap();
-    let work_id = created["work"]["workId"].as_str().unwrap();
-    let item = store.load_work_item(work_id).unwrap().unwrap();
+    let work_id = created["work"]["workId"].as_str().unwrap().to_string();
+    let item = store.load_work_item(&work_id).unwrap().unwrap();
     let lease_id = "managed-cancel-lease";
+    let revoke_count = Arc::new(AtomicU32::new(0));
     let receipt_status_at_revoke = Arc::new(Mutex::new(None));
     let receipt_reader = {
         let store = store.clone();
@@ -226,6 +172,7 @@ async fn cancel_work_revokes_managed_capability_before_receipt_settles() {
         Arc::new(RevokeOrderResolver {
             receipt_status_at_revoke: receipt_status_at_revoke.clone(),
             receipt_reader,
+            revoke_count: revoke_count.clone(),
         }),
     )
     .unwrap();
@@ -292,34 +239,258 @@ async fn cancel_work_revokes_managed_capability_before_receipt_settles() {
             updated_at: now,
         })
         .unwrap();
+    (
+        root,
+        orch,
+        store,
+        auth,
+        session,
+        workspace,
+        work_id,
+        revoke_count,
+        receipt_status_at_revoke,
+    )
+}
 
+#[tokio::test]
+async fn authenticated_send_survives_post_delivery_prune_failure() {
+    let mut env = common::ProcessEnvGuard::new();
+    env.set("GROKPTAH_AGENT_OFFLINE", "1");
+    let root = tempfile::tempdir().unwrap();
+    set_grokptah_home_override(Some(root.path().join("home")));
+    std::fs::create_dir_all(root.path().join("workspace")).unwrap();
+    let workspace = canonical_workspace(&root.path().join("workspace")).unwrap();
+    let host = AgentHost::create(HostConfig {
+        always_approve: true,
+        ..HostConfig::default()
+    })
+    .unwrap();
+    host.start().unwrap();
+    let session = host.session_new_kind(SessionKind::Build).unwrap().id;
+    host.session_set_cwd(session, &workspace).unwrap();
+    let store = OrchStore::open(root.path().join("home/ledger")).unwrap();
+    std::fs::create_dir_all(store.root().join("messages")).unwrap();
+    for index in 1..=MAX_RETAINED_MESSAGES {
+        let mut message = grokptah_agent_bridge::orchestration::WorkMessage::new(
+            MessageKind::Status,
+            "seed",
+            None,
+            None,
+            session,
+            workspace.display().to_string(),
+            None,
+            "retention seed",
+            None,
+            Utc::now(),
+        )
+        .unwrap();
+        message.message_id = format!("retained-seed-{index:04}");
+        message.seq = index as u64;
+        let path = store.root().join(format!(
+            "messages/{}.json",
+            safe_id_filename(&message.message_id).unwrap()
+        ));
+        write_json(path, &json!(message));
+    }
+    std::fs::write(store.root().join("messages/seq"), "500").unwrap();
+    let orch = OrchestrationService::new(
+        host.clone(),
+        host.event_bus(),
+        store.clone(),
+        OrchestrationConfig {
+            bearer_token: TOKEN.into(),
+            allowlist: WorkspaceAllowlist::new([workspace.clone()]),
+            max_concurrent_runs: 2,
+            bounds: RunBounds::default(),
+        },
+    );
+    let auth = orch.auth_header(Some(&format!("Bearer {TOKEN}"))).unwrap();
+    PRUNE_REMOVE_FAULT.store(true, Ordering::SeqCst);
+    let delivered = orch
+        .send_message(
+            &auth,
+            "send-overflow",
+            session,
+            &workspace,
+            MessageKind::Status,
+            None,
+            None,
+            None,
+            "overflow after retention".into(),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    PRUNE_REMOVE_FAULT.store(false, Ordering::SeqCst);
+    let message_id = delivered["message"]["messageId"].as_str().unwrap();
+    let scope =
+        grokptah_agent_bridge::orchestration::IdempotencyScope::new(&auth.owner_id, session, &workspace)
+            .unwrap();
+    let receipt = store.load_idempotency(&scope, "send-overflow").unwrap().unwrap();
+    assert_eq!(receipt.status, "complete");
+    assert!(store.ledger_admission_closed().is_none());
+    assert!(store.load_message(message_id).unwrap().is_some());
+    let replay = orch
+        .send_message(
+            &auth,
+            "send-overflow",
+            session,
+            &workspace,
+            MessageKind::Status,
+            None,
+            None,
+            None,
+            "overflow after retention".into(),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(replay, delivered);
+    drop(orch);
+    let reopened = OrchStore::open(root.path().join("home/ledger")).unwrap();
+    assert!(reopened.load_message(message_id).unwrap().is_some());
+    assert_eq!(
+        std::fs::read_dir(reopened.root().join("messages"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "json"))
+            .count(),
+        MAX_RETAINED_MESSAGES + 1
+    );
+}
+
+#[tokio::test]
+async fn cancel_work_revokes_managed_capability_before_receipt_settles() {
+    let (
+        _root,
+        orch,
+        store,
+        auth,
+        session,
+        workspace,
+        work_id,
+        _revoke_count,
+        receipt_status_at_revoke,
+    ) = managed_cancel_fixture().await;
     orch.cancel_work(
         &auth,
         "cancel-managed",
         session,
         &workspace,
-        work_id,
+        &work_id,
         "operator cancelled".into(),
-        Some(item.revision),
+        Some(store.load_work_item(&work_id).unwrap().unwrap().revision),
     )
     .await
     .unwrap();
-
     assert_eq!(
         receipt_status_at_revoke.lock().unwrap().as_deref(),
         Some("pending"),
         "managed capability must be revoked before the cancel receipt settles"
     );
-    let receipt = store.load_idempotency(
-        &grokptah_agent_bridge::orchestration::IdempotencyScope::new(
-            &auth.owner_id,
+    let scope =
+        grokptah_agent_bridge::orchestration::IdempotencyScope::new(&auth.owner_id, session, &workspace)
+            .unwrap();
+    assert_eq!(
+        store.load_idempotency(&scope, "cancel-managed").unwrap().unwrap().status,
+        "complete"
+    );
+}
+
+#[tokio::test]
+async fn stale_cancel_does_not_revoke_or_mutate_work() {
+    let (
+        _root,
+        orch,
+        store,
+        auth,
+        session,
+        workspace,
+        work_id,
+        revoke_count,
+        _receipt_status,
+    ) = managed_cancel_fixture().await;
+    let revision = store.load_work_item(&work_id).unwrap().unwrap().revision;
+    let error = orch
+        .cancel_work(
+            &auth,
+            "stale-cancel",
             session,
             &workspace,
+            &work_id,
+            "stale".into(),
+            Some(revision + 9),
         )
-        .unwrap(),
-        "cancel-managed",
-    )
-    .unwrap()
-    .unwrap();
-    assert_eq!(receipt.status, "complete");
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, OrchErrorCode::StaleVersion);
+    assert_eq!(revoke_count.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        store.load_work_item(&work_id).unwrap().unwrap().state,
+        WorkState::Queued
+    );
+}
+
+#[tokio::test]
+async fn concurrent_cancel_revision_fence_blocks_stale_side_effects() {
+    let (
+        root,
+        orch,
+        store,
+        auth,
+        session,
+        workspace,
+        work_id,
+        revoke_count,
+        _receipt_status,
+    ) = managed_cancel_fixture().await;
+    let revision = store.load_work_item(&work_id).unwrap().unwrap().revision;
+    OrchStore::set_work_request_test_gate(Some(Arc::new(Barrier::new(2))));
+    let orch_a = orch.clone();
+    let auth_a = auth.clone();
+    let workspace_a = workspace.clone();
+    let work_id_a = work_id.clone();
+    let worker = std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            OrchStore::arrive_at_work_request_test_gate();
+            orch_a
+                .cancel_work(
+                    &auth_a,
+                    "stale-race",
+                    session,
+                    &workspace_a,
+                    &work_id_a,
+                    "stale race".into(),
+                    Some(revision),
+                )
+                .await
+        })
+    });
+    OrchStore::arrive_at_work_request_test_gate();
+    store
+        .reprioritize_work(&work_id, 99, "bump revision", None)
+        .unwrap();
+    let result = worker.join().unwrap();
+    OrchStore::set_work_request_test_gate(None);
+    assert_eq!(result.unwrap_err().code, OrchErrorCode::StaleVersion);
+    assert_eq!(revoke_count.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        store.load_work_item(&work_id).unwrap().unwrap().revision,
+        revision + 1
+    );
+    assert_eq!(
+        store.load_work_item(&work_id).unwrap().unwrap().state,
+        WorkState::Queued
+    );
+    let _ = root;
 }
