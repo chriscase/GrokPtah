@@ -2043,12 +2043,16 @@ impl OrchStore {
         store.recover_managed_finalization_intents()?;
         store.mark_unfinished_interrupted()?;
         store.fail_orphaned_idempotency_claims()?;
-        store
-            .reconcile_idempotency_scope_bindings_from_receipts_unlocked()
-            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
-        store
-            .sweep_orphan_idempotency_scope_bindings_unlocked()
-            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        // Derived request-scope bindings are repair metadata. Do not mutate the
+        // ledger while admission is closed after a refused recovery finalize.
+        if store.ledger_admission_closed().is_none() {
+            store
+                .reconcile_idempotency_scope_bindings_from_receipts_unlocked()
+                .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+            store
+                .sweep_orphan_idempotency_scope_bindings_unlocked()
+                .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        }
         store.reconcile_workloads()?;
         // Cleanup is best-effort at the record level, but directory access
         // failures still surface so a broken ledger cannot look healthy.
