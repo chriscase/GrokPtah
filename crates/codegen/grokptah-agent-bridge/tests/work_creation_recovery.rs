@@ -564,15 +564,13 @@ fn aliased_creation_replays_after_intent_cut_without_closing_admission() {
     let root = tempfile::tempdir().unwrap();
     let workspace = canonical_workspace(&root.path().join("workspace")).unwrap();
     let alias = workspace.join(".");
+    let alias_display = alias.display().to_string();
     assert_exit(
         &child_with(
             root.path(),
             "create",
             "lifecycle_after_intent",
-            &[(
-                "WORK_CREATION_WORKSPACE_ALIAS",
-                alias.display().to_string(),
-            )],
+            &[("WORK_CREATION_WORKSPACE_ALIAS", alias_display.as_str())],
         ),
         86,
     );
