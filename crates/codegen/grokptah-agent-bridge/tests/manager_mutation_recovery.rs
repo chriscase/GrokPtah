@@ -1343,7 +1343,10 @@ fn manager_post_commit_prune_recovers_on_ordinary_reopen_without_test_phase_env(
     let store = OrchStore::open(root.path().join("home/ledger")).unwrap();
     assert!(store.ledger_admission_closed().is_none());
     assert_eq!(receipt(root.path())["status"], "complete");
-    assert!(!root.path().join("home/ledger/ledger-admission-recovery.json").exists());
+    assert!(!root
+        .path()
+        .join("home/ledger/ledger-admission-recovery.json")
+        .exists());
     assert!(paths(&root.path().join("home/ledger/manager-intents")).is_empty());
     assert_eq!(
         read(root.path().join("prune_remove_fault.json"))["response"],
@@ -1375,11 +1378,17 @@ fn manager_post_commit_prune_keeps_intent_when_prune_fails_again_on_reopen() {
             .path()
             .join("home/ledger/ledger-admission-recovery.json")
             .is_file());
-        assert_eq!(paths(&root.path().join("home/ledger/manager-intents")).len(), 1);
+        assert_eq!(
+            paths(&root.path().join("home/ledger/manager-intents")).len(),
+            1
+        );
     }
     let store = OrchStore::open(root.path().join("home/ledger")).unwrap();
     assert!(store.ledger_admission_closed().is_none());
-    assert!(!root.path().join("home/ledger/ledger-admission-recovery.json").exists());
+    assert!(!root
+        .path()
+        .join("home/ledger/ledger-admission-recovery.json")
+        .exists());
     assert!(paths(&root.path().join("home/ledger/manager-intents")).is_empty());
 }
 

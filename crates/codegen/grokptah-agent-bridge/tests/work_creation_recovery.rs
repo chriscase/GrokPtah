@@ -660,8 +660,7 @@ fn substituted_both_digests_with_untouched_receipt_refuses_recovery() {
     write_json(&path, &intent);
     let receipt = read_json(receipt_path(root.path()));
     assert_ne!(
-        intent["creationRequestDigest"],
-        receipt["payloadHash"],
+        intent["creationRequestDigest"], receipt["payloadHash"],
         "receipt must remain bound to the original caller hash"
     );
     for _ in 0..3 {
@@ -679,7 +678,10 @@ fn legacy_schema2_creation_intent_without_request_digest_reopens() {
     assert_exit(&child(root.path(), "create", "lifecycle_after_intent"), 86);
     let path = intent_paths(root.path()).remove(0);
     let mut intent = read_json(&path);
-    intent.as_object_mut().unwrap().remove("creationRequestDigest");
+    intent
+        .as_object_mut()
+        .unwrap()
+        .remove("creationRequestDigest");
     write_json(&path, &intent);
     for reopen in 0..3 {
         assert_exit(&child(root.path(), "replay", ""), 0);

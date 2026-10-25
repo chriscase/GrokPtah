@@ -4153,10 +4153,8 @@ impl OrchStore {
                     ));
                 }
             } else {
-                let legacy = Self::legacy_creation_request_payload_hash_from_item(
-                    request,
-                    &intent.item,
-                )?;
+                let legacy =
+                    Self::legacy_creation_request_payload_hash_from_item(request, &intent.item)?;
                 if legacy != request.payload_hash {
                     return Err(related_creation_conflict(
                         "creation receipt does not match sealed caller inputs",
