@@ -3457,7 +3457,6 @@ impl OrchStore {
         crash_process_if_stage("manager_mutation_after_intent");
         self.commit_manager_mutation_unlocked(&intent)
             .map_err(|error| self.note_work_recovery_required(error))?;
-        crash_process_if_stage("manager_mutation_after_commit");
         let mut prune_failed = false;
         if let Err(error) = self.prune_messages_unlocked() {
             self.persist_ledger_admission_recovery_unlocked(&intent)?;
@@ -3470,6 +3469,8 @@ impl OrchStore {
                 &intent.response(),
             )
             .map_err(|error| self.note_work_recovery_required(error))?;
+            crash_process_if_stage("manager_mutation_after_receipt");
+            crash_process_if_stage("manager_mutation_after_commit");
             self.clear_related_intent_unlocked(&path)
                 .map_err(|error| self.note_work_recovery_required(error))?;
         }
@@ -3749,6 +3750,7 @@ impl OrchStore {
                         intent.request.as_ref().map(|request| &request.binding),
                         &intent.response(),
                     )?;
+                    crash_process_if_stage("manager_mutation_after_receipt");
                 }
             }
             self.clear_related_intent_unlocked(&path)?;
