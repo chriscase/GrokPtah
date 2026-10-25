@@ -14,12 +14,11 @@ use grokptah_agent_bridge::orchestration::{
     canonical_workspace, hash_payload, safe_id_filename, ManagedExecutionBudgetProfile,
     ManagedExecutionIntent, ManagedGrokCliPermissionMode, ManagedGrokExecutorConfig,
     ManagedGrokInvocation, ManagedIntentState, MessageKind, OrchErrorCode, OrchStore,
-    OrchestrationConfig, OrchestrationService, RunBounds, RunExecutionMode, WorkPolicy,
-    WorkState, WorkspaceAllowlist, MANAGED_EXECUTION_SCHEMA_VERSION,
-    MANAGED_GROK_INVOCATION_SCHEMA_VERSION,
+    OrchestrationConfig, OrchestrationService, RunBounds, RunExecutionMode, WorkPolicy, WorkState,
+    WorkspaceAllowlist, MANAGED_EXECUTION_SCHEMA_VERSION, MANAGED_GROK_INVOCATION_SCHEMA_VERSION,
 };
 use grokptah_agent_bridge::{
-    set_grokptah_home_override, AgentHost, HostConfig, PRUNE_REMOVE_FAULT, SessionKind,
+    set_grokptah_home_override, AgentHost, HostConfig, HostRuntime, SessionKind, PRUNE_REMOVE_FAULT,
 };
 use serde_json::json;
 use uuid::Uuid;
@@ -83,6 +82,7 @@ fn minimal_grok_identity() -> grokptah_agent_sdk::GrokBuildGitIdentity {
 
 async fn managed_cancel_fixture() -> (
     tempfile::TempDir,
+    HostRuntime,
     Arc<OrchestrationService>,
     OrchStore,
     grokptah_agent_bridge::orchestration::AuthContext,
@@ -98,18 +98,18 @@ async fn managed_cancel_fixture() -> (
     set_grokptah_home_override(Some(root.path().join("home")));
     std::fs::create_dir_all(root.path().join("workspace")).unwrap();
     let workspace = canonical_workspace(&root.path().join("workspace")).unwrap();
-    let host = AgentHost::create(HostConfig {
+    let runtime = AgentHost::create(HostConfig {
         always_approve: true,
         ..HostConfig::default()
     })
     .unwrap();
-    host.start().unwrap();
-    let session = host.session_new_kind(SessionKind::Build).unwrap().id;
-    host.session_set_cwd(session, &workspace).unwrap();
+    runtime.start().unwrap();
+    let session = runtime.session_new_kind(SessionKind::Build).unwrap().id;
+    runtime.session_set_cwd(session, &workspace).unwrap();
     let store = OrchStore::open(root.path().join("home/ledger")).unwrap();
     let orch = OrchestrationService::new(
-        host.clone(),
-        host.event_bus(),
+        runtime.clone(),
+        runtime.event_bus(),
         store.clone(),
         OrchestrationConfig {
             bearer_token: TOKEN.into(),
@@ -142,9 +142,12 @@ async fn managed_cancel_fixture() -> (
     let receipt_status_at_revoke = Arc::new(Mutex::new(None));
     let receipt_reader = {
         let store = store.clone();
-        let scope =
-            grokptah_agent_bridge::orchestration::IdempotencyScope::new(&auth.owner_id, session, &workspace)
-                .unwrap();
+        let scope = grokptah_agent_bridge::orchestration::IdempotencyScope::new(
+            &auth.owner_id,
+            session,
+            &workspace,
+        )
+        .unwrap();
         Arc::new(move || {
             store
                 .load_idempotency(&scope, "cancel-managed")
@@ -241,6 +244,7 @@ async fn managed_cancel_fixture() -> (
         .unwrap();
     (
         root,
+        runtime,
         orch,
         store,
         auth,
@@ -260,14 +264,14 @@ async fn authenticated_send_survives_post_delivery_prune_failure() {
     set_grokptah_home_override(Some(root.path().join("home")));
     std::fs::create_dir_all(root.path().join("workspace")).unwrap();
     let workspace = canonical_workspace(&root.path().join("workspace")).unwrap();
-    let host = AgentHost::create(HostConfig {
+    let runtime = AgentHost::create(HostConfig {
         always_approve: true,
         ..HostConfig::default()
     })
     .unwrap();
-    host.start().unwrap();
-    let session = host.session_new_kind(SessionKind::Build).unwrap().id;
-    host.session_set_cwd(session, &workspace).unwrap();
+    runtime.start().unwrap();
+    let session = runtime.session_new_kind(SessionKind::Build).unwrap().id;
+    runtime.session_set_cwd(session, &workspace).unwrap();
     let store = OrchStore::open(root.path().join("home/ledger")).unwrap();
     std::fs::create_dir_all(store.root().join("messages")).unwrap();
     for index in 1..=MAX_RETAINED_MESSAGES {
@@ -294,8 +298,8 @@ async fn authenticated_send_survives_post_delivery_prune_failure() {
     }
     std::fs::write(store.root().join("messages/seq"), "500").unwrap();
     let orch = OrchestrationService::new(
-        host.clone(),
-        host.event_bus(),
+        runtime.clone(),
+        runtime.event_bus(),
         store.clone(),
         OrchestrationConfig {
             bearer_token: TOKEN.into(),
@@ -326,10 +330,16 @@ async fn authenticated_send_survives_post_delivery_prune_failure() {
         .unwrap();
     PRUNE_REMOVE_FAULT.store(false, Ordering::SeqCst);
     let message_id = delivered["message"]["messageId"].as_str().unwrap();
-    let scope =
-        grokptah_agent_bridge::orchestration::IdempotencyScope::new(&auth.owner_id, session, &workspace)
-            .unwrap();
-    let receipt = store.load_idempotency(&scope, "send-overflow").unwrap().unwrap();
+    let scope = grokptah_agent_bridge::orchestration::IdempotencyScope::new(
+        &auth.owner_id,
+        session,
+        &workspace,
+    )
+    .unwrap();
+    let receipt = store
+        .load_idempotency(&scope, "send-overflow")
+        .unwrap()
+        .unwrap();
     assert_eq!(receipt.status, "complete");
     assert!(store.ledger_admission_closed().is_none());
     assert!(store.load_message(message_id).unwrap().is_some());
@@ -352,11 +362,17 @@ async fn authenticated_send_survives_post_delivery_prune_failure() {
         .await
         .unwrap();
     assert_eq!(replay, delivered);
+    let ledger_root = store.root().to_path_buf();
     drop(orch);
-    let reopened = OrchStore::open(root.path().join("home/ledger")).unwrap();
-    assert!(reopened.load_message(message_id).unwrap().is_some());
+    drop(store);
+    assert!(runtime.shutdown().await.is_clean());
+    let message_path = ledger_root.join(format!(
+        "messages/{}.json",
+        safe_id_filename(message_id).unwrap()
+    ));
+    assert!(message_path.is_file());
     assert_eq!(
-        std::fs::read_dir(reopened.root().join("messages"))
+        std::fs::read_dir(ledger_root.join("messages"))
             .unwrap()
             .filter_map(Result::ok)
             .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "json"))
@@ -369,6 +385,7 @@ async fn authenticated_send_survives_post_delivery_prune_failure() {
 async fn cancel_work_revokes_managed_capability_before_receipt_settles() {
     let (
         _root,
+        _runtime,
         orch,
         store,
         auth,
@@ -394,11 +411,18 @@ async fn cancel_work_revokes_managed_capability_before_receipt_settles() {
         Some("pending"),
         "managed capability must be revoked before the cancel receipt settles"
     );
-    let scope =
-        grokptah_agent_bridge::orchestration::IdempotencyScope::new(&auth.owner_id, session, &workspace)
-            .unwrap();
+    let scope = grokptah_agent_bridge::orchestration::IdempotencyScope::new(
+        &auth.owner_id,
+        session,
+        &workspace,
+    )
+    .unwrap();
     assert_eq!(
-        store.load_idempotency(&scope, "cancel-managed").unwrap().unwrap().status,
+        store
+            .load_idempotency(&scope, "cancel-managed")
+            .unwrap()
+            .unwrap()
+            .status,
         "complete"
     );
 }
@@ -407,6 +431,7 @@ async fn cancel_work_revokes_managed_capability_before_receipt_settles() {
 async fn stale_cancel_does_not_revoke_or_mutate_work() {
     let (
         _root,
+        _runtime,
         orch,
         store,
         auth,
@@ -441,6 +466,7 @@ async fn stale_cancel_does_not_revoke_or_mutate_work() {
 async fn concurrent_cancel_revision_fence_blocks_stale_side_effects() {
     let (
         root,
+        _runtime,
         orch,
         store,
         auth,
@@ -478,14 +504,7 @@ async fn concurrent_cancel_revision_fence_blocks_stale_side_effects() {
     });
     OrchStore::arrive_at_work_request_test_gate();
     store
-        .reprioritize_work(
-            &work_id,
-            99,
-            "bump revision",
-            "operator",
-            None,
-            Utc::now(),
-        )
+        .reprioritize_work(&work_id, 99, "bump revision", "operator", None, Utc::now())
         .unwrap();
     let result = worker.join().unwrap();
     OrchStore::set_work_request_test_gate(None);

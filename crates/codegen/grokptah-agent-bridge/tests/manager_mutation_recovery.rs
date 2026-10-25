@@ -10,10 +10,10 @@ use grokptah_agent_bridge::{
     set_grokptah_home_override, start_control_server, AgentHost, DurableWriteFault, HostConfig,
     McpControlClient, SessionKind, DURABLE_WRITE_FAULT, PRUNE_REMOVE_FAULT,
 };
-use std::sync::atomic::Ordering;
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::sync::atomic::Ordering;
 use uuid::Uuid;
 
 const TOKEN: &str = "synthetic-manager-mutation-v2";
@@ -1281,7 +1281,10 @@ fn manager_mutation_returns_success_when_only_post_commit_prune_fails() {
         root.path().join("options.json"),
         &json!({"seedMessages":500}),
     );
-    exited(&child(root.path(), "tick-message", "prune_remove_fault", ""), 0);
+    exited(
+        &child(root.path(), "tick-message", "prune_remove_fault", ""),
+        0,
+    );
     let outcome = read(root.path().join("prune_remove_fault.json"));
     assert!(
         outcome.get("response").is_some(),
@@ -1300,7 +1303,10 @@ fn manager_post_commit_prune_closes_admission_but_replays_the_original_tick() {
         root.path().join("options.json"),
         &json!({"seedMessages":500}),
     );
-    exited(&child(root.path(), "tick-message", "prune_remove_fault", ""), 0);
+    exited(
+        &child(root.path(), "tick-message", "prune_remove_fault", ""),
+        0,
+    );
     let expected = read(root.path().join("prune_remove_fault.json"))["response"].clone();
     exited(&child(root.path(), "tick-message", "refusal", ""), 0);
     let refusal = read(root.path().join("refusal.json"));

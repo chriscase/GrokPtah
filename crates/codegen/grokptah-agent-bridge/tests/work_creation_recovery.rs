@@ -68,15 +68,18 @@ fn child(root: &Path, phase: &str, stage: &str) -> Output {
 }
 
 fn child_with(root: &Path, phase: &str, stage: &str, extra: &[(&str, &str)]) -> Output {
-    Command::new(std::env::current_exe().unwrap())
+    let mut command = Command::new(std::env::current_exe().unwrap());
+    command
         .args(["--exact", "creation_service_child", "--nocapture"])
         .env("WORK_CREATION_CHILD_ROOT", root)
         .env("WORK_CREATION_PHASE", phase)
         .env("WORK_CREATION_STAGE", stage)
         .env_remove("GROKPTAH_CRASH_STAGE")
-        .envs(extra.iter().copied())
-        .output()
-        .unwrap()
+        .env_remove("WORK_CREATION_WORKSPACE_ALIAS");
+    if phase == "create" {
+        command.env("GROKPTAH_CRASH_STAGE", stage);
+    }
+    command.envs(extra.iter().copied()).output().unwrap()
 }
 
 fn assert_exit(output: &Output, code: i32) {
@@ -172,6 +175,13 @@ fn creation_service_child() {
             let invoke_workspace = std::env::var("WORK_CREATION_WORKSPACE_ALIAS")
                 .map(PathBuf::from)
                 .unwrap_or_else(|_| workspace.clone());
+            if phase == "create" && std::env::var("WORK_CREATION_WORKSPACE_ALIAS").is_ok() {
+                let stopped = orch.stop_background_tasks().await;
+                assert!(
+                    stopped.fully_stopped && stopped.errors.is_empty(),
+                    "aliased intent-cut create must not race the workload supervisor"
+                );
+            }
             let result = orch
                 .create_work(
                     &auth,
@@ -559,55 +569,60 @@ fn creation_recovery_refuses_conflicting_evidence_without_writing_work() {
     }
 }
 
-#[test]
-fn aliased_creation_replays_after_intent_cut_without_closing_admission() {
+fn spawn_aliased_create_crash(root: &Path, workspace: &Path, stage: &str) -> Output {
+    let alias_display = workspace.join(".").display().to_string();
+    child_with(
+        root,
+        "create",
+        stage,
+        &[("WORK_CREATION_WORKSPACE_ALIAS", alias_display.as_str())],
+    )
+}
+
+fn aliased_creation_crash_fixture(stage: &str) -> (tempfile::TempDir, PathBuf) {
     let root = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(root.path().join("workspace")).unwrap();
     let workspace = canonical_workspace(&root.path().join("workspace")).unwrap();
-    let alias = workspace.join(".");
-    let alias_display = alias.display().to_string();
     assert_exit(
-        &child_with(
-            root.path(),
-            "create",
-            "lifecycle_after_intent",
-            &[("WORK_CREATION_WORKSPACE_ALIAS", alias_display.as_str())],
-        ),
+        &spawn_aliased_create_crash(root.path(), &workspace, stage),
         86,
     );
-    let expected = read_json(intent_paths(root.path()).remove(0));
+    (root, workspace)
+}
+
+#[test]
+fn aliased_creation_replays_after_intent_cut_without_closing_admission() {
+    let (root, workspace) = aliased_creation_crash_fixture("lifecycle_after_intent");
+    let _expected = read_json(intent_paths(root.path()).remove(0));
+    let alias_display = workspace.join(".").display().to_string();
     for reopen in 0..3 {
-        assert_exit(&child(root.path(), "replay", ""), 0);
+        assert_exit(
+            &child_with(
+                root.path(),
+                "replay",
+                "",
+                &[("WORK_CREATION_WORKSPACE_ALIAS", alias_display.as_str())],
+            ),
+            0,
+        );
         let outcome = read_json(root.path().join("outcome.json"));
         assert!(
             outcome.get("response").is_some(),
-            "reopen {reopen} must replay the aliased create: {outcome}"
+            "reopen {reopen}: {outcome}"
         );
-        assert!(
-            outcome["admissionClosed"].is_null(),
-            "aliased recovery must not close admission: {outcome}"
-        );
+        assert!(outcome["admissionClosed"].is_null());
         assert_eq!(
             outcome["response"]["work"]["workspace"],
             workspace.display().to_string()
         );
-        assert_eq!(receipt_path(root.path()).exists(), true);
         assert_eq!(read_json(receipt_path(root.path()))["status"], "complete");
-        assert_eq!(
-            records(&root.path().join("ledger/work-items")).len(),
-            1,
-            "reopen {reopen}"
-        );
+        assert_eq!(records(&root.path().join("ledger/work-items")).len(), 1);
     }
-    assert_exit(
-        &child_with(
-            root.path(),
-            "create",
-            "lifecycle_after_intent",
-            &[("WORK_CREATION_WORKSPACE_ALIAS", alias_display.as_str())],
-        ),
-        86,
-    );
+}
+
+#[test]
+fn aliased_substituted_creation_digest_refuses_recovery() {
+    let (root, _workspace) = aliased_creation_crash_fixture("lifecycle_after_intent");
     let path = intent_paths(root.path()).remove(0);
     let mut intent = read_json(&path);
     intent["item"]["objective"] = json!("changed after seal");
