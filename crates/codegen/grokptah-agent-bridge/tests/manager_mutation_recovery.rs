@@ -1403,7 +1403,11 @@ fn manager_post_commit_prune_keeps_intent_when_prune_fails_again_on_reopen() {
         let store = OrchStore::open(root.path().join("home/ledger")).unwrap();
         PRUNE_REMOVE_FAULT.store(false, Ordering::SeqCst);
         assert!(store.ledger_admission_closed().is_some());
-        assert_eq!(receipt(root.path())["status"], "complete");
+        assert_eq!(
+            receipt(root.path())["status"],
+            "pending",
+            "prune must not settle the caller receipt while recovery marker remains"
+        );
         assert!(root
             .path()
             .join("home/ledger/ledger-admission-recovery.json")
@@ -1420,6 +1424,7 @@ fn manager_post_commit_prune_keeps_intent_when_prune_fails_again_on_reopen() {
         .join("home/ledger/ledger-admission-recovery.json")
         .exists());
     assert!(paths(&root.path().join("home/ledger/manager-intents")).is_empty());
+    assert_eq!(receipt(root.path())["status"], "complete");
 }
 
 #[test]
@@ -1460,23 +1465,31 @@ fn manager_post_commit_prune_restores_deleted_notification_on_reopen() {
 #[test]
 fn manager_post_commit_prune_restores_deleted_child_on_reopen() {
     let root = tempfile::tempdir().unwrap();
+    // Retention pruning runs only when message count exceeds MAX_RETAINED_MESSAGES
+    // (500). Advance does not append a notification, so seed one extra message so
+    // post-commit prune fails while the mutation intent still seals created Work.
     write(
         root.path().join("options.json"),
-        &json!({"seedMessages":500}),
+        &json!({"seedMessages":501}),
     );
-    exited(
-        &child(root.path(), "tick-message", "prune_remove_fault", ""),
-        0,
+    exited(&child(root.path(), "advance", "prune_remove_fault", ""), 0);
+    let outcome = read(root.path().join("prune_remove_fault.json"));
+    let created = outcome["response"]["createdWork"]
+        .as_array()
+        .expect("advance must seal created Work in its committed response");
+    assert!(!created.is_empty(), "advance must create child Work");
+    assert!(
+        root.path()
+            .join("home/ledger/ledger-admission-recovery.json")
+            .is_file(),
+        "post-commit prune failure must leave admission recovery evidence"
     );
-    let work_path = paths(&root.path().join("home/ledger/work-items"))
-        .into_iter()
-        .find(|path| {
-            let item = read(path.as_path());
-            let kind = item["kind"].as_str().unwrap_or("");
-            kind != "manager-plan" && kind != "manager-decision"
-        })
-        .expect("manager tick must leave a child Work item on disk");
-    let expected_child = read(work_path.clone());
+    let expected_child = created[0].clone();
+    let work_id = expected_child["workId"].as_str().unwrap();
+    let work_path = root
+        .path()
+        .join("home/ledger/work-items")
+        .join(format!("{}.json", safe_id_filename(work_id).unwrap()));
     assert!(work_path.is_file());
     std::fs::remove_file(&work_path).unwrap();
     assert!(!work_path.exists());
@@ -1484,10 +1497,13 @@ fn manager_post_commit_prune_restores_deleted_child_on_reopen() {
     set_grokptah_home_override(Some(root.path().join("home")));
     std::env::remove_var("MANAGER_MUTATION_PHASE");
     let store = OrchStore::open(root.path().join("home/ledger")).unwrap();
+    assert!(
+        work_path.is_file(),
+        "deleted child Work must be replayed before settlement"
+    );
+    assert_eq!(read(work_path), expected_child);
     assert!(store.ledger_admission_closed().is_none());
     assert_eq!(receipt(root.path())["status"], "complete");
-    assert!(work_path.is_file());
-    assert_eq!(read(work_path), expected_child);
 }
 
 #[test]

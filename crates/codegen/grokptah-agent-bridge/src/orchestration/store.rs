@@ -8616,14 +8616,14 @@ impl OrchStore {
                     ));
                 }
             }
-            self.preflight_manager_mutation_unlocked(&intent)?;
             self.replay_missing_manager_mutation_effects_unlocked(&intent)?;
+            self.preflight_manager_mutation_unlocked(&intent)?;
             self.require_manager_mutation_committed_effects_unlocked(&intent)?;
-            self.complete_bound_request_unlocked(Some(&sealed_binding), &sealed_response)?;
             if let Err(error) = self.prune_messages_unlocked() {
                 self.note_work_recovery_required(error);
                 return Ok(());
             }
+            self.complete_bound_request_unlocked(Some(&sealed_binding), &sealed_response)?;
             remove_file_durable(&self.lease(), &path)
                 .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
             if intent_path.is_file() {
