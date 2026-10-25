@@ -568,8 +568,8 @@ impl CredentialLeaseResolver for FailRevokeResolver {
 #[tokio::test]
 async fn cancel_revoke_conflict_leaves_work_active_and_retryable_receipt() {
     let (
-        _root,
-        _runtime,
+        root,
+        runtime,
         orch,
         store,
         auth,
@@ -584,7 +584,7 @@ async fn cancel_revoke_conflict_leaves_work_active_and_retryable_receipt() {
             executable: PathBuf::from("/bin/true"),
             git_executable: PathBuf::from("/usr/bin/git"),
             cwd: workspace.clone(),
-            isolate_parent: _root.path().join("isolate"),
+            isolate_parent: root.path().join("isolate"),
             repository_id: "repo-wr-v2-repair".into(),
             base_ref: "refs/heads/main".into(),
             identity: GrokBuildGitIdentity {
@@ -601,6 +601,7 @@ async fn cancel_revoke_conflict_leaves_work_active_and_retryable_receipt() {
     )
     .unwrap();
     let revision = store.load_work_item(&work_id).unwrap().unwrap().revision;
+    let ledger = root.path().join("home/ledger");
     let error = orch
         .cancel_work(
             &auth,
@@ -629,32 +630,43 @@ async fn cancel_revoke_conflict_leaves_work_active_and_retryable_receipt() {
         .load_idempotency(&scope, "cancel-revoke-conflict")
         .unwrap()
         .unwrap();
-    assert_eq!(receipt.status, "failed");
-    assert_eq!(
-        receipt.error.as_ref().map(|e| e.code.clone()),
-        Some(OrchErrorCode::Conflict)
-    );
-    let retry = orch
-        .cancel_work(
-            &auth,
-            "cancel-revoke-conflict",
-            session,
-            &workspace,
-            &work_id,
-            "revoke refused".into(),
-            Some(revision),
-        )
-        .await
-        .unwrap_err();
-    assert_eq!(retry.code, OrchErrorCode::Conflict);
-    assert_eq!(
-        store
-            .load_idempotency(&scope, "cancel-revoke-conflict")
+    assert_eq!(receipt.status, "pending");
+    assert!(store.ledger_admission_closed().is_some());
+    assert!(
+        std::fs::read_dir(ledger.join("work-lifecycle-intents"))
             .unwrap()
-            .unwrap()
-            .status,
-        "failed"
+            .next()
+            .is_some(),
+        "durable cancel intent must survive revoke refusal"
     );
+    write_json(
+        root.path().join("fixture.json"),
+        &json!({
+            "sessionId": session,
+            "workId": work_id,
+            "revision": revision,
+            "requestId": "cancel-revoke-conflict",
+        }),
+    );
+    drop(orch);
+    drop(store);
+    assert!(runtime.shutdown().await.is_clean());
+    let exe = std::env::current_exe().unwrap();
+    for reopen in 0..3 {
+        let output = std::process::Command::new(&exe)
+            .args(["--exact", "cancel_cut_child", "--nocapture"])
+            .env("WR_V2_CANCEL_CUT_ROOT", root.path())
+            .env("WR_V2_CANCEL_CUT_MODE", "inspect")
+            .env("WR_V2_CANCEL_REQUEST_ID", "cancel-revoke-conflict")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "reopen {reopen}:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 }
 
 #[test]
@@ -689,16 +701,25 @@ fn cancel_cut_child() {
             let session = Uuid::parse_str(meta["sessionId"].as_str().unwrap()).unwrap();
             let work_id = meta["workId"].as_str().unwrap();
             runtime.session_set_cwd(session, &workspace).unwrap();
-            if mode == "recover" {
+            if mode == "recover" || mode == "inspect" {
                 let store = OrchStore::open(root.join("home/ledger")).unwrap();
+                let request_id = std::env::var("WR_V2_CANCEL_REQUEST_ID")
+                    .unwrap_or_else(|_| "cancel-managed".to_string());
                 assert_eq!(
                     store.load_work_item(work_id).unwrap().unwrap().state,
                     WorkState::Cancelled
                 );
                 assert_eq!(
-                    idempotency_receipt_status(store.root(), "cancel-managed"),
+                    idempotency_receipt_status(store.root(), &request_id),
                     "complete"
                 );
+                if mode == "inspect" {
+                    assert!(
+                        std::fs::read_dir(store.root().join("work-lifecycle-intents"))
+                            .map(|mut dir| dir.next().is_none())
+                            .unwrap_or(false)
+                    );
+                }
                 return;
             }
             let store = OrchStore::open(root.join("home/ledger")).unwrap();

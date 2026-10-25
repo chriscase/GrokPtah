@@ -1421,6 +1421,123 @@ fn manager_post_commit_prune_keeps_intent_when_prune_fails_again_on_reopen() {
 }
 
 #[test]
+fn manager_post_commit_prune_refuses_altered_committed_effects() {
+    let root = tempfile::tempdir().unwrap();
+    write(
+        root.path().join("options.json"),
+        &json!({"seedMessages":500}),
+    );
+    exited(
+        &child(root.path(), "tick-message", "prune_remove_fault", ""),
+        0,
+    );
+    let outcome = read(root.path().join("prune_remove_fault.json"));
+    let message_id = outcome["response"]["messages"][0]["messageId"]
+        .as_str()
+        .unwrap();
+    let message_path = root
+        .path()
+        .join("home/ledger/messages")
+        .join(format!("{}.json", safe_id_filename(message_id).unwrap()));
+    let mut message = read(message_path.clone());
+    message["body"] = json!("tampered committed message effect");
+    write(message_path, &message);
+    let _guard = common::ProcessEnvGuard::new();
+    set_grokptah_home_override(Some(root.path().join("home")));
+    std::env::remove_var("MANAGER_MUTATION_PHASE");
+    let store = OrchStore::open(root.path().join("home/ledger")).unwrap();
+    assert!(store.ledger_admission_closed().is_some());
+    assert!(
+        root.path()
+            .join("home/ledger/ledger-admission-recovery.json")
+            .is_file()
+    );
+    assert_eq!(receipt(root.path())["status"], "pending");
+}
+
+fn manager_post_commit_prune_refuses_tampered_marker_without_intent() {
+    let root = tempfile::tempdir().unwrap();
+    write(
+        root.path().join("options.json"),
+        &json!({"seedMessages":500}),
+    );
+    exited(
+        &child(root.path(), "tick-message", "prune_remove_fault", ""),
+        0,
+    );
+    let marker_path = root
+        .path()
+        .join("home/ledger/ledger-admission-recovery.json");
+    let intent_paths = paths(&root.path().join("home/ledger/manager-intents"));
+    assert_eq!(intent_paths.len(), 1);
+    std::fs::remove_file(&intent_paths[0]).unwrap();
+    let marker = read(marker_path.clone());
+    let cases: Vec<(&str, Value)> = vec![
+        (
+            "altered-response",
+            {
+                let mut tampered = marker.clone();
+                tampered["sealedResponse"]["plan"]["revision"] =
+                    json!(tampered["sealedResponse"]["plan"]["revision"].as_u64().unwrap() + 99);
+                tampered
+            },
+        ),
+        (
+            "altered-identity",
+            {
+                let mut tampered = marker.clone();
+                tampered["sealedBinding"]["ownerId"] = json!("foreign-owner");
+                tampered
+            },
+        ),
+        (
+            "absent-sealed-binding",
+            {
+                let mut tampered = marker.clone();
+                tampered.as_object_mut().unwrap().remove("sealedBinding");
+                tampered
+            },
+        ),
+        (
+            "absent-sealed-response",
+            {
+                let mut tampered = marker.clone();
+                tampered.as_object_mut().unwrap().remove("sealedResponse");
+                tampered
+            },
+        ),
+    ];
+    for (label, tampered) in cases {
+        let case_root = tempfile::tempdir().unwrap();
+        common::copy_dir_all(root.path(), case_root.path()).unwrap();
+        let case_marker = case_root
+            .path()
+            .join("home/ledger/ledger-admission-recovery.json");
+        write(&case_marker, &tampered);
+        let intent_paths = paths(&case_root.path().join("home/ledger/manager-intents"));
+        for path in intent_paths {
+            std::fs::remove_file(path).unwrap();
+        }
+        let _guard = common::ProcessEnvGuard::new();
+        set_grokptah_home_override(Some(case_root.path().join("home")));
+        std::env::remove_var("MANAGER_MUTATION_PHASE");
+        let store = OrchStore::open(case_root.path().join("home/ledger")).unwrap();
+        assert!(
+            store.ledger_admission_closed().is_some(),
+            "{label}: tampered marker must keep admission closed"
+        );
+        assert!(
+            case_marker.is_file(),
+            "{label}: tampered marker evidence must be preserved"
+        );
+        assert_eq!(
+            receipt(case_root.path())["status"],
+            "pending",
+            "{label}: caller receipt must stay pending until validated recovery"
+        );
+    }
+}
+
 fn pre_intent_manager_process_death_has_no_mutation_effect() {
     for operation in ["advance", "tick", "replan", "tick-message"] {
         let root = tempfile::tempdir().unwrap();

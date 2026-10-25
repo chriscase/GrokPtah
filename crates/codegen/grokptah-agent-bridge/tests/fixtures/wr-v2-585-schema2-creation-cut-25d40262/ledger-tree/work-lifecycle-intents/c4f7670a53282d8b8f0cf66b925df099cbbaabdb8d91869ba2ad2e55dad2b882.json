@@ -1,16 +1,16 @@
 {
   "schemaVersion": 2,
-  "intentId": "ab117051-a38b-404c-a2c2-8434e1fd3690",
+  "intentId": "5950d9d4-e708-42f5-99e5-3287b45759ff",
   "operation": "create",
-  "workId": "0db2a595-94e7-4776-8f04-792812cc28cb",
+  "workId": "6449ac1f-1b2c-46eb-8d4d-a922edb64ce9",
   "priorItem": null,
   "item": {
     "schemaVersion": 1,
-    "workId": "0db2a595-94e7-4776-8f04-792812cc28cb",
+    "workId": "6449ac1f-1b2c-46eb-8d4d-a922edb64ce9",
     "kind": "test",
     "objective": "recover the original Work creation",
-    "sessionId": "a8b8bc1b-301c-48c3-8c16-25a1ef7cf847",
-    "workspace": "/tmp/grokptah-585-cut-root.WYK9de/workspace",
+    "sessionId": "102bc2b2-62b7-47e5-907b-ffcfe2faae81",
+    "workspace": "/tmp/grokptah-585-cut-root.wu1Qcc/workspace",
     "createdBy": "primary",
     "assignedAgentId": null,
     "priority": 7,
@@ -42,20 +42,20 @@
     "isContainer": false,
     "approval": null,
     "assignmentStatus": "unassigned",
-    "createdAt": "2026-10-25T14:08:02.708947973Z",
-    "updatedAt": "2026-10-25T14:08:02.708947973Z"
+    "createdAt": "2026-10-25T14:28:21.526070769Z",
+    "updatedAt": "2026-10-25T14:28:21.526070769Z"
   },
-  "creationItemDigest": "0a9211b10bef448c4be0dabe858b98aee7de938d379e6acc33dccff11c3115bd",
+  "creationItemDigest": "fc2fe8a8049498c1ea8bfb74d0ba7b3a961803a54f118b647eafb97f4ee4b81f",
   "priorAttempts": [],
   "attempts": [],
   "request": {
     "requestId": "create-original-request",
     "ownerId": "primary",
     "tool": "ptah_create_work",
-    "sessionId": "a8b8bc1b-301c-48c3-8c16-25a1ef7cf847",
-    "workspaceDigest": "733f32716995e42444d17ae81608ed96f77bbf09dfbfa84fb1db26d4cbfecaec",
-    "workspaceDisplay": "/tmp/grokptah-585-cut-root.WYK9de/workspace",
-    "payloadHash": "e470eaa37bea6bb96c1b0889d59002197da073ca09a85c844bb7acaf912653dd",
+    "sessionId": "102bc2b2-62b7-47e5-907b-ffcfe2faae81",
+    "workspaceDigest": "fc461db136aadc1c047675f98cc35d7af84522e1a01e7c3aa3c9908645da9ee7",
+    "workspaceDisplay": "/tmp/grokptah-585-cut-root.wu1Qcc/workspace",
+    "payloadHash": "f9bb0d058f425c42a2ebb1233340bfaabfdea94564bbf6eca6b04322354495e6",
     "shape": "work_attempts"
   }
 }

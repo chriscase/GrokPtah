@@ -1,9 +1,4 @@
-Producer SHA: 25d40262a3b530227af850f26974c19dfc2935fd
-Command:
-  crates/codegen/grokptah-agent-bridge/scripts/produce_585_creation_cut.sh
-Harness (equivalent):
-  cargo test --locked --test work_creation_recovery --no-run  # at producer SHA
-  WORK_CREATION_CHILD_ROOT=<tmpdir> WORK_CREATION_PHASE=create \
-  WORK_CREATION_STAGE=lifecycle_after_intent GROKPTAH_CRASH_STAGE=lifecycle_after_intent \
-  GROKPTAH_AGENT_OFFLINE=1 \
-  <test_binary> --exact creation_service_child --nocapture  # expect exit 86
+git worktree: /tmp/grokptah-585-cut.3A8uV6
+producer_sha: 25d40262a3b530227af850f26974c19dfc2935fd
+cwd: /tmp/grokptah-585-cut.3A8uV6/crates/codegen/grokptah-agent-bridge
+build: cargo test --locked --test work_creation_recovery --no-run

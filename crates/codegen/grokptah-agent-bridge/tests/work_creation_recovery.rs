@@ -708,7 +708,12 @@ fn legacy_schema2_585_producer_cut_reopens_on_candidate() {
     let receipt = read_json(&receipt_file);
     let expected_sha = expected_receipt_sha256(&bundle);
     let actual = sha256_file(&receipt_file);
-    assert_eq!(actual, expected_sha, "receipt bytes must match preserved artifact");
+    assert_eq!(
+        actual, expected_sha,
+        "receipt bytes must match preserved artifact"
+    );
+    let anchored_payload_hash = receipt["payloadHash"].clone();
+    let anchored_request_id = receipt["requestId"].clone();
     for reopen in 0..3 {
         assert_exit(&child(root.path(), "replay", ""), 0);
         let outcome = read_json(root.path().join("outcome.json"));
@@ -716,10 +721,10 @@ fn legacy_schema2_585_producer_cut_reopens_on_candidate() {
             outcome.get("response").is_some(),
             "legacy #585 reopen {reopen}: {outcome}"
         );
-        let settled = read_json(receipt_path(root.path()));
+        let settled = read_json(&receipt_file);
         assert_eq!(settled["status"], "complete");
-        assert_eq!(settled["payloadHash"], receipt["payloadHash"]);
-        assert_eq!(settled["requestId"], receipt["requestId"]);
+        assert_eq!(settled["payloadHash"], anchored_payload_hash);
+        assert_eq!(settled["requestId"], anchored_request_id);
     }
 }
 
