@@ -5988,6 +5988,14 @@ impl OrchestrationService {
             None,
             expected_revision,
         )?;
+        for intent in self
+            .store
+            .list_managed_intents()?
+            .into_iter()
+            .filter(|intent| intent.work_id == work_id && intent.grok.is_some())
+        {
+            self.cancel_managed_grok_authority(&intent)?;
+        }
         let cancel_result = self
             .store
             .cancel_work_checked(work_id, &reason, expected_revision);
@@ -5997,14 +6005,6 @@ impl OrchestrationService {
                 return Err(self.fail_claim(&mut lease, None, session_id, &claimed, error))
             }
         };
-        for intent in self
-            .store
-            .list_managed_intents()?
-            .into_iter()
-            .filter(|intent| intent.work_id == work_id && intent.grok.is_some())
-        {
-            self.cancel_managed_grok_authority(&intent)?;
-        }
         let attempts = attempts
             .iter()
             .map(WorkAttemptView::from)

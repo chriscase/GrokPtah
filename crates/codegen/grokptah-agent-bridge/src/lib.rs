@@ -247,6 +247,7 @@ pub use verified_change::{
     ReadinessInput, RequiredCheckCwd, RequiredCheckEnv, RequiredCheckSpec, VerifiedChangeError,
     VerifiedChangeReadiness, VerifiedExecutionEnvelopeV1, ADMISSION_FAULT, APPLY_FAULT,
     BEFORE_CANDIDATE_BIND, CHECK_CONFINEMENT_EXECUTABLE, CLEANUP_FAULT, DURABLE_WRITE_FAULT,
+    PRUNE_REMOVE_FAULT,
     RECEIPT_TREE_SCANS, SKIP_VERIFIED_DRIVE,
 };
 

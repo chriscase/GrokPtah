@@ -3433,8 +3433,9 @@ impl OrchStore {
         self.clear_related_intent_unlocked(&path)
             .map_err(|error| self.note_work_recovery_required(error))?;
         crash_process_if_stage("manager_mutation_after_commit");
-        self.prune_messages_unlocked()
-            .map_err(|error| self.note_work_recovery_required(error))?;
+        if let Err(error) = self.prune_messages_unlocked() {
+            self.note_work_recovery_required(error);
+        }
         Ok(intent.response())
     }
 
@@ -3887,6 +3888,24 @@ impl OrchStore {
             .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))
     }
 
+    fn creation_request_payload_hash(
+        request: &WorkRequestBinding,
+        item: &WorkItem,
+    ) -> Result<String, OrchError> {
+        let payload = serde_json::json!({
+            "sessionId": request.session_id,
+            "workspace": request.workspace_display,
+            "kind": item.kind,
+            "objective": item.objective,
+            "priority": item.priority,
+            "deadline": item.deadline,
+            "parentWorkId": item.parent_work_id,
+            "dependencies": item.dependencies,
+            "policy": item.policy,
+        });
+        Ok(super::hash_payload(&payload))
+    }
+
     fn attempt_digest(attempt: &WorkAttempt) -> Result<String, OrchError> {
         serde_json::to_value(attempt)
             .map(|value| super::hash_payload(&value))
@@ -4075,6 +4094,11 @@ impl OrchStore {
             .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
         if intent.prior_item.is_none() {
             let request = intent.request.as_ref().expect("validated creation request");
+            if Self::creation_request_payload_hash(request, &intent.item)? != request.payload_hash {
+                return Err(related_creation_conflict(
+                    "creation receipt does not match sealed work inputs",
+                ));
+            }
             let receipt = self.inspect_canonical_request_receipt_unlocked(request)?;
             let response = lifecycle_response_value(intent)?;
             let settled = receipt.status == "complete"
@@ -6926,7 +6950,14 @@ impl OrchStore {
         messages.sort_by_key(|message| message.seq);
         let drop = messages.len() - MAX_RETAINED_MESSAGES;
         for message in messages.into_iter().take(drop) {
-            let _ = remove_file_durable(&self.lease(), &self.message_path(&message.message_id)?);
+            if crate::verified_change::prune_remove_fault_armed() {
+                return Err(OrchError::new(
+                    OrchErrorCode::Internal,
+                    "injected prune remove failure",
+                ));
+            }
+            remove_file_durable(&self.lease(), &self.message_path(&message.message_id)?)
+                .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
         }
         Ok(())
     }

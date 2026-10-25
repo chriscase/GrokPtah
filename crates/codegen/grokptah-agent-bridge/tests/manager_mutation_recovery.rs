@@ -8,8 +8,9 @@ use grokptah_agent_bridge::orchestration::{
 };
 use grokptah_agent_bridge::{
     set_grokptah_home_override, start_control_server, AgentHost, DurableWriteFault, HostConfig,
-    McpControlClient, SessionKind, DURABLE_WRITE_FAULT,
+    McpControlClient, SessionKind, DURABLE_WRITE_FAULT, PRUNE_REMOVE_FAULT,
 };
+use std::sync::atomic::Ordering;
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -368,11 +369,17 @@ async fn run_child(root: PathBuf, env: &mut common::ProcessEnvGuard) {
         }
         json!({"response":{"plan":store.load_manager_plan(args["planId"].as_str().unwrap()).unwrap().unwrap()}})
     } else {
+        if phase == "prune_remove_fault" {
+            PRUNE_REMOVE_FAULT.store(true, Ordering::SeqCst);
+        }
         match invoke(&orch, &auth, &args, &operation).await {
             Ok(response) => json!({"response":response}),
             Err(error) => json!({"error":error}),
         }
     };
+    if phase == "prune_remove_fault" {
+        PRUNE_REMOVE_FAULT.store(false, Ordering::SeqCst);
+    }
     *DURABLE_WRITE_FAULT.lock().unwrap() = None;
     write(root.join(format!("{phase}.json")), &outcome);
     if phase == "fault" || phase == "refusal" {
@@ -426,7 +433,7 @@ async fn run_child(root: PathBuf, env: &mut common::ProcessEnvGuard) {
                 )
                 .is_err());
         }
-    } else {
+    } else if phase != "prune_remove_fault" {
         assert!(
             outcome.get("response").is_some(),
             "caller failed: {outcome}; durable receipt: {}",
@@ -1265,6 +1272,25 @@ fn recovered_tick_preserves_retention_and_existing_question_identity() {
         assert_eq!(expected["messages"][0], original);
         assert_eq!(paths(&root.path().join("home/ledger/messages")).len(), 1);
     }
+}
+
+#[test]
+fn manager_mutation_returns_success_when_only_post_commit_prune_fails() {
+    let root = tempfile::tempdir().unwrap();
+    write(
+        root.path().join("options.json"),
+        &json!({"seedMessages":500}),
+    );
+    exited(&child(root.path(), "tick-message", "prune_remove_fault", ""), 0);
+    let outcome = read(root.path().join("prune_remove_fault.json"));
+    assert!(
+        outcome.get("response").is_some(),
+        "committed manager mutation must not surface as caller failure: {outcome}"
+    );
+    assert!(outcome.get("error").is_none(), "{outcome}");
+    let settled = receipt(root.path());
+    assert_eq!(settled["status"], "complete");
+    assert!(paths(&root.path().join("home/ledger/manager-intents")).is_empty());
 }
 
 #[test]

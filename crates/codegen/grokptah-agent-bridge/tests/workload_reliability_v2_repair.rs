@@ -1,8 +1,7 @@
 //! Targeted repairs for workload reliability v2 draft #585.
 mod common;
 
-use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use chrono::Utc;
@@ -23,42 +22,14 @@ use grokptah_agent_bridge::{
     set_grokptah_home_override, AgentHost, DurableWriteFault, HostConfig, SessionKind,
     DURABLE_WRITE_FAULT,
 };
-use serde_json::{json, Value};
+use serde_json::json;
+
+fn write_json(path: impl AsRef<std::path::Path>, value: &serde_json::Value) {
+    std::fs::write(path, serde_json::to_vec_pretty(value).unwrap()).unwrap();
+}
 use uuid::Uuid;
 
 const TOKEN: &str = "wr-v2-585-repair";
-const MANAGER_REQUEST: &str = "original-manager-mutation";
-
-fn read(path: impl AsRef<Path>) -> Value {
-    serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
-}
-
-fn write(path: impl AsRef<Path>, value: &Value) {
-    std::fs::write(path, serde_json::to_vec_pretty(value).unwrap()).unwrap();
-}
-
-fn manager_child(root: &Path, operation: &str, phase: &str, stage: &str) -> std::process::Output {
-    Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", "manager_mutation_child", "--nocapture"])
-        .env("MANAGER_MUTATION_ROOT", root)
-        .env("MANAGER_MUTATION_OP", operation)
-        .env("MANAGER_MUTATION_PHASE", phase)
-        .env("MANAGER_MUTATION_STAGE", stage)
-        .env_remove("GROKPTAH_CRASH_STAGE")
-        .output()
-        .unwrap()
-}
-
-fn manager_receipt(root: &Path) -> Value {
-    walkdir::WalkDir::new(root.join("home/ledger/idempotency"))
-        .into_iter()
-        .filter_map(Result::ok)
-        .filter(|entry| entry.file_type().is_file())
-        .map(|entry| read(entry.path()))
-        .find(|value| value["requestId"] == MANAGER_REQUEST)
-        .unwrap()
-}
-
 struct RevokeOrderResolver {
     receipt_status_at_revoke: Arc<Mutex<Option<String>>>,
     receipt_reader: Arc<dyn Fn() -> String + Send + Sync>,
@@ -111,6 +82,7 @@ fn minimal_grok_identity() -> grokptah_agent_sdk::GrokBuildGitIdentity {
 #[test]
 fn message_prune_remove_failures_surface_as_errors() {
     let store = OrchStore::open(tempfile::tempdir().unwrap().path()).unwrap();
+    std::fs::create_dir_all(store.root().join("messages")).unwrap();
     let session = Uuid::new_v4();
     let workspace = "/tmp/wr-v2-prune-fail-closed".to_string();
     for index in 1..=MAX_RETAINED_MESSAGES {
@@ -120,7 +92,7 @@ fn message_prune_remove_failures_surface_as_errors() {
             None,
             None,
             session,
-            workspace.into(),
+            workspace.clone(),
             None,
             "retention seed",
             None,
@@ -132,7 +104,7 @@ fn message_prune_remove_failures_surface_as_errors() {
         let path = store
             .root()
             .join(format!("messages/{}.json", safe_id_filename(&message.message_id).unwrap()));
-        write(path, &json!(message));
+        write_json(path, &json!(message));
     }
     std::fs::write(store.root().join("messages/seq"), MAX_RETAINED_MESSAGES.to_string()).unwrap();
 
@@ -146,7 +118,7 @@ fn message_prune_remove_failures_surface_as_errors() {
         None,
         None,
         session,
-        workspace.into(),
+        workspace.clone(),
         None,
         "overflow",
         None,
@@ -168,44 +140,8 @@ fn message_prune_remove_failures_surface_as_errors() {
         .count();
     assert_eq!(
         messages,
-        MAX_RETAINED_MESSAGES + 1,
-        "fail-open prune must not leave stale messages behind"
-    );
-}
-
-#[test]
-fn manager_mutation_returns_success_when_only_post_commit_prune_fails() {
-    let root = tempfile::tempdir().unwrap();
-    write(root.path().join("options.json"), &json!({"seedMessages":500}));
-    *DURABLE_WRITE_FAULT.lock().unwrap() = Some(DurableWriteFault {
-        needle: "messages/",
-        skips_remaining: 0,
-    });
-    let output = manager_child(root.path(), "tick-message", "replay", "");
-    *DURABLE_WRITE_FAULT.lock().unwrap() = None;
-    assert_eq!(
-        output.status.code(),
-        Some(0),
-        "stdout={}\nstderr={}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let outcome = read(root.path().join("replay.json"));
-    assert!(
-        outcome.get("response").is_some(),
-        "committed manager mutation must not surface as caller failure: {outcome}"
-    );
-    assert!(outcome.get("error").is_none(), "{outcome}");
-    let receipt = manager_receipt(root.path());
-    assert_eq!(receipt["status"], "complete");
-    assert!(
-        root.path()
-            .join("home/ledger/manager-intents")
-            .read_dir()
-            .unwrap()
-            .next()
-            .is_none(),
-        "intent cleanup must still complete"
+        MAX_RETAINED_MESSAGES,
+        "overflow must not commit when prune fails closed"
     );
 }
 
