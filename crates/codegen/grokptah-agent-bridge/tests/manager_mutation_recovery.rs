@@ -1294,6 +1294,27 @@ fn manager_mutation_returns_success_when_only_post_commit_prune_fails() {
 }
 
 #[test]
+fn manager_post_commit_prune_closes_admission_but_replays_the_original_tick() {
+    let root = tempfile::tempdir().unwrap();
+    write(
+        root.path().join("options.json"),
+        &json!({"seedMessages":500}),
+    );
+    exited(&child(root.path(), "tick-message", "prune_remove_fault", ""), 0);
+    let expected = read(root.path().join("prune_remove_fault.json"))["response"].clone();
+    exited(&child(root.path(), "tick-message", "refusal", ""), 0);
+    let refusal = read(root.path().join("refusal.json"));
+    assert!(refusal.get("error").is_some(), "{refusal}");
+    for phase in ["replay", "reopen2"] {
+        exited(&child(root.path(), "tick-message", phase, ""), 0);
+        assert_eq!(
+            read(root.path().join(format!("{phase}.json")))["response"],
+            expected
+        );
+    }
+}
+
+#[test]
 fn pre_intent_manager_process_death_has_no_mutation_effect() {
     for operation in ["advance", "tick", "replan", "tick-message"] {
         let root = tempfile::tempdir().unwrap();
