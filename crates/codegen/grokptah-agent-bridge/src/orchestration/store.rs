@@ -3555,21 +3555,11 @@ impl OrchStore {
             .map_err(|_| related_creation_conflict("manager message sequence is malformed"))
     }
 
-    fn preflight_manager_mutation_unlocked(
+    fn preflight_manager_mutation_observation_conflicts_unlocked(
         &self,
         intent: &ManagerMutationIntent,
     ) -> Result<(), OrchError> {
-        intent.validate()?;
         if let Some(observation) = &intent.observation {
-            for item in &observation.work_items {
-                if !self
-                    .related_record_matches_unlocked(&self.work_item_path(&item.work_id)?, item)?
-                {
-                    return Err(related_creation_conflict(
-                        "manager observation Work disappeared",
-                    ));
-                }
-            }
             // An unobserved adopted child is a conflicting writer, not a
             // reason to materialize another child for that logical step.
             for item in self
@@ -3597,6 +3587,79 @@ impl OrchStore {
                     ));
                 }
             }
+        }
+        Ok(())
+    }
+
+    /// Post-commit prune recovery must prove authorization, seal integrity,
+    /// canonical receipt shape, and observation conflicts before replaying any
+    /// committed effect that was removed after the mutation committed.
+    fn preflight_post_commit_prune_recovery_unlocked(
+        &self,
+        intent: &ManagerMutationIntent,
+        sealed_binding: &WorkRequestBinding,
+        sealed_response: &serde_json::Value,
+    ) -> Result<(), OrchError> {
+        intent.validate()?;
+        if intent.snapshot_digest != intent.digest()? {
+            return Err(related_creation_conflict(
+                "manager mutation intent seal does not match its committed body",
+            ));
+        }
+        self.preflight_manager_mutation_observation_conflicts_unlocked(intent)?;
+        let receipt = self.inspect_canonical_request_receipt_unlocked(sealed_binding)?;
+        if receipt.status == "failed" || receipt.error.is_some() {
+            return Err(related_creation_conflict(
+                "post-commit prune recovery refuses a failed caller receipt",
+            ));
+        }
+        if receipt.status == "pending" && !creation_receipt_is_pending(&receipt) {
+            return Err(related_creation_conflict(
+                "post-commit prune recovery refuses a tampered caller receipt",
+            ));
+        }
+        if receipt.status == "complete" {
+            let settled = receipt.error.is_none()
+                && receipt.response == *sealed_response
+                && receipt.run_id.as_deref() == Some(intent.plan.plan_id.as_str());
+            if !settled {
+                return Err(related_creation_conflict(
+                    "post-commit prune recovery refuses a caller receipt with a conflicting outcome",
+                ));
+            }
+        }
+        if receipt.payload_hash != sealed_binding.payload_hash {
+            return Err(related_creation_conflict(
+                "post-commit prune recovery refuses a caller receipt with a conflicting payload hash",
+            ));
+        }
+        if receipt.status == "pending" {
+            self.preflight_related_receipt_unlocked(
+                intent.request.as_ref(),
+                sealed_response,
+                &intent.plan.plan_id,
+                false,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn preflight_manager_mutation_unlocked(
+        &self,
+        intent: &ManagerMutationIntent,
+    ) -> Result<(), OrchError> {
+        intent.validate()?;
+        if let Some(observation) = &intent.observation {
+            for item in &observation.work_items {
+                if !self
+                    .related_record_matches_unlocked(&self.work_item_path(&item.work_id)?, item)?
+                {
+                    return Err(related_creation_conflict(
+                        "manager observation Work disappeared",
+                    ));
+                }
+            }
+            self.preflight_manager_mutation_observation_conflicts_unlocked(intent)?;
         }
 
         let mut present = self.manager_record_transition_unlocked(
@@ -8616,8 +8679,12 @@ impl OrchStore {
                     ));
                 }
             }
+            self.preflight_post_commit_prune_recovery_unlocked(
+                &intent,
+                &sealed_binding,
+                &sealed_response,
+            )?;
             self.replay_missing_manager_mutation_effects_unlocked(&intent)?;
-            self.preflight_manager_mutation_unlocked(&intent)?;
             self.require_manager_mutation_committed_effects_unlocked(&intent)?;
             if let Err(error) = self.prune_messages_unlocked() {
                 self.note_work_recovery_required(error);

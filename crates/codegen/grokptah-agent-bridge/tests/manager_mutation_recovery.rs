@@ -746,6 +746,67 @@ fn disk_json(root: &Path) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
     }
     result
 }
+
+fn manager_mutation_intent_digest(intent: &Value) -> String {
+    grokptah_agent_bridge::orchestration::hash_payload(&json!([
+        intent["operation"],
+        intent["priorPlan"],
+        intent["plan"],
+        intent["workWrites"],
+        intent["messageWrites"],
+        intent["sequence"],
+        intent["nativeExecutor"],
+        intent["observation"]
+    ]))
+}
+
+fn prune_tick_prune_fault_root() -> tempfile::TempDir {
+    let root = tempfile::tempdir().unwrap();
+    write(
+        root.path().join("options.json"),
+        &json!({"seedMessages":500}),
+    );
+    exited(
+        &child(root.path(), "tick-message", "prune_remove_fault", ""),
+        0,
+    );
+    root
+}
+
+fn prune_fault_notification_path(root: &Path) -> PathBuf {
+    let outcome = read(root.join("prune_remove_fault.json"));
+    let message_id = outcome["response"]["messages"][0]["messageId"]
+        .as_str()
+        .unwrap();
+    root.join("home/ledger/messages")
+        .join(format!("{}.json", safe_id_filename(message_id).unwrap()))
+}
+
+fn delete_prune_fault_notification(root: &Path) {
+    std::fs::remove_file(prune_fault_notification_path(root)).unwrap();
+}
+
+fn receipt_path_for_request(root: &Path) -> PathBuf {
+    paths(&root.join("home/ledger/idempotency"))
+        .into_iter()
+        .find(|path| read(path)["requestId"] == REQUEST)
+        .unwrap()
+}
+
+fn assert_refused_prune_recovery_preserves_evidence(root: &Path, expected_receipt_status: &str) {
+    let before = disk_json(root);
+    let _guard = common::ProcessEnvGuard::new();
+    set_grokptah_home_override(Some(root.join("home")));
+    std::env::remove_var("MANAGER_MUTATION_PHASE");
+    let store = OrchStore::open(root.join("home/ledger")).unwrap();
+    assert!(store.ledger_admission_closed().is_some());
+    assert_eq!(disk_json(root), before);
+    assert_eq!(receipt(root)["status"], expected_receipt_status);
+    assert!(root
+        .join("home/ledger/ledger-admission-recovery.json")
+        .is_file());
+}
+
 #[test]
 fn advance_child_written_cut_replays_the_original_request() {
     prove("advance", "manager_mutation_after_work");
@@ -1577,6 +1638,95 @@ fn manager_post_commit_prune_refuses_altered_committed_effects() {
 }
 
 #[test]
+fn manager_post_commit_prune_refusal_invalid_receipt_preserves_evidence_intent_present() {
+    let root = prune_tick_prune_fault_root();
+    delete_prune_fault_notification(root.path());
+    let receipt_path = receipt_path_for_request(root.path());
+    let mut claim = read(&receipt_path);
+    claim["status"] = json!("failed");
+    claim["error"] = json!({"code":"conflict","message":"foreign failure"});
+    write(&receipt_path, &claim);
+    assert_refused_prune_recovery_preserves_evidence(root.path(), "failed");
+}
+
+#[test]
+fn manager_post_commit_prune_refusal_invalid_receipt_preserves_evidence_marker_only() {
+    let root = prune_tick_prune_fault_root();
+    delete_prune_fault_notification(root.path());
+    for path in paths(&root.path().join("home/ledger/manager-intents")) {
+        std::fs::remove_file(path).unwrap();
+    }
+    let receipt_path = receipt_path_for_request(root.path());
+    let mut claim = read(&receipt_path);
+    claim["payloadHash"] = json!("deadbeef");
+    write(&receipt_path, &claim);
+    assert_refused_prune_recovery_preserves_evidence(root.path(), "pending");
+}
+
+#[test]
+fn manager_post_commit_prune_refusal_invalid_seal_preserves_evidence_intent_present() {
+    let root = prune_tick_prune_fault_root();
+    delete_prune_fault_notification(root.path());
+    let intent_path = paths(&root.path().join("home/ledger/manager-intents"))
+        .pop()
+        .unwrap();
+    let mut intent = read(&intent_path);
+    intent["messageWrites"][0]["message"]["body"] = json!("tampered sealed notification");
+    write(&intent_path, &intent);
+    assert_refused_prune_recovery_preserves_evidence(root.path(), "pending");
+}
+
+#[test]
+fn manager_post_commit_prune_refusal_invalid_seal_preserves_evidence_marker_only() {
+    let root = prune_tick_prune_fault_root();
+    delete_prune_fault_notification(root.path());
+    for path in paths(&root.path().join("home/ledger/manager-intents")) {
+        std::fs::remove_file(path).unwrap();
+    }
+    let marker_path = root
+        .path()
+        .join("home/ledger/ledger-admission-recovery.json");
+    let mut marker = read(&marker_path);
+    marker["sealedMutationIntent"]["messageWrites"][0]["message"]["body"] =
+        json!("tampered sealed notification");
+    write(&marker_path, &marker);
+    assert_refused_prune_recovery_preserves_evidence(root.path(), "pending");
+}
+
+#[test]
+fn manager_post_commit_prune_refusal_conflicting_observation_preserves_evidence_intent_present() {
+    let root = prune_tick_prune_fault_root();
+    delete_prune_fault_notification(root.path());
+    let intent_path = paths(&root.path().join("home/ledger/manager-intents"))
+        .pop()
+        .unwrap();
+    let mut intent = read(&intent_path);
+    intent["observation"]["actor"] = json!("foreign-actor");
+    intent["snapshotDigest"] = json!(manager_mutation_intent_digest(&intent));
+    write(&intent_path, &intent);
+    assert_refused_prune_recovery_preserves_evidence(root.path(), "pending");
+}
+
+#[test]
+fn manager_post_commit_prune_refusal_conflicting_observation_preserves_evidence_marker_only() {
+    let root = prune_tick_prune_fault_root();
+    delete_prune_fault_notification(root.path());
+    for path in paths(&root.path().join("home/ledger/manager-intents")) {
+        std::fs::remove_file(path).unwrap();
+    }
+    let marker_path = root
+        .path()
+        .join("home/ledger/ledger-admission-recovery.json");
+    let mut marker = read(&marker_path);
+    marker["sealedMutationIntent"]["observation"]["actor"] = json!("foreign-actor");
+    marker["sealedMutationIntent"]["snapshotDigest"] = json!(manager_mutation_intent_digest(
+        &marker["sealedMutationIntent"]
+    ));
+    write(&marker_path, &marker);
+    assert_refused_prune_recovery_preserves_evidence(root.path(), "pending");
+}
+
+#[test]
 fn manager_post_commit_prune_refuses_tampered_marker_without_intent() {
     let root = tempfile::tempdir().unwrap();
     write(
@@ -1652,6 +1802,7 @@ fn manager_post_commit_prune_refuses_tampered_marker_without_intent() {
     }
 }
 
+#[test]
 fn pre_intent_manager_process_death_has_no_mutation_effect() {
     for operation in ["advance", "tick", "replan", "tick-message"] {
         let root = tempfile::tempdir().unwrap();
