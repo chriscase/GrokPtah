@@ -83,7 +83,7 @@ fn minimal_grok_identity() -> grokptah_agent_sdk::GrokBuildGitIdentity {
 
 async fn managed_cancel_fixture() -> (
     tempfile::TempDir,
-    OrchestrationService,
+    Arc<OrchestrationService>,
     OrchStore,
     grokptah_agent_bridge::orchestration::AuthContext,
     Uuid,
@@ -478,7 +478,14 @@ async fn concurrent_cancel_revision_fence_blocks_stale_side_effects() {
     });
     OrchStore::arrive_at_work_request_test_gate();
     store
-        .reprioritize_work(&work_id, 99, "bump revision", None)
+        .reprioritize_work(
+            &work_id,
+            99,
+            "bump revision",
+            "operator",
+            None,
+            Utc::now(),
+        )
         .unwrap();
     let result = worker.join().unwrap();
     OrchStore::set_work_request_test_gate(None);

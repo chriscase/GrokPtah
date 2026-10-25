@@ -562,6 +562,7 @@ fn creation_recovery_refuses_conflicting_evidence_without_writing_work() {
 #[test]
 fn aliased_creation_replays_after_intent_cut_without_closing_admission() {
     let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(root.path().join("workspace")).unwrap();
     let workspace = canonical_workspace(&root.path().join("workspace")).unwrap();
     let alias = workspace.join(".");
     let alias_display = alias.display().to_string();
@@ -603,10 +604,7 @@ fn aliased_creation_replays_after_intent_cut_without_closing_admission() {
             root.path(),
             "create",
             "lifecycle_after_intent",
-            &[(
-                "WORK_CREATION_WORKSPACE_ALIAS",
-                alias.display().to_string(),
-            )],
+            &[("WORK_CREATION_WORKSPACE_ALIAS", alias_display.as_str())],
         ),
         86,
     );
