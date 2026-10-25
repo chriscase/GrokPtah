@@ -54,9 +54,15 @@ fn json_paths(dir: &Path) -> Vec<PathBuf> {
     paths
 }
 
+fn idempotency_receipt_paths(dir: &Path) -> Vec<PathBuf> {
+    json_paths(dir)
+        .into_iter()
+        .filter(|path| read_json(path).get("status").is_some())
+        .collect()
+}
+
 fn receipt_path(root: &Path) -> PathBuf {
-    let paths = json_paths(&root.join("ledger/idempotency"));
-    paths
+    idempotency_receipt_paths(&root.join("ledger/idempotency"))
         .into_iter()
         .find(|path| read_json(path)["requestId"] == REQUEST)
         .unwrap()
@@ -770,7 +776,7 @@ fn legacy_schema2_585_producer_cut_reopens_on_candidate() {
             records(&root.path().join("ledger/work-items"))[0]["workId"],
             original_work_id
         );
-        let matching_receipts = json_paths(&root.path().join("ledger/idempotency"))
+        let matching_receipts = idempotency_receipt_paths(&root.path().join("ledger/idempotency"))
             .into_iter()
             .filter(|path| read_json(path)["requestId"] == REQUEST)
             .collect::<Vec<_>>();
@@ -781,6 +787,103 @@ fn legacy_schema2_585_producer_cut_reopens_on_candidate() {
         );
         assert_eq!(matching_receipts[0], receipt_file);
     }
+}
+
+#[test]
+fn synthetic_macos_relocated_pending_fixture_passes_creation_integrity() {
+    let bundle = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/wr-v2-585-schema2-creation-cut-macos-private-tmp-pending-25d40262");
+    assert!(
+        bundle.join("FIXTURE_PROVENANCE").is_file(),
+        "relocated macOS fixture must declare synthetic provenance"
+    );
+    let provenance = std::fs::read_to_string(bundle.join("FIXTURE_PROVENANCE")).unwrap();
+    assert!(
+        provenance.contains("synthetic_relocated"),
+        "fixture must not be labeled as a genuine historical macOS capture"
+    );
+    let root = tempfile::tempdir().unwrap();
+    copy_tree::copy_dir_all(&bundle.join("ledger-tree"), &root.path().join("ledger")).unwrap();
+    OrchStore::open(root.path().join("ledger")).expect("relocated fixture must pass recovery");
+}
+
+#[test]
+fn legacy_schema2_585_producer_cut_replays_after_creation_intent_removed() {
+    let bundle = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/wr-v2-585-schema2-creation-cut-25d40262");
+    let root = tempfile::tempdir().unwrap();
+    copy_tree::copy_dir_all(&bundle.join("ledger-tree"), &root.path().join("ledger")).unwrap();
+    copy_tree::copy_dir_all(&bundle.join("home-tree"), &root.path().join("home")).unwrap();
+    std::fs::copy(
+        bundle.join("fixture.json"),
+        root.path().join("fixture.json"),
+    )
+    .unwrap();
+    let intent = read_json(intent_paths(root.path()).first().expect("intent"));
+    let invoke_workspace = intent["request"]["workspaceDisplay"]
+        .as_str()
+        .expect("producer-bound request scope");
+    std::fs::create_dir_all(invoke_workspace).unwrap();
+    let original_work_id = intent["workId"].as_str().unwrap();
+    assert_exit(
+        &child_with(
+            root.path(),
+            "replay",
+            "",
+            &[("WORK_CREATION_WORKSPACE_ALIAS", invoke_workspace)],
+        ),
+        0,
+    );
+    assert!(
+        intent_paths(root.path()).is_empty(),
+        "recovery must clear intents"
+    );
+    for _reopen in 0..3 {
+        assert_exit(
+            &child_with(
+                root.path(),
+                "replay",
+                "",
+                &[("WORK_CREATION_WORKSPACE_ALIAS", invoke_workspace)],
+            ),
+            0,
+        );
+        let outcome = read_json(root.path().join("outcome.json"));
+        assert_eq!(
+            outcome["response"]["work"]["workId"].as_str().unwrap(),
+            original_work_id
+        );
+        let matching_receipts = idempotency_receipt_paths(&root.path().join("ledger/idempotency"))
+            .into_iter()
+            .filter(|path| read_json(path)["requestId"] == REQUEST)
+            .collect::<Vec<_>>();
+        assert_eq!(matching_receipts.len(), 1);
+    }
+}
+
+#[test]
+fn derive_relocated_creation_fixture_integrity_from_env() {
+    let Ok(item_path) = std::env::var("DERIVE_RELOCATED_CREATION_ITEM") else {
+        return;
+    };
+    let Ok(workspace) = std::env::var("DERIVE_RELOCATED_CREATION_WORKSPACE") else {
+        return;
+    };
+    let item: WorkItem = serde_json::from_slice(&std::fs::read(item_path).unwrap()).unwrap();
+    let item_digest = hash_payload(&serde_json::to_value(&item).unwrap());
+    let payload = json!({
+        "sessionId": item.session_id,
+        "workspace": workspace,
+        "kind": item.kind,
+        "objective": item.objective,
+        "priority": item.priority,
+        "deadline": item.deadline,
+        "parentWorkId": item.parent_work_id,
+        "dependencies": item.dependencies,
+        "policy": item.policy,
+    });
+    println!("creation_item_digest={item_digest}");
+    println!("payload_hash={}", hash_payload(&payload));
 }
 
 #[cfg(target_os = "macos")]
@@ -870,7 +973,7 @@ fn legacy_schema2_585_macos_private_tmp_pending_producer_cut_reopens_on_candidat
             records(&root.path().join("ledger/work-items"))[0]["workId"],
             original_work_id
         );
-        let matching_receipts = json_paths(&root.path().join("ledger/idempotency"))
+        let matching_receipts = idempotency_receipt_paths(&root.path().join("ledger/idempotency"))
             .into_iter()
             .filter(|path| read_json(path)["requestId"] == REQUEST)
             .collect::<Vec<_>>();
@@ -927,7 +1030,7 @@ fn legacy_schema2_585_macos_private_tmp_completed_producer_replays_without_dupli
             records(&root.path().join("ledger/work-items")),
             work_items_before
         );
-        let matching_receipts = json_paths(&root.path().join("ledger/idempotency"))
+        let matching_receipts = idempotency_receipt_paths(&root.path().join("ledger/idempotency"))
             .into_iter()
             .filter(|path| read_json(path)["requestId"] == REQUEST)
             .collect::<Vec<_>>();

@@ -1,5 +1,5 @@
+fixture_kind=synthetic_relocated
 relocated_from=/workspace/crates/codegen/grokptah-agent-bridge/tests/fixtures/wr-v2-585-schema2-creation-cut-25d40262
 producer_sha=25d40262a3b530227af850f26974c19dfc2935fd
-platform_spelling=macos_private_tmp
 workspace_display=/private/tmp/grokptah-585-cut-root.wu1Qcc/workspace
 state=pending_intent_cut

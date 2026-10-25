@@ -45,7 +45,7 @@
     "createdAt": "2026-10-25T14:28:21.526070769Z",
     "updatedAt": "2026-10-25T14:28:21.526070769Z"
   },
-  "creationItemDigest": "fc2fe8a8049498c1ea8bfb74d0ba7b3a961803a54f118b647eafb97f4ee4b81f",
+  "creationItemDigest": "727bfebe87040056e32e4a564990ef453bbaf347857072cf461ab033477c31ba",
   "priorAttempts": [],
   "attempts": [],
   "request": {
@@ -55,7 +55,8 @@
     "sessionId": "102bc2b2-62b7-47e5-907b-ffcfe2faae81",
     "workspaceDigest": "f1cbe34c2d1784835b7447699f0d21e56583364e5d2203e376d616b146868c77",
     "workspaceDisplay": "/private/tmp/grokptah-585-cut-root.wu1Qcc/workspace",
-    "payloadHash": "f9bb0d058f425c42a2ebb1233340bfaabfdea94564bbf6eca6b04322354495e6",
-    "shape": "work_attempts"
+    "payloadHash": "a8799ef355e6d77c09fa70cfb318e5d350f9143c90d5e06aa18656bb2c8b4705",
+    "shape": "work_attempts",
+    "payloadWorkspace": "/private/tmp/grokptah-585-cut-root.wu1Qcc/workspace"
   }
 }

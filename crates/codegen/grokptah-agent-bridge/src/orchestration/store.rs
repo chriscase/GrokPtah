@@ -1120,6 +1120,25 @@ pub struct WorkRequestBinding {
     pub expected_revision: Option<u64>,
 }
 
+/// Durable workspace scope for an idempotent request. Survives creation-intent
+/// cleanup so alias replay can find the producer-bound receipt shard.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct IdempotencyRequestScopeBinding {
+    schema_version: u32,
+    owner_id: String,
+    session_id: Uuid,
+    request_id: String,
+    tool: String,
+    payload_hash: String,
+    workspace_digest: String,
+    workspace_display: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    payload_workspace: String,
+}
+
+const IDEMPOTENCY_REQUEST_SCOPE_BINDING_SCHEMA_VERSION: u32 = 1;
+
 impl WorkRequestBinding {
     /// Copy the scope the service already authenticated. The digest stays the
     /// one `IdempotencyScope` computed. Callers do not supply it.
@@ -2043,6 +2062,64 @@ impl OrchStore {
             .join("v2")
             .join(scope.owner_path_digest())
             .join(format!("{safe}.json")))
+    }
+
+    fn idempotency_request_scope_binding_path(
+        &self,
+        owner_id: &str,
+        request_id: &str,
+    ) -> Result<PathBuf, OrchError> {
+        let owner_scope = IdempotencyScope::new(owner_id, Uuid::nil(), Path::new("/"))?;
+        let safe = safe_id_filename(request_id)?;
+        Ok(self
+            .inner
+            .root
+            .join("idempotency")
+            .join("v2")
+            .join(owner_scope.owner_path_digest())
+            .join("request-scopes")
+            .join(format!("{safe}.json")))
+    }
+
+    fn persist_idempotency_request_scope_binding_unlocked(
+        &self,
+        request: &WorkRequestBinding,
+    ) -> Result<(), OrchError> {
+        let binding = IdempotencyRequestScopeBinding {
+            schema_version: IDEMPOTENCY_REQUEST_SCOPE_BINDING_SCHEMA_VERSION,
+            owner_id: request.owner_id.clone(),
+            session_id: request.session_id,
+            request_id: request.request_id.clone(),
+            tool: request.tool.clone(),
+            payload_hash: request.payload_hash.clone(),
+            workspace_digest: request.workspace_digest.clone(),
+            workspace_display: request.workspace_display.clone(),
+            payload_workspace: request.payload_workspace.clone(),
+        };
+        let path =
+            self.idempotency_request_scope_binding_path(&request.owner_id, &request.request_id)?;
+        atomic_write_json(&self.lease(), &path, &binding)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))
+    }
+
+    fn load_idempotency_request_scope_binding_unlocked(
+        &self,
+        owner_id: &str,
+        request_id: &str,
+    ) -> Result<Option<IdempotencyRequestScopeBinding>, OrchError> {
+        let path = self.idempotency_request_scope_binding_path(owner_id, request_id)?;
+        if !path.is_file() {
+            return Ok(None);
+        }
+        let binding: IdempotencyRequestScopeBinding = serde_json::from_str(
+            &fs::read_to_string(&path)
+                .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?,
+        )
+        .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        if binding.schema_version != IDEMPOTENCY_REQUEST_SCOPE_BINDING_SCHEMA_VERSION {
+            return Ok(None);
+        }
+        Ok(Some(binding))
     }
 
     fn idemp_path(&self, scope: &IdempotencyScope, request_id: &str) -> Result<PathBuf, OrchError> {
@@ -4123,7 +4200,13 @@ impl OrchStore {
             } else {
                 error
             }
-        })
+        })?;
+        if intent.operation == "create" {
+            if let Some(request) = intent.request.as_ref() {
+                self.persist_idempotency_request_scope_binding_unlocked(request)?;
+            }
+        }
+        Ok(())
     }
 
     fn clear_work_lifecycle_intent_unlocked(&self, intent_id: &str) -> Result<(), OrchError> {
@@ -4197,6 +4280,11 @@ impl OrchStore {
             )?;
         }
         crash_process_if_stage("lifecycle_after_receipt");
+        if intent.operation == "create" {
+            if let Some(request) = intent.request.as_ref() {
+                self.persist_idempotency_request_scope_binding_unlocked(request)?;
+            }
+        }
         self.clear_work_lifecycle_intent_unlocked(&intent.intent_id)
             .map_err(|error| self.note_work_recovery_required(error))?;
         crash_process_if_stage("lifecycle_after_commit");
@@ -8842,6 +8930,7 @@ impl OrchStore {
         if response.is_null() {
             return Ok(());
         }
+        self.persist_idempotency_request_scope_binding_unlocked(request)?;
         let scope = IdempotencyScope {
             owner_id: request.owner_id.clone(),
             session_id: request.session_id,
@@ -12944,53 +13033,121 @@ impl OrchStore {
         payload_hash: &str,
         claimed_canonical_workspace: &str,
     ) -> Result<Option<(PathBuf, IdempotencyScope)>, OrchError> {
-        let dir = self.inner.root.join("work-lifecycle-intents");
-        if !dir.is_dir() {
-            return Ok(None);
+        if let Some(binding) =
+            self.load_idempotency_request_scope_binding_unlocked(&scope.owner_id, request_id)?
+        {
+            if binding.session_id == scope.session_id
+                && binding.request_id == request_id
+                && binding.tool == tool
+                && binding.payload_hash == payload_hash
+                && workspaces_match(&binding.workspace_display, claimed_canonical_workspace)
+            {
+                let bound_scope = IdempotencyScope::new(
+                    &binding.owner_id,
+                    binding.session_id,
+                    Path::new(&binding.workspace_display),
+                )?;
+                if bound_scope.workspace_digest != scope.workspace_digest {
+                    let receipt_path = self.idemp_path(&bound_scope, request_id)?;
+                    if receipt_path.is_file() {
+                        return Ok(Some((receipt_path, bound_scope)));
+                    }
+                }
+            }
         }
-        for entry in fs::read_dir(&dir)
+        let dir = self.inner.root.join("work-lifecycle-intents");
+        if dir.is_dir() {
+            for entry in fs::read_dir(&dir)
+                .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
+            {
+                let path = entry
+                    .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
+                    .path();
+                if path.extension().and_then(|value| value.to_str()) != Some("json") {
+                    continue;
+                }
+                let intent: WorkLifecycleIntent =
+                    serde_json::from_str(&fs::read_to_string(&path).map_err(|error| {
+                        OrchError::new(OrchErrorCode::Internal, error.to_string())
+                    })?)
+                    .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+                if intent.validate().is_err() || intent.operation != "create" {
+                    continue;
+                }
+                let Some(request) = intent.request.as_ref() else {
+                    continue;
+                };
+                if request.owner_id != scope.owner_id
+                    || request.session_id != scope.session_id
+                    || request.request_id != request_id
+                    || request.tool != tool
+                    || request.payload_hash != payload_hash
+                {
+                    continue;
+                }
+                if !workspaces_match(&request.workspace_display, claimed_canonical_workspace) {
+                    continue;
+                }
+                let bound_scope = IdempotencyScope::new(
+                    &request.owner_id,
+                    request.session_id,
+                    Path::new(&request.workspace_display),
+                )?;
+                if bound_scope.workspace_digest == scope.workspace_digest {
+                    continue;
+                }
+                let receipt_path = self.idemp_path(&bound_scope, request_id)?;
+                if receipt_path.is_file() {
+                    return Ok(Some((receipt_path, bound_scope)));
+                }
+            }
+        }
+        let owner_dir = self
+            .inner
+            .root
+            .join("idempotency")
+            .join("v2")
+            .join(scope.owner_path_digest());
+        for receipt_path in owner_receipt_files(&owner_dir)
             .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
         {
-            let path = entry
-                .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
-                .path();
-            if path.extension().and_then(|value| value.to_str()) != Some("json") {
-                continue;
-            }
-            let intent: WorkLifecycleIntent = serde_json::from_str(
-                &fs::read_to_string(&path)
+            let receipt: IdempotencyReceipt = serde_json::from_str(
+                &fs::read_to_string(&receipt_path)
                     .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?,
             )
             .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
-            if intent.validate().is_err() || intent.operation != "create" {
-                continue;
-            }
-            let Some(request) = intent.request.as_ref() else {
-                continue;
-            };
-            if request.owner_id != scope.owner_id
-                || request.session_id != scope.session_id
-                || request.request_id != request_id
-                || request.tool != tool
-                || request.payload_hash != payload_hash
+            if receipt.owner_id != scope.owner_id
+                || receipt.session_id != scope.session_id
+                || receipt.request_id != request_id
+                || receipt.tool != tool
+                || receipt.payload_hash != payload_hash
+                || receipt.workspace_digest == scope.workspace_digest
             {
                 continue;
             }
-            if !workspaces_match(&request.workspace_display, claimed_canonical_workspace) {
+            let alias_workspace = receipt
+                .response
+                .get("work")
+                .and_then(|work| work.get("workId"))
+                .and_then(|value| value.as_str())
+                .and_then(|work_id| {
+                    self.load_work_item_unlocked(work_id)
+                        .ok()
+                        .flatten()
+                        .map(|item| item.workspace)
+                });
+            let Some(alias_workspace) = alias_workspace else {
+                continue;
+            };
+            if !workspaces_match(&alias_workspace, claimed_canonical_workspace) {
                 continue;
             }
-            let bound_scope = IdempotencyScope::new(
-                &request.owner_id,
-                request.session_id,
-                Path::new(&request.workspace_display),
-            )?;
-            if bound_scope.workspace_digest == scope.workspace_digest {
-                continue;
-            }
-            let receipt_path = self.idemp_path(&bound_scope, request_id)?;
-            if receipt_path.is_file() {
-                return Ok(Some((receipt_path, bound_scope)));
-            }
+            let bound_scope = IdempotencyScope {
+                owner_id: receipt.owner_id.clone(),
+                session_id: receipt.session_id,
+                workspace_digest: receipt.workspace_digest.clone(),
+            };
+            return Ok(Some((receipt_path, bound_scope)));
         }
         Ok(None)
     }
@@ -13768,6 +13925,13 @@ fn owner_receipt_files(owner_dir: &Path) -> anyhow::Result<Vec<PathBuf>> {
         let path = entry.path();
         let file_type = entry.file_type()?;
         if file_type.is_dir() {
+            if path
+                .file_name()
+                .and_then(|value| value.to_str())
+                .is_some_and(|name| name == "request-scopes")
+            {
+                continue;
+            }
             for child in fs::read_dir(&path)? {
                 let child = child?;
                 let child_path = child.path();
@@ -15163,6 +15327,111 @@ mod tests {
             OrchStore::open(d.path()).is_err(),
             "a second live opener must not run crash recovery"
         );
+    }
+
+    #[test]
+    fn idempotency_replays_producer_bound_receipt_after_scope_binding_survives_intent_cleanup() {
+        let dir = tempdir().unwrap();
+        let workspace = dir.path().join("workspace");
+        let alias = dir.path().join("alias");
+        fs::create_dir_all(&workspace).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&workspace, &alias).unwrap();
+        #[cfg(not(unix))]
+        {
+            return;
+        }
+        let sealed = crate::orchestration::authz::canonical_workspace(&workspace).unwrap();
+        let sealed_scope = IdempotencyScope::new("owner-a", Uuid::nil(), &sealed).unwrap();
+        let claim_scope = IdempotencyScope::new(
+            "owner-a",
+            Uuid::nil(),
+            Path::new("/tmp/foreign-idempotency-scope-spelling"),
+        )
+        .unwrap();
+        assert_ne!(claim_scope.workspace_digest, sealed_scope.workspace_digest);
+        let store = OrchStore::open(dir.path()).unwrap();
+        let binding = WorkRequestBinding::bound(
+            &sealed_scope,
+            sealed.display().to_string(),
+            "create-alias-replay",
+            "ptah_create_work",
+            "payload-hash",
+            "work_attempts",
+        );
+        store
+            .persist_idempotency_request_scope_binding_unlocked(&binding)
+            .unwrap();
+        let response = serde_json::json!({
+            "work": {
+                "workId": "work-alias-replay",
+                "workspace": sealed.display().to_string(),
+            }
+        });
+        assert!(matches!(
+            store
+                .claim_idempotency(
+                    &sealed_scope,
+                    "ptah_create_work",
+                    "create-alias-replay",
+                    "payload-hash",
+                    None,
+                )
+                .unwrap(),
+            IdempotencyClaim::Perform
+        ));
+        store
+            .complete_idempotency(
+                &sealed_scope,
+                "ptah_create_work",
+                "create-alias-replay",
+                "payload-hash",
+                Some("work-alias-replay".into()),
+                response.clone(),
+            )
+            .unwrap();
+        let replay = store
+            .claim_idempotency(
+                &claim_scope,
+                "ptah_create_work",
+                "create-alias-replay",
+                "payload-hash",
+                Some(sealed.to_str().unwrap()),
+            )
+            .unwrap();
+        match replay {
+            IdempotencyClaim::Replay(Ok(value)) => {
+                assert_eq!(value["work"]["workId"], "work-alias-replay");
+            }
+            other => panic!("expected replay after intent cleanup path: {other:?}"),
+        }
+        assert_eq!(
+            json_paths(&dir.path().join("idempotency"))
+                .into_iter()
+                .filter(|path| {
+                    serde_json::from_slice::<IdempotencyReceipt>(&fs::read(path).unwrap())
+                        .map(|receipt| receipt.request_id == "create-alias-replay")
+                        .unwrap_or(false)
+                })
+                .count(),
+            1
+        );
+    }
+
+    fn json_paths(dir: &Path) -> Vec<PathBuf> {
+        let mut paths = Vec::new();
+        if !dir.is_dir() {
+            return paths;
+        }
+        for entry in fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                paths.extend(json_paths(&path));
+            } else if path.extension().and_then(|ext| ext.to_str()) == Some("json") {
+                paths.push(path);
+            }
+        }
+        paths
     }
 
     #[test]
