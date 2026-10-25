@@ -5,9 +5,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 use grokptah_agent_bridge::orchestration::{
-    canonical_workspace, safe_id_filename, OrchStore, OrchestrationConfig, OrchestrationService,
-    RunBounds, WorkItem, WorkPolicy, WorkspaceAllowlist, MAX_GRAPH_SCOPE_ITEMS,
-    WORK_PAGE_TRANSPORT_CEILING_BYTES,
+    canonical_workspace, hash_payload, safe_id_filename, OrchStore, OrchestrationConfig,
+    OrchestrationService, RunBounds, WorkItem, WorkPolicy, WorkspaceAllowlist,
+    MAX_GRAPH_SCOPE_ITEMS, WORK_PAGE_TRANSPORT_CEILING_BYTES,
 };
 use grokptah_agent_bridge::{
     set_grokptah_home_override, start_control_server, AgentHost, DurableWriteFault, HostConfig,
@@ -463,6 +463,7 @@ fn creation_recovery_refuses_conflicting_evidence_without_writing_work() {
         "schema",
         "filename",
         "foreign_work",
+        "substituted_creation_digest",
     ] {
         let root = tempfile::tempdir().unwrap();
         assert_exit(&child(root.path(), "create", "lifecycle_after_intent"), 86);
@@ -473,6 +474,11 @@ fn creation_recovery_refuses_conflicting_evidence_without_writing_work() {
         match corruption {
             "snapshot" => {
                 intent["item"]["objective"] = json!("changed after seal");
+                write_json(&path, &intent);
+            }
+            "substituted_creation_digest" => {
+                intent["item"]["objective"] = json!("changed after seal");
+                intent["creationItemDigest"] = json!(hash_payload(&intent["item"]));
                 write_json(&path, &intent);
             }
             "owner" => {
