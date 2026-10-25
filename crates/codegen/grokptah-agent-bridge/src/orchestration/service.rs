@@ -5234,6 +5234,12 @@ impl OrchestrationService {
                 ))
             }
         };
+        if self.store.post_commit_prune_recovery_marker_present()
+            || self.store.ledger_admission_closed().is_some()
+        {
+            lease.leave_pending();
+            return Ok(response);
+        }
         lease
             .complete(Some(plan_id.to_string()), response.clone())
             .map_err(|error| {
@@ -5997,23 +6003,23 @@ impl OrchestrationService {
             None,
             expected_revision,
         )?;
-        let cancel_result = self
-            .store
-            .cancel_work_checked(work_id, &reason, expected_revision);
+        let cancel_result = self.store.cancel_work_checked_with_pre_commit(
+            work_id,
+            &reason,
+            expected_revision,
+            |intents| {
+                for intent in intents {
+                    self.cancel_managed_grok_authority(intent)?;
+                }
+                Ok(())
+            },
+        );
         let (item, attempts) = match cancel_result {
             Ok(value) => value,
             Err(error) => {
                 return Err(self.fail_claim(&mut lease, None, session_id, &claimed, error))
             }
         };
-        for intent in self
-            .store
-            .list_managed_intents()?
-            .into_iter()
-            .filter(|intent| intent.work_id == work_id && intent.grok.is_some())
-        {
-            self.cancel_managed_grok_authority(&intent)?;
-        }
         let attempts = attempts
             .iter()
             .map(WorkAttemptView::from)

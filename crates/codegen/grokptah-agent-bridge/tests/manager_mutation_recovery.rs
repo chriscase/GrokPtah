@@ -1292,8 +1292,11 @@ fn manager_mutation_returns_success_when_only_post_commit_prune_fails() {
     );
     assert!(outcome.get("error").is_none(), "{outcome}");
     let settled = receipt(root.path());
-    assert_eq!(settled["status"], "complete");
-    assert!(paths(&root.path().join("home/ledger/manager-intents")).is_empty());
+    assert_eq!(settled["status"], "pending");
+    assert_eq!(
+        paths(&root.path().join("home/ledger/manager-intents")).len(),
+        1
+    );
 }
 
 #[test]

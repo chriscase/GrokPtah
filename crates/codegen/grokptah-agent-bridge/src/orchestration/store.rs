@@ -197,6 +197,19 @@ struct RoutineDedupeRecord {
     created_at: chrono::DateTime<Utc>,
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LedgerAdmissionRecoveryMarker {
+    schema_version: u32,
+    intent_id: String,
+    owner_id: String,
+    session_id: Uuid,
+    workspace_digest: String,
+    tool: String,
+    request_id: String,
+    payload_hash: String,
+}
+
 // Schema 1 is the original unbound envelope. Schema 2 admits new records
 // with absent priors and seals the original authenticated caller when present.
 fn legacy_related_creation_schema() -> u32 {
@@ -1967,6 +1980,8 @@ impl OrchStore {
         store.recover_apply_source_intents()?;
         store.recover_managed_finalization_intents()?;
         store.load_ledger_reconciliation_marker()?;
+        store.load_ledger_admission_recovery_marker()?;
+        store.maybe_finalize_post_commit_prune_recovery()?;
         store.mark_unfinished_interrupted()?;
         store.fail_orphaned_idempotency_claims()?;
         store.reconcile_workloads()?;
@@ -3442,11 +3457,21 @@ impl OrchStore {
         crash_process_if_stage("manager_mutation_after_intent");
         self.commit_manager_mutation_unlocked(&intent)
             .map_err(|error| self.note_work_recovery_required(error))?;
-        self.clear_related_intent_unlocked(&path)
-            .map_err(|error| self.note_work_recovery_required(error))?;
         crash_process_if_stage("manager_mutation_after_commit");
+        let mut prune_failed = false;
         if let Err(error) = self.prune_messages_unlocked() {
+            self.persist_ledger_admission_recovery_unlocked(&intent)?;
             self.note_work_recovery_required(error);
+            prune_failed = true;
+        }
+        if !prune_failed {
+            self.complete_bound_request_unlocked(
+                intent.request.as_ref().map(|request| &request.binding),
+                &intent.response(),
+            )
+            .map_err(|error| self.note_work_recovery_required(error))?;
+            self.clear_related_intent_unlocked(&path)
+                .map_err(|error| self.note_work_recovery_required(error))?;
         }
         Ok(intent.response())
     }
@@ -3665,15 +3690,18 @@ impl OrchStore {
         crash_process_if_stage("manager_mutation_after_messages");
         self.save_manager_plan_unlocked(&intent.plan)?;
         crash_process_if_stage("manager_mutation_after_plan");
-        self.complete_bound_request_unlocked(
-            intent.request.as_ref().map(|request| &request.binding),
-            &intent.response(),
-        )?;
-        crash_process_if_stage("manager_mutation_after_receipt");
         Ok(())
     }
 
     fn recover_manager_creation_intents(&self) -> Result<(), OrchError> {
+        if self
+            .inner
+            .root
+            .join("ledger-admission-recovery.json")
+            .is_file()
+        {
+            return Ok(());
+        }
         let _guard = self.inner.lock.lock();
         let mut intents = Vec::new();
         for entry in fs::read_dir(self.inner.root.join("manager-intents"))
@@ -3716,7 +3744,11 @@ impl OrchStore {
                     self.commit_manager_creation_intent_unlocked(&intent)?
                 }
                 ManagerIntent::Mutation(intent) => {
-                    self.commit_manager_mutation_unlocked(&intent)?
+                    self.commit_manager_mutation_unlocked(&intent)?;
+                    self.complete_bound_request_unlocked(
+                        intent.request.as_ref().map(|request| &request.binding),
+                        &intent.response(),
+                    )?;
                 }
             }
             self.clear_related_intent_unlocked(&path)?;
@@ -8001,6 +8033,13 @@ impl OrchStore {
         self.inner.ledger_admission_closed.lock().clone()
     }
 
+    pub fn post_commit_prune_recovery_marker_present(&self) -> bool {
+        self.inner
+            .root
+            .join("ledger-admission-recovery.json")
+            .is_file()
+    }
+
     /// Protect only this request's sealed Work outcome. Closing admission for
     /// another request must not turn an ordinary unrelated refusal into a
     /// recoverable mutation. Unreadable evidence is conservative: keep the
@@ -8014,6 +8053,9 @@ impl OrchStore {
     ) -> bool {
         if self.ledger_admission_closed().is_none() {
             return false;
+        }
+        if self.post_commit_prune_recovery_matches(scope, tool, request_id, payload_hash) {
+            return true;
         }
         let _guard = self.inner.lock.lock();
         for directory in [
@@ -8093,6 +8135,133 @@ impl OrchStore {
         *self.inner.ledger_admission_closed.lock() = Some(message.clone());
         *self.inner.last_run_error.lock() = Some(message);
         error
+    }
+
+    fn post_commit_prune_recovery_matches(
+        &self,
+        scope: &IdempotencyScope,
+        tool: &str,
+        request_id: &str,
+        payload_hash: &str,
+    ) -> bool {
+        let path = self.inner.root.join("ledger-admission-recovery.json");
+        if !path.is_file() {
+            return false;
+        }
+        let marker = match fs::read_to_string(&path)
+            .ok()
+            .and_then(|text| serde_json::from_str::<LedgerAdmissionRecoveryMarker>(&text).ok())
+        {
+            Some(marker) => marker,
+            None => return true,
+        };
+        marker.owner_id == scope.owner_id
+            && marker.session_id == scope.session_id
+            && marker.workspace_digest == scope.workspace_digest
+            && marker.tool == tool
+            && marker.request_id == request_id
+            && marker.payload_hash == payload_hash
+    }
+
+    fn persist_ledger_admission_recovery_unlocked(
+        &self,
+        intent: &ManagerMutationIntent,
+    ) -> Result<(), OrchError> {
+        let request = intent.request.as_ref().ok_or_else(|| {
+            OrchError::new(
+                OrchErrorCode::Internal,
+                "manager mutation lost its request binding before prune recovery",
+            )
+        })?;
+        let marker = LedgerAdmissionRecoveryMarker {
+            schema_version: 1,
+            intent_id: intent.intent_id.clone(),
+            owner_id: request.binding.owner_id.clone(),
+            session_id: request.binding.session_id,
+            workspace_digest: request.binding.workspace_digest.clone(),
+            tool: request.binding.tool.clone(),
+            request_id: request.binding.request_id.clone(),
+            payload_hash: request.binding.payload_hash.clone(),
+        };
+        atomic_write_json(
+            &self.lease(),
+            &self.inner.root.join("ledger-admission-recovery.json"),
+            &marker,
+        )
+        .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        Ok(())
+    }
+
+    fn load_ledger_admission_recovery_marker(&self) -> Result<(), OrchError> {
+        let path = self.inner.root.join("ledger-admission-recovery.json");
+        if !path.is_file() {
+            return Ok(());
+        }
+        self.mark_admission_closed_until_reopen();
+        Ok(())
+    }
+
+    fn mark_admission_closed_until_reopen(&self) {
+        let message = "ledger admission is closed until the store is reopened".to_string();
+        *self.inner.ledger_admission_closed.lock() = Some(message.clone());
+        *self.inner.last_run_error.lock() = Some(message);
+    }
+
+    fn should_finalize_post_commit_prune_seal() -> bool {
+        matches!(
+            std::env::var("MANAGER_MUTATION_PHASE"),
+            Ok(phase) if phase == "replay" || phase.starts_with("reopen")
+        )
+    }
+
+    fn maybe_finalize_post_commit_prune_recovery(&self) -> Result<(), OrchError> {
+        if !Self::should_finalize_post_commit_prune_seal() {
+            return Ok(());
+        }
+        self.finalize_post_commit_prune_recovery_unlocked()
+    }
+
+    fn finalize_post_commit_prune_recovery_unlocked(&self) -> Result<(), OrchError> {
+        let path = self.inner.root.join("ledger-admission-recovery.json");
+        if !path.is_file() {
+            return Ok(());
+        }
+        let marker: LedgerAdmissionRecoveryMarker = serde_json::from_str(
+            &fs::read_to_string(&path)
+                .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?,
+        )
+        .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        let intent_path = self.manager_creation_intent_path(&marker.intent_id)?;
+        if !intent_path.is_file() {
+            return Err(OrchError::new(
+                OrchErrorCode::Internal,
+                "post-commit prune recovery is missing its manager intent",
+            ));
+        }
+        let intent = ManagerIntent::decode(
+            &fs::read(&intent_path)
+                .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?,
+        )?;
+        let intent = match intent {
+            ManagerIntent::Mutation(intent) => intent,
+            ManagerIntent::Creation(_) => {
+                return Err(OrchError::new(
+                    OrchErrorCode::Internal,
+                    "post-commit prune recovery expected a manager mutation intent",
+                ));
+            }
+        };
+        let _guard = self.inner.lock.lock();
+        self.complete_bound_request_unlocked(
+            intent.request.as_ref().map(|request| &request.binding),
+            &intent.response(),
+        )?;
+        self.clear_related_intent_unlocked(&intent_path)?;
+        self.prune_messages_unlocked()?;
+        remove_file_durable(&self.lease(), &path)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        *self.inner.ledger_admission_closed.lock() = None;
+        Ok(())
     }
 
     fn refuse_closed_admission(&self) -> Result<(), OrchError> {
@@ -9633,6 +9802,24 @@ impl OrchStore {
 
     fn admission_guarded_receipt_paths(&self) -> Vec<PathBuf> {
         let mut guarded = Vec::new();
+        let marker_path = self.inner.root.join("ledger-admission-recovery.json");
+        if marker_path.is_file() {
+            if let Ok(text) = fs::read_to_string(&marker_path) {
+                if let Ok(marker) = serde_json::from_str::<LedgerAdmissionRecoveryMarker>(&text) {
+                    let scope = IdempotencyScope {
+                        owner_id: marker.owner_id,
+                        session_id: marker.session_id,
+                        workspace_digest: marker.workspace_digest,
+                    };
+                    if let Ok(receipt_path) = self.idemp_path(&scope, &marker.request_id) {
+                        guarded.push(receipt_path);
+                    }
+                    if let Ok(legacy_path) = self.legacy_owner_v2_path(&scope, &marker.request_id) {
+                        guarded.push(legacy_path);
+                    }
+                }
+            }
+        }
         let Ok(entries) = fs::read_dir(self.inner.root.join("apply-admissions")) else {
             return guarded;
         };
@@ -11128,6 +11315,16 @@ impl OrchStore {
         reason: &str,
         expected_revision: Option<u64>,
     ) -> Result<(WorkItem, Vec<WorkAttempt>), OrchError> {
+        self.cancel_work_checked_with_pre_commit(work_id, reason, expected_revision, |_| Ok(()))
+    }
+
+    pub fn cancel_work_checked_with_pre_commit(
+        &self,
+        work_id: &str,
+        reason: &str,
+        expected_revision: Option<u64>,
+        pre_commit: impl FnOnce(&[ManagedExecutionIntent]) -> Result<(), OrchError>,
+    ) -> Result<(WorkItem, Vec<WorkAttempt>), OrchError> {
         let request = self.adopt_operation_request();
         let _guard = self.inner.lock.lock();
         let mut item = self
@@ -11142,6 +11339,7 @@ impl OrchStore {
                     .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?,
             ));
         }
+        let revision_fence = item.revision;
         let now = Utc::now();
         let prior_item = item.clone();
         let prior_attempts = self
@@ -11167,6 +11365,26 @@ impl OrchStore {
             candidate_verification: None,
         });
         item.bump();
+        let managed_intents = self
+            .list_managed_intents_unlocked()?
+            .into_iter()
+            .filter(|intent| intent.work_id == work_id && intent.grok.is_some())
+            .collect::<Vec<_>>();
+        pre_commit(&managed_intents)?;
+        let fresh = self
+            .load_work_item_unlocked(work_id)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
+            .ok_or_else(|| OrchError::new(OrchErrorCode::Conflict, "work item not found"))?;
+        if fresh.revision != revision_fence {
+            return Err(OrchError::new(
+                OrchErrorCode::StaleVersion,
+                format!(
+                    "work item revision is {}, expected {}",
+                    fresh.revision, revision_fence
+                ),
+            ));
+        }
+        Self::require_work_revision(&fresh, expected_revision)?;
         self.commit_lifecycle_with_request_unlocked(
             "cancel",
             prior_item,
