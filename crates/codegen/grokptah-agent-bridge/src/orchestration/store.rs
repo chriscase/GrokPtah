@@ -8085,12 +8085,7 @@ impl OrchStore {
         request_id: &str,
         payload_hash: &str,
     ) -> bool {
-        if self.bound_request_has_durable_recovery_intent(
-            scope,
-            tool,
-            request_id,
-            payload_hash,
-        ) {
+        if self.bound_request_has_durable_recovery_intent(scope, tool, request_id, payload_hash) {
             return true;
         }
         if self.ledger_admission_closed().is_none() {
@@ -8395,9 +8390,7 @@ impl OrchStore {
             .get("nativeExecutor")
             .map(|value| serde_json::from_value(value.clone()))
             .transpose()
-            .map_err(|_| {
-                related_creation_conflict("prune recovery nativeExecutor is malformed")
-            })?;
+            .map_err(|_| related_creation_conflict("prune recovery nativeExecutor is malformed"))?;
         let operation = if !messages.is_empty() {
             "tick"
         } else if work_items.is_empty() {
@@ -8472,10 +8465,9 @@ impl OrchStore {
             let (sealed_binding, sealed_response) =
                 self.validate_ledger_admission_recovery_marker_unlocked(&marker)?;
             let intent = if intent_path.is_file() {
-                let intent =
-                    ManagerIntent::decode(&fs::read(&intent_path).map_err(|error| {
-                        OrchError::new(OrchErrorCode::Internal, error.to_string())
-                    })?)?;
+                let intent = ManagerIntent::decode(&fs::read(&intent_path).map_err(|error| {
+                    OrchError::new(OrchErrorCode::Internal, error.to_string())
+                })?)?;
                 match intent {
                     ManagerIntent::Mutation(intent) => intent,
                     ManagerIntent::Creation(_) => {

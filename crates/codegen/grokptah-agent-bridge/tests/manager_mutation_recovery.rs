@@ -1447,14 +1447,14 @@ fn manager_post_commit_prune_refuses_altered_committed_effects() {
     std::env::remove_var("MANAGER_MUTATION_PHASE");
     let store = OrchStore::open(root.path().join("home/ledger")).unwrap();
     assert!(store.ledger_admission_closed().is_some());
-    assert!(
-        root.path()
-            .join("home/ledger/ledger-admission-recovery.json")
-            .is_file()
-    );
+    assert!(root
+        .path()
+        .join("home/ledger/ledger-admission-recovery.json")
+        .is_file());
     assert_eq!(receipt(root.path())["status"], "pending");
 }
 
+#[test]
 fn manager_post_commit_prune_refuses_tampered_marker_without_intent() {
     let root = tempfile::tempdir().unwrap();
     write(
@@ -1473,39 +1473,31 @@ fn manager_post_commit_prune_refuses_tampered_marker_without_intent() {
     std::fs::remove_file(&intent_paths[0]).unwrap();
     let marker = read(marker_path.clone());
     let cases: Vec<(&str, Value)> = vec![
-        (
-            "altered-response",
-            {
-                let mut tampered = marker.clone();
-                tampered["sealedResponse"]["plan"]["revision"] =
-                    json!(tampered["sealedResponse"]["plan"]["revision"].as_u64().unwrap() + 99);
-                tampered
-            },
-        ),
-        (
-            "altered-identity",
-            {
-                let mut tampered = marker.clone();
-                tampered["sealedBinding"]["ownerId"] = json!("foreign-owner");
-                tampered
-            },
-        ),
-        (
-            "absent-sealed-binding",
-            {
-                let mut tampered = marker.clone();
-                tampered.as_object_mut().unwrap().remove("sealedBinding");
-                tampered
-            },
-        ),
-        (
-            "absent-sealed-response",
-            {
-                let mut tampered = marker.clone();
-                tampered.as_object_mut().unwrap().remove("sealedResponse");
-                tampered
-            },
-        ),
+        ("altered-response", {
+            let mut tampered = marker.clone();
+            tampered["sealedResponse"]["plan"]["revision"] = json!(
+                tampered["sealedResponse"]["plan"]["revision"]
+                    .as_u64()
+                    .unwrap()
+                    + 99
+            );
+            tampered
+        }),
+        ("altered-identity", {
+            let mut tampered = marker.clone();
+            tampered["sealedBinding"]["ownerId"] = json!("foreign-owner");
+            tampered
+        }),
+        ("absent-sealed-binding", {
+            let mut tampered = marker.clone();
+            tampered.as_object_mut().unwrap().remove("sealedBinding");
+            tampered
+        }),
+        ("absent-sealed-response", {
+            let mut tampered = marker.clone();
+            tampered.as_object_mut().unwrap().remove("sealedResponse");
+            tampered
+        }),
     ];
     for (label, tampered) in cases {
         let case_root = tempfile::tempdir().unwrap();
