@@ -1139,6 +1139,20 @@ struct IdempotencyRequestScopeBinding {
 
 const IDEMPOTENCY_REQUEST_SCOPE_BINDING_SCHEMA_VERSION: u32 = 1;
 
+fn idempotency_request_identity_conflict() -> OrchError {
+    OrchError::new(
+        OrchErrorCode::Conflict,
+        "request_id reused with different payload",
+    )
+}
+
+fn idempotency_scope_binding_invalid() -> OrchError {
+    OrchError::new(
+        OrchErrorCode::Conflict,
+        "idempotency scope binding is invalid",
+    )
+}
+
 impl WorkRequestBinding {
     /// Copy the scope the service already authenticated. The digest stays the
     /// one `IdempotencyScope` computed. Callers do not supply it.
@@ -2096,6 +2110,7 @@ impl OrchStore {
             workspace_display: request.workspace_display.clone(),
             payload_workspace: request.payload_workspace.clone(),
         };
+        Self::validated_scope_binding_shard(&binding)?;
         let path =
             self.idempotency_request_scope_binding_path(&request.owner_id, &request.request_id)?;
         atomic_write_json(&self.lease(), &path, &binding)
@@ -2119,7 +2134,68 @@ impl OrchStore {
         if binding.schema_version != IDEMPOTENCY_REQUEST_SCOPE_BINDING_SCHEMA_VERSION {
             return Ok(None);
         }
+        if binding.owner_id != owner_id || binding.request_id != request_id {
+            return Err(idempotency_scope_binding_invalid());
+        }
         Ok(Some(binding))
+    }
+
+    fn validated_scope_binding_shard(
+        binding: &IdempotencyRequestScopeBinding,
+    ) -> Result<IdempotencyScope, OrchError> {
+        let bound_scope = IdempotencyScope::new(
+            &binding.owner_id,
+            binding.session_id,
+            Path::new(&binding.workspace_display),
+        )?;
+        if bound_scope.workspace_digest != binding.workspace_digest {
+            return Err(idempotency_scope_binding_invalid());
+        }
+        Ok(bound_scope)
+    }
+
+    fn owner_has_idempotency_receipt_for_request_unlocked(
+        &self,
+        owner_id: &str,
+        request_id: &str,
+    ) -> Result<bool, OrchError> {
+        let owner_scope = IdempotencyScope::new(owner_id, Uuid::nil(), Path::new("/"))?;
+        let owner_dir = self
+            .inner
+            .root
+            .join("idempotency")
+            .join("v2")
+            .join(owner_scope.owner_path_digest());
+        for path in owner_receipt_files(&owner_dir)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
+        {
+            let Ok(text) = fs::read_to_string(&path) else {
+                continue;
+            };
+            let Ok(receipt) = serde_json::from_str::<IdempotencyReceipt>(&text) else {
+                continue;
+            };
+            if receipt.owner_id == owner_id && receipt.request_id == request_id {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    fn remove_orphan_idempotency_scope_binding_unlocked(
+        &self,
+        owner_id: &str,
+        request_id: &str,
+    ) -> Result<(), OrchError> {
+        if self.owner_has_idempotency_receipt_for_request_unlocked(owner_id, request_id)? {
+            return Ok(());
+        }
+        let path = self.idempotency_request_scope_binding_path(owner_id, request_id)?;
+        if path.is_file() {
+            remove_file_durable(&self.lease(), &path)
+                .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        }
+        Ok(())
     }
 
     fn idemp_path(&self, scope: &IdempotencyScope, request_id: &str) -> Result<PathBuf, OrchError> {
@@ -2232,9 +2308,19 @@ impl OrchStore {
             }
         }
         eligible.sort_by_key(|(_, created_at)| *created_at);
-        if let Some((path, _)) = eligible.first() {
+        if let Some((path, _created_at)) = eligible.first() {
+            let request_id = fs::read_to_string(path)
+                .ok()
+                .and_then(|text| serde_json::from_str::<IdempotencyReceipt>(&text).ok())
+                .map(|receipt| receipt.request_id);
             remove_file_durable(&self.lease(), path)
                 .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+            if let Some(request_id) = request_id {
+                self.remove_orphan_idempotency_scope_binding_unlocked(
+                    &scope.owner_id,
+                    &request_id,
+                )?;
+            }
         }
         Ok(())
     }
@@ -13036,17 +13122,14 @@ impl OrchStore {
         if let Some(binding) =
             self.load_idempotency_request_scope_binding_unlocked(&scope.owner_id, request_id)?
         {
-            if binding.session_id == scope.session_id
-                && binding.request_id == request_id
-                && binding.tool == tool
-                && binding.payload_hash == payload_hash
-                && workspaces_match(&binding.workspace_display, claimed_canonical_workspace)
-            {
-                let bound_scope = IdempotencyScope::new(
-                    &binding.owner_id,
-                    binding.session_id,
-                    Path::new(&binding.workspace_display),
-                )?;
+            if binding.session_id != scope.session_id {
+                return Err(idempotency_scope_binding_invalid());
+            }
+            if binding.tool != tool || binding.payload_hash != payload_hash {
+                return Err(idempotency_request_identity_conflict());
+            }
+            if workspaces_match(&binding.workspace_display, claimed_canonical_workspace) {
+                let bound_scope = Self::validated_scope_binding_shard(&binding)?;
                 if bound_scope.workspace_digest != scope.workspace_digest {
                     let receipt_path = self.idemp_path(&bound_scope, request_id)?;
                     if receipt_path.is_file() {
@@ -13080,10 +13163,11 @@ impl OrchStore {
                 if request.owner_id != scope.owner_id
                     || request.session_id != scope.session_id
                     || request.request_id != request_id
-                    || request.tool != tool
-                    || request.payload_hash != payload_hash
                 {
                     continue;
+                }
+                if request.tool != tool || request.payload_hash != payload_hash {
+                    return Err(idempotency_request_identity_conflict());
                 }
                 if !workspaces_match(&request.workspace_display, claimed_canonical_workspace) {
                     continue;
@@ -13119,10 +13203,13 @@ impl OrchStore {
             if receipt.owner_id != scope.owner_id
                 || receipt.session_id != scope.session_id
                 || receipt.request_id != request_id
-                || receipt.tool != tool
-                || receipt.payload_hash != payload_hash
-                || receipt.workspace_digest == scope.workspace_digest
             {
+                continue;
+            }
+            if receipt.tool != tool || receipt.payload_hash != payload_hash {
+                return Err(idempotency_request_identity_conflict());
+            }
+            if receipt.workspace_digest == scope.workspace_digest {
                 continue;
             }
             let alias_workspace = receipt
@@ -13150,6 +13237,75 @@ impl OrchStore {
             return Ok(Some((receipt_path, bound_scope)));
         }
         Ok(None)
+    }
+
+    fn reject_idempotency_identity_reuse_unlocked(
+        &self,
+        scope: &IdempotencyScope,
+        tool: &str,
+        request_id: &str,
+        payload_hash: &str,
+    ) -> Result<(), OrchError> {
+        if let Some(binding) =
+            self.load_idempotency_request_scope_binding_unlocked(&scope.owner_id, request_id)?
+        {
+            if binding.session_id == scope.session_id
+                && (binding.tool != tool || binding.payload_hash != payload_hash)
+            {
+                return Err(idempotency_request_identity_conflict());
+            }
+        }
+        let dir = self.inner.root.join("work-lifecycle-intents");
+        if dir.is_dir() {
+            for entry in fs::read_dir(&dir)
+                .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
+            {
+                let path = entry
+                    .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
+                    .path();
+                if path.extension().and_then(|value| value.to_str()) != Some("json") {
+                    continue;
+                }
+                let intent: WorkLifecycleIntent =
+                    serde_json::from_str(&fs::read_to_string(&path).map_err(|error| {
+                        OrchError::new(OrchErrorCode::Internal, error.to_string())
+                    })?)
+                    .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+                let Some(request) = intent.request.as_ref() else {
+                    continue;
+                };
+                if request.owner_id == scope.owner_id
+                    && request.session_id == scope.session_id
+                    && request.request_id == request_id
+                    && (request.tool != tool || request.payload_hash != payload_hash)
+                {
+                    return Err(idempotency_request_identity_conflict());
+                }
+            }
+        }
+        let owner_dir = self
+            .inner
+            .root
+            .join("idempotency")
+            .join("v2")
+            .join(scope.owner_path_digest());
+        for receipt_path in owner_receipt_files(&owner_dir)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
+        {
+            let receipt: IdempotencyReceipt = serde_json::from_str(
+                &fs::read_to_string(&receipt_path)
+                    .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?,
+            )
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+            if receipt.owner_id == scope.owner_id
+                && receipt.session_id == scope.session_id
+                && receipt.request_id == request_id
+                && (receipt.tool != tool || receipt.payload_hash != payload_hash)
+            {
+                return Err(idempotency_request_identity_conflict());
+            }
+        }
+        Ok(())
     }
 
     /// Atomically claim a request_id for mutation.
@@ -13248,6 +13404,8 @@ impl OrchStore {
                 "principal idempotency receipt capacity is exhausted",
             ));
         }
+
+        self.reject_idempotency_identity_reuse_unlocked(scope, tool, request_id, payload_hash)?;
 
         let pending = IdempotencyReceipt {
             schema_version: IDEMPOTENCY_RECEIPT_SCHEMA_VERSION,
@@ -15416,6 +15574,152 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn idempotency_scope_binding_rejects_tampered_owner_redirect() {
+        let dir = tempdir().unwrap();
+        let store = OrchStore::open(dir.path()).unwrap();
+        let scope =
+            IdempotencyScope::new("owner-a", Uuid::nil(), Path::new("/tmp/workspace-a")).unwrap();
+        let binding_path = store
+            .idempotency_request_scope_binding_path("owner-a", "shared-request")
+            .unwrap();
+        fs::create_dir_all(binding_path.parent().unwrap()).unwrap();
+        let tampered = serde_json::json!({
+            "schemaVersion": 1,
+            "ownerId": "owner-b",
+            "sessionId": Uuid::nil(),
+            "requestId": "shared-request",
+            "tool": "ptah_create_work",
+            "payloadHash": "hash-a",
+            "workspaceDigest": scope.workspace_digest,
+            "workspaceDisplay": "/tmp/workspace-a",
+        });
+        fs::write(binding_path, serde_json::to_vec_pretty(&tampered).unwrap()).unwrap();
+        let claim_scope =
+            IdempotencyScope::new("owner-a", Uuid::nil(), Path::new("/tmp/workspace-b")).unwrap();
+        let error = store
+            .claim_idempotency(
+                &claim_scope,
+                "ptah_create_work",
+                "shared-request",
+                "hash-a",
+                Some("/tmp/workspace-a"),
+            )
+            .unwrap_err();
+        assert_eq!(error.code, OrchErrorCode::Conflict);
+        assert!(error.message.contains("scope binding"));
+    }
+
+    #[test]
+    fn idempotency_alias_rejects_changed_payload_for_same_request() {
+        let dir = tempdir().unwrap();
+        let sealed = dir.path().join("workspace");
+        fs::create_dir_all(&sealed).unwrap();
+        let sealed_scope = IdempotencyScope::new("owner-a", Uuid::nil(), &sealed).unwrap();
+        let claim_scope = IdempotencyScope::new(
+            "owner-a",
+            Uuid::nil(),
+            Path::new("/tmp/foreign-idempotency-scope-spelling"),
+        )
+        .unwrap();
+        let store = OrchStore::open(dir.path()).unwrap();
+        let binding = WorkRequestBinding::bound(
+            &sealed_scope,
+            sealed.display().to_string(),
+            "shared-request",
+            "ptah_create_work",
+            "hash-a",
+            "work_attempts",
+        );
+        store
+            .persist_idempotency_request_scope_binding_unlocked(&binding)
+            .unwrap();
+        store
+            .claim_idempotency(
+                &sealed_scope,
+                "ptah_create_work",
+                "shared-request",
+                "hash-a",
+                None,
+            )
+            .unwrap();
+        store
+            .complete_idempotency(
+                &sealed_scope,
+                "ptah_create_work",
+                "shared-request",
+                "hash-a",
+                None,
+                serde_json::json!({"work": {"workId": "work-1", "workspace": sealed}}),
+            )
+            .unwrap();
+        let error = store
+            .claim_idempotency(
+                &claim_scope,
+                "ptah_create_work",
+                "shared-request",
+                "hash-b",
+                Some(sealed.to_str().unwrap()),
+            )
+            .unwrap_err();
+        assert_eq!(error.code, OrchErrorCode::Conflict);
+        assert!(error.message.contains("different payload"));
+        assert!(matches!(
+            store
+                .claim_idempotency(
+                    &claim_scope,
+                    "ptah_create_work",
+                    "shared-request",
+                    "hash-b",
+                    None,
+                )
+                .unwrap_err()
+                .code,
+            OrchErrorCode::Conflict
+        ));
+    }
+
+    #[test]
+    fn idempotency_scope_binding_is_pruned_with_terminal_receipt() {
+        let dir = tempdir().unwrap();
+        let workspace = dir.path().join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+        let scope = IdempotencyScope::new("owner-a", Uuid::nil(), &workspace).unwrap();
+        let store = OrchStore::open(dir.path().join("ledger")).unwrap();
+        let workspace_display = workspace.display().to_string();
+        let binding = WorkRequestBinding::bound(
+            &scope,
+            workspace_display,
+            "prune-binding",
+            "tool",
+            "hash",
+            "work_attempts",
+        );
+        store
+            .persist_idempotency_request_scope_binding_unlocked(&binding)
+            .unwrap();
+        store
+            .claim_idempotency(&scope, "tool", "prune-binding", "hash", None)
+            .unwrap();
+        store
+            .complete_idempotency(
+                &scope,
+                "tool",
+                "prune-binding",
+                "hash",
+                None,
+                serde_json::json!({"ok": true}),
+            )
+            .unwrap();
+        let binding_path = store
+            .idempotency_request_scope_binding_path(&scope.owner_id, "prune-binding")
+            .unwrap();
+        assert!(binding_path.is_file());
+        store.prune_one_owner_receipt_unlocked(&scope).unwrap();
+        assert!(!store.idemp_path(&scope, "prune-binding").unwrap().is_file());
+        assert!(!binding_path.is_file());
     }
 
     fn json_paths(dir: &Path) -> Vec<PathBuf> {
