@@ -15,8 +15,10 @@ run_logged() {
   local name="$1"
   shift
   summary "=== $name: $* ==="
+  set +e
   "$@" >"$LOGDIR/$name.log" 2>&1
   local ec=$?
+  set -e
   summary "$name EXIT=$ec"
   sha256sum "$LOGDIR/$name.log" >>"$LOGDIR/sha256sums.txt"
   return "$ec"
@@ -27,7 +29,8 @@ run_logged() {
 
 run_logged fmt-check cargo fmt --check
 run_logged clippy-all-targets cargo clippy --locked --all-targets -- -D warnings
-run_logged focused-prune-recovery cargo test --locked --test manager_mutation_recovery manager_post_commit_prune pre_intent_manager_process_death_has_no_mutation_effect -- --test-threads=1
+run_logged focused-prune-recovery cargo test --locked --test manager_mutation_recovery manager_post_commit_prune -- --test-threads=1
+run_logged focused-pre-intent-death cargo test --locked --test manager_mutation_recovery pre_intent_manager_process_death_has_no_mutation_effect -- --test-threads=1
 run_logged focused-585 cargo test --locked --test work_creation_recovery legacy_schema2_585_producer_cut_reopens_on_candidate -- --test-threads=1
 run_logged cargo-test-threads1 cargo test --locked -- --test-threads=1
 run_logged cargo-check-release-cached cargo check --locked --release

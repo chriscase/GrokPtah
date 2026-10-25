@@ -65,6 +65,16 @@ pub struct ManagedChildPolicy {
     pub(crate) max_output_tokens: u32,
 }
 
+impl ManagedChildPolicy {
+    fn validate_loopback_endpoint(&self) -> Result<(), &'static str> {
+        let expected = format!("http://127.0.0.1:{}/v1", self.port);
+        if self.endpoint != expected {
+            return Err("managed relay endpoint does not match its loopback port");
+        }
+        Ok(())
+    }
+}
+
 /// Stable categories contain no upstream prose, request bodies or credentials.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -774,6 +784,7 @@ impl ManagedProviderRelay {
             max_turns: MAX_REQUESTS,
             max_output_tokens: MAX_OUTPUT_TOKENS,
         };
+        policy.validate_loopback_endpoint()?;
         let state = Arc::new(RelayState {
             backend,
             credentials,
@@ -2369,6 +2380,10 @@ fn validate_completion(
 }
 
 #[cfg(test)]
+#[path = "managed_provider_offline_fixtures.rs"]
+mod offline_fixtures;
+
+#[cfg(all(test, target_os = "macos"))]
 #[path = "managed_provider_offline_tests.rs"]
 mod offline_tests;
 
@@ -3461,7 +3476,7 @@ mod tests {
         if backend == ManagedBackend::ChatCompletions {
             stream("settled handoff turn")
         } else {
-            offline_tests::responses_turn(
+            offline_fixtures::responses_turn(
                 0,
                 false,
                 json!({"input_tokens":100,"output_tokens":10,"total_tokens":110,"input_tokens_details":{"cached_tokens":20},"output_tokens_details":{"reasoning_tokens":5}}),
