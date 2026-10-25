@@ -8379,7 +8379,6 @@ impl OrchStore {
         match intent.request.as_ref().map(|request| request.tool.as_str()) {
             Some("ptah_apply_verified_change") => false,
             Some("ptah_discard_verified_change") => intent.operation == "discard-candidate",
-            Some("ptah_cancel_work") => false,
             _ => true,
         }
     }
