@@ -2024,6 +2024,9 @@ impl OrchStore {
         store.recover_managed_finalization_intents()?;
         store.mark_unfinished_interrupted()?;
         store.fail_orphaned_idempotency_claims()?;
+        store
+            .sweep_orphan_idempotency_scope_bindings_unlocked()
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
         store.reconcile_workloads()?;
         // Cleanup is best-effort at the record level, but directory access
         // failures still surface so a broken ledger cannot look healthy.
@@ -2182,18 +2185,70 @@ impl OrchStore {
         Ok(false)
     }
 
-    fn remove_orphan_idempotency_scope_binding_unlocked(
+    fn remove_idempotency_scope_binding_unlocked(
         &self,
         owner_id: &str,
         request_id: &str,
     ) -> Result<(), OrchError> {
-        if self.owner_has_idempotency_receipt_for_request_unlocked(owner_id, request_id)? {
-            return Ok(());
-        }
         let path = self.idempotency_request_scope_binding_path(owner_id, request_id)?;
         if path.is_file() {
+            crate::verified_change::fail_durable_write_if_armed(&path)
+                .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
             remove_file_durable(&self.lease(), &path)
                 .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        }
+        Ok(())
+    }
+
+    fn sweep_orphan_idempotency_scope_bindings_unlocked(&self) -> Result<(), OrchError> {
+        let owners_root = self.inner.root.join("idempotency").join("v2");
+        if !owners_root.is_dir() {
+            return Ok(());
+        }
+        for owner_entry in fs::read_dir(&owners_root)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
+        {
+            let owner_dir = owner_entry
+                .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
+                .path();
+            if !owner_dir.is_dir() {
+                continue;
+            }
+            let scopes_dir = owner_dir.join("request-scopes");
+            if !scopes_dir.is_dir() {
+                continue;
+            }
+            let mut removed = 0usize;
+            for entry in fs::read_dir(&scopes_dir)
+                .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
+            {
+                if removed >= MAX_IDEMPOTENCY_RECEIPTS_PER_OWNER {
+                    break;
+                }
+                let path = entry
+                    .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
+                    .path();
+                if !path.is_file() {
+                    continue;
+                }
+                let binding: IdempotencyRequestScopeBinding =
+                    serde_json::from_str(&fs::read_to_string(&path).map_err(|error| {
+                        OrchError::new(OrchErrorCode::Internal, error.to_string())
+                    })?)
+                    .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+                if binding.schema_version != IDEMPOTENCY_REQUEST_SCOPE_BINDING_SCHEMA_VERSION {
+                    continue;
+                }
+                if self.owner_has_idempotency_receipt_for_request_unlocked(
+                    &binding.owner_id,
+                    &binding.request_id,
+                )? {
+                    continue;
+                }
+                remove_file_durable(&self.lease(), &path)
+                    .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+                removed += 1;
+            }
         }
         Ok(())
     }
@@ -2309,18 +2364,17 @@ impl OrchStore {
         }
         eligible.sort_by_key(|(_, created_at)| *created_at);
         if let Some((path, _created_at)) = eligible.first() {
-            let request_id = fs::read_to_string(path)
+            let receipt = fs::read_to_string(path)
                 .ok()
-                .and_then(|text| serde_json::from_str::<IdempotencyReceipt>(&text).ok())
-                .map(|receipt| receipt.request_id);
-            remove_file_durable(&self.lease(), path)
-                .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
-            if let Some(request_id) = request_id {
-                self.remove_orphan_idempotency_scope_binding_unlocked(
-                    &scope.owner_id,
-                    &request_id,
+                .and_then(|text| serde_json::from_str::<IdempotencyReceipt>(&text).ok());
+            if let Some(receipt) = receipt {
+                self.remove_idempotency_scope_binding_unlocked(
+                    &receipt.owner_id,
+                    &receipt.request_id,
                 )?;
             }
+            remove_file_durable(&self.lease(), path)
+                .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
         }
         Ok(())
     }
@@ -13125,10 +13179,15 @@ impl OrchStore {
             if binding.session_id != scope.session_id {
                 return Err(idempotency_scope_binding_invalid());
             }
-            if binding.tool != tool || binding.payload_hash != payload_hash {
-                return Err(idempotency_request_identity_conflict());
-            }
-            if workspaces_match(&binding.workspace_display, claimed_canonical_workspace) {
+            if idempotency_scope_binding_matches_claim_scope(
+                scope,
+                Some(claimed_canonical_workspace),
+                &binding.workspace_display,
+                &binding.workspace_digest,
+            ) {
+                if binding.tool != tool || binding.payload_hash != payload_hash {
+                    return Err(idempotency_request_identity_conflict());
+                }
                 let bound_scope = Self::validated_scope_binding_shard(&binding)?;
                 if bound_scope.workspace_digest != scope.workspace_digest {
                     let receipt_path = self.idemp_path(&bound_scope, request_id)?;
@@ -13166,11 +13225,11 @@ impl OrchStore {
                 {
                     continue;
                 }
-                if request.tool != tool || request.payload_hash != payload_hash {
-                    return Err(idempotency_request_identity_conflict());
-                }
                 if !workspaces_match(&request.workspace_display, claimed_canonical_workspace) {
                     continue;
+                }
+                if request.tool != tool || request.payload_hash != payload_hash {
+                    return Err(idempotency_request_identity_conflict());
                 }
                 let bound_scope = IdempotencyScope::new(
                     &request.owner_id,
@@ -13206,12 +13265,6 @@ impl OrchStore {
             {
                 continue;
             }
-            if receipt.tool != tool || receipt.payload_hash != payload_hash {
-                return Err(idempotency_request_identity_conflict());
-            }
-            if receipt.workspace_digest == scope.workspace_digest {
-                continue;
-            }
             let alias_workspace = receipt
                 .response
                 .get("work")
@@ -13223,6 +13276,20 @@ impl OrchStore {
                         .flatten()
                         .map(|item| item.workspace)
                 });
+            if !idempotency_receipt_matches_claim_scope(
+                scope,
+                Some(claimed_canonical_workspace),
+                &receipt.workspace_digest,
+                alias_workspace.as_deref(),
+            ) {
+                continue;
+            }
+            if receipt.tool != tool || receipt.payload_hash != payload_hash {
+                return Err(idempotency_request_identity_conflict());
+            }
+            if receipt.workspace_digest == scope.workspace_digest {
+                continue;
+            }
             let Some(alias_workspace) = alias_workspace else {
                 continue;
             };
@@ -13245,11 +13312,18 @@ impl OrchStore {
         tool: &str,
         request_id: &str,
         payload_hash: &str,
+        claimed_canonical_workspace: Option<&str>,
     ) -> Result<(), OrchError> {
         if let Some(binding) =
             self.load_idempotency_request_scope_binding_unlocked(&scope.owner_id, request_id)?
         {
             if binding.session_id == scope.session_id
+                && idempotency_scope_binding_matches_claim_scope(
+                    scope,
+                    claimed_canonical_workspace,
+                    &binding.workspace_display,
+                    &binding.workspace_digest,
+                )
                 && (binding.tool != tool || binding.payload_hash != payload_hash)
             {
                 return Err(idempotency_request_identity_conflict());
@@ -13274,11 +13348,21 @@ impl OrchStore {
                 let Some(request) = intent.request.as_ref() else {
                     continue;
                 };
-                if request.owner_id == scope.owner_id
-                    && request.session_id == scope.session_id
-                    && request.request_id == request_id
-                    && (request.tool != tool || request.payload_hash != payload_hash)
+                if request.owner_id != scope.owner_id
+                    || request.session_id != scope.session_id
+                    || request.request_id != request_id
                 {
+                    continue;
+                }
+                if !idempotency_scope_binding_matches_claim_scope(
+                    scope,
+                    claimed_canonical_workspace,
+                    &request.workspace_display,
+                    &request.workspace_digest,
+                ) {
+                    continue;
+                }
+                if request.tool != tool || request.payload_hash != payload_hash {
                     return Err(idempotency_request_identity_conflict());
                 }
             }
@@ -13297,11 +13381,32 @@ impl OrchStore {
                     .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?,
             )
             .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
-            if receipt.owner_id == scope.owner_id
-                && receipt.session_id == scope.session_id
-                && receipt.request_id == request_id
-                && (receipt.tool != tool || receipt.payload_hash != payload_hash)
+            if receipt.owner_id != scope.owner_id
+                || receipt.session_id != scope.session_id
+                || receipt.request_id != request_id
             {
+                continue;
+            }
+            let alias_workspace = receipt
+                .response
+                .get("work")
+                .and_then(|work| work.get("workId"))
+                .and_then(|value| value.as_str())
+                .and_then(|work_id| {
+                    self.load_work_item_unlocked(work_id)
+                        .ok()
+                        .flatten()
+                        .map(|item| item.workspace)
+                });
+            if !idempotency_receipt_matches_claim_scope(
+                scope,
+                claimed_canonical_workspace,
+                &receipt.workspace_digest,
+                alias_workspace.as_deref(),
+            ) {
+                continue;
+            }
+            if receipt.tool != tool || receipt.payload_hash != payload_hash {
                 return Err(idempotency_request_identity_conflict());
             }
         }
@@ -13405,7 +13510,13 @@ impl OrchStore {
             ));
         }
 
-        self.reject_idempotency_identity_reuse_unlocked(scope, tool, request_id, payload_hash)?;
+        self.reject_idempotency_identity_reuse_unlocked(
+            scope,
+            tool,
+            request_id,
+            payload_hash,
+            claimed_canonical_workspace,
+        )?;
 
         let pending = IdempotencyReceipt {
             schema_version: IDEMPOTENCY_RECEIPT_SCHEMA_VERSION,
@@ -14037,6 +14148,36 @@ pub(crate) fn workspaces_match(left: &str, right: &str) -> bool {
     }
     match (dunce::canonicalize(left), dunce::canonicalize(right)) {
         (Ok(left), Ok(right)) => left == right,
+        _ => false,
+    }
+}
+
+fn idempotency_scope_binding_matches_claim_scope(
+    scope: &IdempotencyScope,
+    claimed_canonical_workspace: Option<&str>,
+    workspace_display: &str,
+    workspace_digest: &str,
+) -> bool {
+    if workspace_digest == scope.workspace_digest {
+        return true;
+    }
+    if let Some(claimed) = claimed_canonical_workspace {
+        return workspaces_match(workspace_display, claimed);
+    }
+    false
+}
+
+fn idempotency_receipt_matches_claim_scope(
+    scope: &IdempotencyScope,
+    claimed_canonical_workspace: Option<&str>,
+    receipt_workspace_digest: &str,
+    alias_workspace_display: Option<&str>,
+) -> bool {
+    if receipt_workspace_digest == scope.workspace_digest {
+        return true;
+    }
+    match (claimed_canonical_workspace, alias_workspace_display) {
+        (Some(claimed), Some(display)) => workspaces_match(display, claimed),
         _ => false,
     }
 }
@@ -15675,9 +15816,8 @@ mod tests {
                     "hash-b",
                     None,
                 )
-                .unwrap_err()
-                .code,
-            OrchErrorCode::Conflict
+                .unwrap(),
+            IdempotencyClaim::Perform
         ));
     }
 
@@ -15720,6 +15860,95 @@ mod tests {
         store.prune_one_owner_receipt_unlocked(&scope).unwrap();
         assert!(!store.idemp_path(&scope, "prune-binding").unwrap().is_file());
         assert!(!binding_path.is_file());
+    }
+
+    #[test]
+    fn open_sweeps_stranded_idempotency_scope_bindings_after_receipt_loss() {
+        let dir = tempdir().unwrap();
+        let workspace = dir.path().join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+        let scope = IdempotencyScope::new("owner-a", Uuid::nil(), &workspace).unwrap();
+        let ledger = dir.path().join("ledger");
+        let store = OrchStore::open(&ledger).unwrap();
+        let binding = WorkRequestBinding::bound(
+            &scope,
+            workspace.display().to_string(),
+            "stranded-binding",
+            "tool",
+            "hash",
+            "work_attempts",
+        );
+        store
+            .persist_idempotency_request_scope_binding_unlocked(&binding)
+            .unwrap();
+        store
+            .claim_idempotency(&scope, "tool", "stranded-binding", "hash", None)
+            .unwrap();
+        store
+            .complete_idempotency(
+                &scope,
+                "tool",
+                "stranded-binding",
+                "hash",
+                None,
+                serde_json::json!({"ok": true}),
+            )
+            .unwrap();
+        let binding_path = store
+            .idempotency_request_scope_binding_path(&scope.owner_id, "stranded-binding")
+            .unwrap();
+        let receipt_path = store.idemp_path(&scope, "stranded-binding").unwrap();
+        assert!(binding_path.is_file());
+        fs::remove_file(receipt_path).unwrap();
+        drop(store);
+        let _store = OrchStore::open(&ledger).unwrap();
+        assert!(!binding_path.is_file());
+    }
+
+    #[test]
+    fn prune_does_not_remove_receipt_when_scope_binding_removal_fails() {
+        let dir = tempdir().unwrap();
+        let workspace = dir.path().join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+        let scope = IdempotencyScope::new("owner-a", Uuid::nil(), &workspace).unwrap();
+        let store = OrchStore::open(dir.path().join("ledger")).unwrap();
+        let binding = WorkRequestBinding::bound(
+            &scope,
+            workspace.display().to_string(),
+            "fault-binding",
+            "tool",
+            "hash",
+            "work_attempts",
+        );
+        store
+            .persist_idempotency_request_scope_binding_unlocked(&binding)
+            .unwrap();
+        store
+            .claim_idempotency(&scope, "tool", "fault-binding", "hash", None)
+            .unwrap();
+        store
+            .complete_idempotency(
+                &scope,
+                "tool",
+                "fault-binding",
+                "hash",
+                None,
+                serde_json::json!({"ok": true}),
+            )
+            .unwrap();
+        let binding_path = store
+            .idempotency_request_scope_binding_path(&scope.owner_id, "fault-binding")
+            .unwrap();
+        let receipt_path = store.idemp_path(&scope, "fault-binding").unwrap();
+        *crate::verified_change::DURABLE_WRITE_FAULT.lock().unwrap() =
+            Some(crate::DurableWriteFault {
+                needle: "request-scopes",
+                skips_remaining: 0,
+            });
+        assert!(store.prune_one_owner_receipt_unlocked(&scope).is_err());
+        assert!(receipt_path.is_file());
+        assert!(binding_path.is_file());
+        *crate::verified_change::DURABLE_WRITE_FAULT.lock().unwrap() = None;
     }
 
     fn json_paths(dir: &Path) -> Vec<PathBuf> {
