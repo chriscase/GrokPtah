@@ -842,9 +842,10 @@ fn delete_created_child_and_seed_orphan_attempt(root: &Path) {
         "synthetic-orphan-lease",
     );
     attempt.validate().unwrap();
-    let attempt_path = root
-        .join("home/ledger/work-attempts")
-        .join(format!("{}.json", safe_id_filename(&attempt.attempt_id).unwrap()));
+    let attempt_path = root.join("home/ledger/work-attempts").join(format!(
+        "{}.json",
+        safe_id_filename(&attempt.attempt_id).unwrap()
+    ));
     write(&attempt_path, &json!(attempt));
 }
 
@@ -860,9 +861,8 @@ fn assert_refused_prune_recovery_preserves_evidence(root: &Path, expected_receip
     let _guard = common::ProcessEnvGuard::new();
     set_grokptah_home_override(Some(root.join("home")));
     std::env::remove_var("MANAGER_MUTATION_PHASE");
-    match OrchStore::open(root.join("home/ledger")) {
-        Ok(store) => assert!(store.ledger_admission_closed().is_some()),
-        Err(_) => {}
+    if let Ok(store) = OrchStore::open(root.join("home/ledger")) {
+        assert!(store.ledger_admission_closed().is_some());
     }
     assert_eq!(disk_json(root), before);
     assert_eq!(receipt(root)["status"], expected_receipt_status);
@@ -1891,7 +1891,8 @@ fn manager_post_commit_prune_refusal_missing_notification_foreign_agent_preserve
 }
 
 #[test]
-fn manager_post_commit_prune_refusal_missing_child_orphan_attempt_preserves_evidence_intent_present() {
+fn manager_post_commit_prune_refusal_missing_child_orphan_attempt_preserves_evidence_intent_present(
+) {
     let root = prune_advance_prune_fault_root();
     delete_created_child_and_seed_orphan_attempt(root.path());
     assert_refused_prune_recovery_preserves_evidence(root.path(), "complete");
