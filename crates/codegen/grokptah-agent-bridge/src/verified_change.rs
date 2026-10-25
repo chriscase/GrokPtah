@@ -1538,17 +1538,18 @@ pub static DURABLE_WRITE_FAULT: std::sync::Mutex<Option<DurableWriteFault>> =
 pub static PRUNE_REMOVE_FAULT: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+#[cfg(debug_assertions)]
 pub(crate) fn prune_remove_fault_armed() -> bool {
-    if !cfg!(debug_assertions) {
-        return false;
-    }
     PRUNE_REMOVE_FAULT.load(std::sync::atomic::Ordering::SeqCst)
 }
 
+#[cfg(not(debug_assertions))]
+pub(crate) fn prune_remove_fault_armed() -> bool {
+    false
+}
+
+#[cfg(debug_assertions)]
 pub(crate) fn fail_durable_write_if_armed(path: &std::path::Path) -> anyhow::Result<()> {
-    if !cfg!(debug_assertions) {
-        return Ok(());
-    }
     let mut guard = DURABLE_WRITE_FAULT
         .lock()
         .unwrap_or_else(|error| error.into_inner());
@@ -1564,6 +1565,11 @@ pub(crate) fn fail_durable_write_if_armed(path: &std::path::Path) -> anyhow::Res
     }
     *guard = None;
     anyhow::bail!("injected durable write failure");
+}
+
+#[cfg(not(debug_assertions))]
+pub(crate) fn fail_durable_write_if_armed(_path: &std::path::Path) -> anyhow::Result<()> {
+    Ok(())
 }
 
 pub(crate) struct PromotionRecord {

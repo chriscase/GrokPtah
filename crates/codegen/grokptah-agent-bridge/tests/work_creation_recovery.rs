@@ -638,6 +638,61 @@ fn aliased_substituted_creation_digest_refuses_recovery() {
 }
 
 #[test]
+fn substituted_both_digests_with_untouched_receipt_refuses_recovery() {
+    let (root, _workspace) = aliased_creation_crash_fixture("lifecycle_after_intent");
+    let path = intent_paths(root.path()).remove(0);
+    let mut intent = read_json(&path);
+    intent["item"]["objective"] = json!("changed after seal");
+    intent["creationItemDigest"] = json!(hash_payload(&intent["item"]));
+    let request = &intent["request"];
+    let caller_payload = json!({
+        "sessionId": request["sessionId"],
+        "workspace": request["workspaceDisplay"],
+        "kind": intent["item"]["kind"],
+        "objective": intent["item"]["objective"],
+        "priority": intent["item"]["priority"],
+        "deadline": intent["item"]["deadline"],
+        "parentWorkId": intent["item"]["parentWorkId"],
+        "dependencies": intent["item"]["dependencies"],
+        "policy": intent["item"]["policy"],
+    });
+    intent["creationRequestDigest"] = json!(hash_payload(&caller_payload));
+    write_json(&path, &intent);
+    let receipt = read_json(receipt_path(root.path()));
+    assert_ne!(
+        intent["creationRequestDigest"],
+        receipt["payloadHash"],
+        "receipt must remain bound to the original caller hash"
+    );
+    for _ in 0..3 {
+        assert!(
+            OrchStore::open(root.path().join("ledger")).is_err(),
+            "recomputed digests must not bypass the sealed receipt hash"
+        );
+        assert!(records(&root.path().join("ledger/work-items")).is_empty());
+    }
+}
+
+#[test]
+fn legacy_schema2_creation_intent_without_request_digest_reopens() {
+    let root = tempfile::tempdir().unwrap();
+    assert_exit(&child(root.path(), "create", "lifecycle_after_intent"), 86);
+    let path = intent_paths(root.path()).remove(0);
+    let mut intent = read_json(&path);
+    intent.as_object_mut().unwrap().remove("creationRequestDigest");
+    write_json(&path, &intent);
+    for reopen in 0..3 {
+        assert_exit(&child(root.path(), "replay", ""), 0);
+        let outcome = read_json(root.path().join("outcome.json"));
+        assert!(
+            outcome.get("response").is_some(),
+            "legacy schema-2 reopen {reopen}: {outcome}"
+        );
+        assert_eq!(read_json(receipt_path(root.path()))["status"], "complete");
+    }
+}
+
+#[test]
 fn committed_creation_replays_the_original_request_after_process_death() {
     let root = tempfile::tempdir().unwrap();
     assert_exit(&child(root.path(), "create", "create_after_item"), 86);

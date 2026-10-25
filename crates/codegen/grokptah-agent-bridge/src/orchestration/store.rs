@@ -1973,6 +1973,9 @@ impl OrchStore {
         store.recover_agent_activation_intents()?;
         store.recover_finalization_intents()?;
         store.recover_routine_intents()?;
+        store.load_ledger_reconciliation_marker()?;
+        store.load_ledger_admission_recovery_marker()?;
+        store.maybe_finalize_post_commit_prune_recovery()?;
         store.recover_manager_creation_intents()?;
         // An absent-prior creation must exist before a dependent update is
         // recovered, and before pending receipts are classified as orphaned.
@@ -1982,9 +1985,6 @@ impl OrchStore {
         store.recover_apply_admissions()?;
         store.recover_apply_source_intents()?;
         store.recover_managed_finalization_intents()?;
-        store.load_ledger_reconciliation_marker()?;
-        store.load_ledger_admission_recovery_marker()?;
-        store.maybe_finalize_post_commit_prune_recovery()?;
         store.mark_unfinished_interrupted()?;
         store.fail_orphaned_idempotency_claims()?;
         store.reconcile_workloads()?;
@@ -2884,7 +2884,7 @@ impl OrchStore {
             prior_item: None,
             item: item.clone(),
             creation_item_digest: Some(Self::work_digest(item)?),
-            creation_request_digest: Some(Self::creation_request_payload_hash(&request, item)?),
+            creation_request_digest: Some(request.payload_hash.clone()),
             prior_attempts: Vec::new(),
             attempts: Vec::new(),
             request: Some(request),
@@ -3938,16 +3938,15 @@ impl OrchStore {
             .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))
     }
 
-    fn creation_request_payload_hash(
+    /// Caller-visible create payload (schema-2 / #585). Excludes server-assigned
+    /// work identity fields so recovery matches the original idempotency hash.
+    fn legacy_creation_request_payload_hash_from_item(
         request: &WorkRequestBinding,
         item: &WorkItem,
     ) -> Result<String, OrchError> {
         let payload = serde_json::json!({
             "sessionId": request.session_id,
             "workspace": request.payload_workspace_for_hash(),
-            "workId": item.work_id,
-            "createdBy": item.created_by,
-            "createdAt": item.created_at,
             "kind": item.kind,
             "objective": item.objective,
             "priority": item.priority,
@@ -4147,22 +4146,22 @@ impl OrchStore {
             .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
         if intent.prior_item.is_none() {
             let request = intent.request.as_ref().expect("validated creation request");
-            let sealed_request_digest = Self::creation_request_payload_hash(request, &intent.item)?;
-            if intent
-                .creation_request_digest
-                .as_deref()
-                .is_some_and(|digest| digest != sealed_request_digest)
-            {
-                return Err(related_creation_conflict(
-                    "creation request digest does not match sealed work inputs",
-                ));
-            }
-            if intent.creation_request_digest.is_none()
-                && sealed_request_digest != request.payload_hash
-            {
-                return Err(related_creation_conflict(
-                    "creation receipt does not match sealed work inputs",
-                ));
+            if let Some(sealed) = intent.creation_request_digest.as_deref() {
+                if sealed != request.payload_hash.as_str() {
+                    return Err(related_creation_conflict(
+                        "creation request digest does not match the authenticated receipt hash",
+                    ));
+                }
+            } else {
+                let legacy = Self::legacy_creation_request_payload_hash_from_item(
+                    request,
+                    &intent.item,
+                )?;
+                if legacy != request.payload_hash {
+                    return Err(related_creation_conflict(
+                        "creation receipt does not match sealed caller inputs",
+                    ));
+                }
             }
             let receipt = self.inspect_canonical_request_receipt_unlocked(request)?;
             let response = lifecycle_response_value(intent)?;
@@ -8229,18 +8228,9 @@ impl OrchStore {
         *self.inner.last_run_error.lock() = Some(message);
     }
 
-    fn should_finalize_post_commit_prune_seal() -> bool {
-        if !cfg!(debug_assertions) {
-            return false;
-        }
-        matches!(
-            std::env::var("MANAGER_MUTATION_PHASE"),
-            Ok(phase) if phase == "replay" || phase.starts_with("reopen")
-        )
-    }
-
     fn maybe_finalize_post_commit_prune_recovery(&self) -> Result<(), OrchError> {
-        if !Self::should_finalize_post_commit_prune_seal() {
+        let path = self.inner.root.join("ledger-admission-recovery.json");
+        if !path.is_file() {
             return Ok(());
         }
         self.finalize_post_commit_prune_recovery_unlocked()
@@ -8281,11 +8271,15 @@ impl OrchStore {
             intent.request.as_ref().map(|request| &request.binding),
             &intent.response(),
         )?;
+        if let Err(error) = self.prune_messages_unlocked() {
+            self.note_work_recovery_required(error);
+            return Ok(());
+        }
         self.clear_related_intent_unlocked(&intent_path)?;
-        self.prune_messages_unlocked()?;
         remove_file_durable(&self.lease(), &path)
             .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
         *self.inner.ledger_admission_closed.lock() = None;
+        *self.inner.last_run_error.lock() = None;
         Ok(())
     }
 
