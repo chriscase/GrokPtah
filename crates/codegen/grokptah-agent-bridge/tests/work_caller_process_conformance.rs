@@ -74,19 +74,62 @@ fn paths(dir: &Path) -> Vec<PathBuf> {
     result.sort();
     result
 }
-fn receipt_path(root: &Path) -> PathBuf {
+fn is_canonical_idempotency_receipt_path(path: &Path) -> bool {
+    if path
+        .components()
+        .any(|part| part.as_os_str() == "request-scopes")
+    {
+        return false;
+    }
+    let Some(parent) = path.parent() else {
+        return false;
+    };
+    if parent
+        .file_name()
+        .is_some_and(|name| name == "request-scopes")
+    {
+        return false;
+    }
+    if !path.components().any(|part| part.as_os_str() == "v2") {
+        return false;
+    }
+    let Ok(bytes) = std::fs::read(path) else {
+        return false;
+    };
+    let Ok(value) = serde_json::from_slice::<Value>(&bytes) else {
+        return false;
+    };
+    // Scope bindings share the request filename but are not receipts.
+    value.get("status").is_some()
+}
+
+fn canonical_idempotency_receipt_paths(root: &Path) -> Vec<PathBuf> {
     let name = format!("{}.json", safe_id_filename(REQUEST).unwrap());
-    walkdir::WalkDir::new(root.join("home/ledger/idempotency"))
+    let mut matches = walkdir::WalkDir::new(root.join("home/ledger/idempotency"))
         .into_iter()
         .filter_map(Result::ok)
-        .find(|entry| {
+        .filter(|entry| entry.file_type().is_file())
+        .filter(|entry| {
             entry
                 .path()
                 .file_name()
                 .is_some_and(|file| file == name.as_str())
         })
-        .unwrap()
-        .into_path()
+        .filter(|entry| is_canonical_idempotency_receipt_path(entry.path()))
+        .map(|entry| entry.into_path())
+        .collect::<Vec<_>>();
+    matches.sort();
+    matches
+}
+
+fn receipt_path(root: &Path) -> PathBuf {
+    let matches = canonical_idempotency_receipt_paths(root);
+    assert_eq!(
+        matches.len(),
+        1,
+        "expected exactly one canonical idempotency receipt for {REQUEST}, found: {matches:?}"
+    );
+    matches[0].clone()
 }
 fn receipt(root: &Path) -> Value {
     read(receipt_path(root))
