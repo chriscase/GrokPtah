@@ -1120,6 +1120,25 @@ pub struct WorkRequestBinding {
     pub expected_revision: Option<u64>,
 }
 
+/// Idempotency binding/receipt lifecycle (v2 owner shards):
+///
+/// - **Create / bind:** work-lifecycle and bound-request completion persist
+///   `request-scopes/<request>.json` (one owner+request binding) and a scoped
+///   receipt under `idempotency/v2/<owner>/<workspace_digest>/<request>.json`.
+///   Multiple workspace digests may each hold a receipt for the same request id;
+///   they share the single binding file when lifecycle code last sealed it.
+/// - **Alias / replay:** `claim_idempotency` checks the binding first (workspace
+///   match, then tool/payload), then intents, then owner-wide receipt scans.
+///   Cross-spelling alias needs the binding and/or a producer receipt shard.
+/// - **Prune:** capacity pressure removes one terminal, inactive receipt per
+///   owner shard. The receipt file is removed first; the binding is removed only
+///   when no receipt remains for that owner+request id.
+/// - **Sweep (open):** drops bindings with no receipts; **reconcile (open):**
+///   rebuilds a missing binding from surviving terminal receipts (manager/routine
+///   paths without `response.work.workId` included).
+/// - **Crash points:** receipt-before-binding prune ordering plus open reconcile
+///   recover from a legacy binding-first crash that left receipts without bindings.
+///
 /// Durable workspace scope for an idempotent request. Survives creation-intent
 /// cleanup so alias replay can find the producer-bound receipt shard.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -2025,6 +2044,9 @@ impl OrchStore {
         store.mark_unfinished_interrupted()?;
         store.fail_orphaned_idempotency_claims()?;
         store
+            .reconcile_idempotency_scope_bindings_from_receipts_unlocked()
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        store
             .sweep_orphan_idempotency_scope_bindings_unlocked()
             .map_err(|error| anyhow::anyhow!(error.to_string()))?;
         store.reconcile_workloads()?;
@@ -2183,6 +2205,132 @@ impl OrchStore {
             }
         }
         Ok(false)
+    }
+
+    fn idempotency_workspace_display_from_receipt_unlocked(
+        &self,
+        receipt: &IdempotencyReceipt,
+    ) -> Option<String> {
+        if let Some(workspace) = receipt
+            .response
+            .get("workspace")
+            .and_then(|value| value.as_str())
+        {
+            return Some(workspace.to_string());
+        }
+        if let Some(workspace) = receipt
+            .response
+            .pointer("/work/workspace")
+            .and_then(|value| value.as_str())
+        {
+            return Some(workspace.to_string());
+        }
+        if let Some(plan_id) = receipt
+            .response
+            .pointer("/plan/planId")
+            .and_then(|value| value.as_str())
+        {
+            if let Ok(Some(plan)) = self.load_manager_plan_unlocked(plan_id) {
+                return Some(plan.workspace.clone());
+            }
+        }
+        if let Some(routine_id) = receipt
+            .response
+            .get("routineId")
+            .and_then(|value| value.as_str())
+        {
+            if let Ok(Some(routine)) = self.load_routine_unlocked(routine_id) {
+                return Some(routine.workspace.clone());
+            }
+        }
+        if let Some(work_id) = receipt
+            .response
+            .pointer("/work/workId")
+            .and_then(|value| value.as_str())
+        {
+            if let Ok(Some(item)) = self.load_work_item_unlocked(work_id) {
+                return Some(item.workspace.clone());
+            }
+        }
+        None
+    }
+
+    fn reconcile_idempotency_scope_bindings_from_receipts_unlocked(&self) -> Result<(), OrchError> {
+        let owners_root = self.inner.root.join("idempotency").join("v2");
+        if !owners_root.is_dir() {
+            return Ok(());
+        }
+        for owner_entry in fs::read_dir(&owners_root)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
+        {
+            let owner_dir = owner_entry
+                .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
+                .path();
+            if !owner_dir.is_dir() {
+                continue;
+            }
+            let mut repaired = 0usize;
+            for receipt_path in owner_receipt_files(&owner_dir)
+                .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
+            {
+                if repaired >= MAX_IDEMPOTENCY_RECEIPTS_PER_OWNER {
+                    break;
+                }
+                let Ok(text) = fs::read_to_string(&receipt_path) else {
+                    continue;
+                };
+                let Ok(receipt) = serde_json::from_str::<IdempotencyReceipt>(&text) else {
+                    continue;
+                };
+                if !matches!(receipt.status.as_str(), "complete" | "failed") {
+                    continue;
+                }
+                if self
+                    .load_idempotency_request_scope_binding_unlocked(
+                        &receipt.owner_id,
+                        &receipt.request_id,
+                    )?
+                    .is_some()
+                {
+                    continue;
+                }
+                let Some(workspace_display) =
+                    self.idempotency_workspace_display_from_receipt_unlocked(&receipt)
+                else {
+                    continue;
+                };
+                let binding = IdempotencyRequestScopeBinding {
+                    schema_version: IDEMPOTENCY_REQUEST_SCOPE_BINDING_SCHEMA_VERSION,
+                    owner_id: receipt.owner_id.clone(),
+                    session_id: receipt.session_id,
+                    request_id: receipt.request_id.clone(),
+                    tool: receipt.tool.clone(),
+                    payload_hash: receipt.payload_hash.clone(),
+                    workspace_digest: receipt.workspace_digest.clone(),
+                    workspace_display,
+                    payload_workspace: String::new(),
+                };
+                if Self::validated_scope_binding_shard(&binding).is_err() {
+                    continue;
+                }
+                self.persist_idempotency_request_scope_binding_unlocked(&WorkRequestBinding {
+                    request_id: binding.request_id.clone(),
+                    owner_id: binding.owner_id.clone(),
+                    tool: binding.tool.clone(),
+                    session_id: binding.session_id,
+                    workspace_digest: binding.workspace_digest.clone(),
+                    workspace_display: binding.workspace_display.clone(),
+                    payload_workspace: binding.payload_workspace.clone(),
+                    payload_hash: binding.payload_hash.clone(),
+                    shape: String::new(),
+                    target_work_id: None,
+                    target_attempt_id: None,
+                    expected_revision: None,
+                })?;
+                repaired += 1;
+            }
+        }
+        Ok(())
     }
 
     fn remove_idempotency_scope_binding_unlocked(
@@ -2367,15 +2515,44 @@ impl OrchStore {
             let receipt = fs::read_to_string(path)
                 .ok()
                 .and_then(|text| serde_json::from_str::<IdempotencyReceipt>(&text).ok());
-            if let Some(receipt) = receipt {
-                self.remove_idempotency_scope_binding_unlocked(
-                    &receipt.owner_id,
-                    &receipt.request_id,
-                )?;
-            }
+            crate::verified_change::fail_durable_write_if_armed(path)
+                .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
             remove_file_durable(&self.lease(), path)
                 .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+            crash_process_if_stage("idempotency_prune_after_receipt_remove");
+            if let Some(receipt) = receipt {
+                if !self.owner_has_idempotency_receipt_for_request_unlocked(
+                    &receipt.owner_id,
+                    &receipt.request_id,
+                )? {
+                    crash_process_if_stage("idempotency_prune_before_binding_remove");
+                    self.remove_idempotency_scope_binding_unlocked(
+                        &receipt.owner_id,
+                        &receipt.request_id,
+                    )?;
+                    crash_process_if_stage("idempotency_prune_after_binding_remove");
+                }
+            }
         }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn simulate_legacy_prune_binding_before_receipt_crash_unlocked(
+        &self,
+        scope: &IdempotencyScope,
+        request_id: &str,
+    ) -> Result<(), OrchError> {
+        let path = self.idemp_path(scope, request_id)?;
+        let receipt = fs::read_to_string(&path)
+            .ok()
+            .and_then(|text| serde_json::from_str::<IdempotencyReceipt>(&text).ok());
+        if let Some(receipt) = receipt {
+            self.remove_idempotency_scope_binding_unlocked(&receipt.owner_id, &receipt.request_id)?;
+        }
+        crash_process_if_stage("idempotency_prune_binding_before_receipt_legacy");
+        remove_file_durable(&self.lease(), &path)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
         Ok(())
     }
 
@@ -15942,15 +16119,293 @@ mod tests {
             .idempotency_request_scope_binding_path(&scope.owner_id, "fault-binding")
             .unwrap();
         let receipt_path = store.idemp_path(&scope, "fault-binding").unwrap();
+        let receipt_needle = {
+            let safe = crate::orchestration::types::safe_id_filename("fault-binding").unwrap();
+            Box::leak(safe.into_boxed_str())
+        };
         *crate::verified_change::DURABLE_WRITE_FAULT.lock().unwrap() =
             Some(crate::DurableWriteFault {
-                needle: "request-scopes",
+                needle: receipt_needle,
+                skips_remaining: 0,
+            });
+        assert!(
+            crate::verified_change::fail_durable_write_if_armed(&receipt_path).is_err(),
+            "fault injection must arm on the receipt path"
+        );
+        *crate::verified_change::DURABLE_WRITE_FAULT.lock().unwrap() =
+            Some(crate::DurableWriteFault {
+                needle: receipt_needle,
                 skips_remaining: 0,
             });
         assert!(store.prune_one_owner_receipt_unlocked(&scope).is_err());
         assert!(receipt_path.is_file());
         assert!(binding_path.is_file());
         *crate::verified_change::DURABLE_WRITE_FAULT.lock().unwrap() = None;
+    }
+
+    #[test]
+    fn prune_does_not_remove_scope_binding_while_sibling_workspace_receipt_survives() {
+        let dir = tempdir().unwrap();
+        let workspace_a = dir.path().join("workspace-a");
+        let workspace_b = dir.path().join("workspace-b");
+        fs::create_dir_all(&workspace_a).unwrap();
+        fs::create_dir_all(&workspace_b).unwrap();
+        #[cfg(unix)]
+        let alias_b = dir.path().join("alias-b");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&workspace_b, &alias_b).unwrap();
+        #[cfg(not(unix))]
+        return;
+        let sealed_b = crate::orchestration::authz::canonical_workspace(&workspace_b).unwrap();
+        let scope_a = IdempotencyScope::new("owner-a", Uuid::nil(), &workspace_a).unwrap();
+        let scope_b = IdempotencyScope::new("owner-a", Uuid::nil(), &workspace_b).unwrap();
+        let claim_scope_b = IdempotencyScope::new(
+            "owner-a",
+            Uuid::nil(),
+            Path::new("/tmp/foreign-prune-sibling-scope"),
+        )
+        .unwrap();
+        let store = OrchStore::open(dir.path()).unwrap();
+        let binding = WorkRequestBinding::bound(
+            &scope_a,
+            workspace_a.display().to_string(),
+            "shared-prune",
+            "ptah_create_work",
+            "hash-a",
+            "work_attempts",
+        );
+        store
+            .persist_idempotency_request_scope_binding_unlocked(&binding)
+            .unwrap();
+        store
+            .claim_idempotency(&scope_a, "ptah_create_work", "shared-prune", "hash-a", None)
+            .unwrap();
+        store
+            .complete_idempotency(
+                &scope_a,
+                "ptah_create_work",
+                "shared-prune",
+                "hash-a",
+                None,
+                serde_json::json!({"work": {"workId": "work-a", "workspace": workspace_a}}),
+            )
+            .unwrap();
+        let receipt_a_path = store.idemp_path(&scope_a, "shared-prune").unwrap();
+        let receipt_a = serde_json::from_str::<IdempotencyReceipt>(
+            &fs::read_to_string(&receipt_a_path).unwrap(),
+        )
+        .unwrap();
+        store
+            .save_idempotency(&IdempotencyReceipt {
+                created_at: Utc::now() - Duration::days(40),
+                ..receipt_a
+            })
+            .unwrap();
+        store
+            .claim_idempotency(&scope_b, "ptah_create_work", "shared-prune", "hash-b", None)
+            .unwrap();
+        store
+            .complete_idempotency(
+                &scope_b,
+                "ptah_create_work",
+                "shared-prune",
+                "hash-b",
+                None,
+                serde_json::json!({"work": {"workId": "work-b", "workspace": workspace_b}}),
+            )
+            .unwrap();
+        let binding_path = store
+            .idempotency_request_scope_binding_path(&scope_a.owner_id, "shared-prune")
+            .unwrap();
+        store.prune_one_owner_receipt_unlocked(&scope_a).unwrap();
+        assert!(!receipt_a_path.is_file());
+        assert!(store
+            .idemp_path(&scope_b, "shared-prune")
+            .unwrap()
+            .is_file());
+        assert!(binding_path.is_file());
+        let work_b = WorkItem::new_at(
+            "triage",
+            "sibling workspace work",
+            Uuid::nil(),
+            workspace_b.display().to_string(),
+            "owner-a",
+            Default::default(),
+            Utc::now(),
+        )
+        .unwrap();
+        let mut work_b = work_b;
+        work_b.work_id = "work-b".into();
+        store.save_work_item(&work_b).unwrap();
+        match store
+            .claim_idempotency(
+                &claim_scope_b,
+                "ptah_create_work",
+                "shared-prune",
+                "hash-b",
+                Some(sealed_b.to_str().unwrap()),
+            )
+            .unwrap()
+        {
+            IdempotencyClaim::Replay(Ok(value)) => {
+                assert_eq!(value["work"]["workId"], "work-b");
+            }
+            other => panic!("expected sibling workspace alias replay: {other:?}"),
+        }
+        match store
+            .claim_idempotency(&scope_b, "ptah_create_work", "shared-prune", "hash-b", None)
+            .unwrap()
+        {
+            IdempotencyClaim::Replay(Ok(value)) => {
+                assert_eq!(value["work"]["workId"], "work-b");
+            }
+            other => panic!("expected sibling workspace shard replay: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn idempotency_retention_crash_child() {
+        let Ok(root) = std::env::var("IDEMPOTENCY_RETENTION_CHILD_ROOT") else {
+            return;
+        };
+        let phase = std::env::var("IDEMPOTENCY_RETENTION_CHILD_PHASE").unwrap();
+        let ledger = PathBuf::from(root);
+        let store = OrchStore::open(&ledger).unwrap();
+        if phase == "legacy_prune_crash" {
+            let workspace = ledger.parent().expect("ledger directory").join("workspace");
+            let scope = IdempotencyScope::new("owner-a", Uuid::nil(), &workspace).unwrap();
+            store
+                .simulate_legacy_prune_binding_before_receipt_crash_unlocked(
+                    &scope,
+                    "manager-routine-replay",
+                )
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn reopen_repairs_binding_after_legacy_prune_crash_and_manager_alias_replays() {
+        use crate::orchestration::manager::{ManagerPlan, ManagerStepSpec};
+        use std::process::Command;
+
+        let dir = tempdir().unwrap();
+        let workspace = dir.path().join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+        #[cfg(unix)]
+        let alias = dir.path().join("alias");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&workspace, &alias).unwrap();
+        #[cfg(not(unix))]
+        return;
+        let sealed = crate::orchestration::authz::canonical_workspace(&workspace).unwrap();
+        let scope = IdempotencyScope::new("owner-a", Uuid::nil(), &workspace).unwrap();
+        let claim_scope = IdempotencyScope::new(
+            "owner-a",
+            Uuid::nil(),
+            Path::new("/tmp/foreign-manager-idempotency-scope"),
+        )
+        .unwrap();
+        let ledger = dir.path().join("ledger");
+        let store = OrchStore::open(&ledger).unwrap();
+        let now = Utc::now();
+        let plan = ManagerPlan::new(
+            Uuid::nil(),
+            sealed.display().to_string(),
+            "manager-agent",
+            "objective",
+            "root-work",
+            vec![ManagerStepSpec {
+                step_id: "step-1".into(),
+                objective: "do".into(),
+                kind: "work".into(),
+                priority: 0,
+                dependencies: vec![],
+                assigned_agent_id: None,
+                policy: WorkPolicy::default(),
+            }],
+            1,
+            1,
+            now,
+        )
+        .unwrap();
+        store.save_manager_plan(&plan).unwrap();
+        let binding = WorkRequestBinding::bound(
+            &scope,
+            sealed.display().to_string(),
+            "manager-routine-replay",
+            "ptah_create_manager_plan",
+            "manager-hash",
+            "work_attempts",
+        );
+        store
+            .persist_idempotency_request_scope_binding_unlocked(&binding)
+            .unwrap();
+        store
+            .claim_idempotency(
+                &scope,
+                "ptah_create_manager_plan",
+                "manager-routine-replay",
+                "manager-hash",
+                None,
+            )
+            .unwrap();
+        let response = serde_json::json!({"plan": {"planId": plan.plan_id}});
+        store
+            .complete_idempotency(
+                &scope,
+                "ptah_create_manager_plan",
+                "manager-routine-replay",
+                "manager-hash",
+                Some(plan.plan_id.clone()),
+                response.clone(),
+            )
+            .unwrap();
+        let binding_path = store
+            .idempotency_request_scope_binding_path(&scope.owner_id, "manager-routine-replay")
+            .unwrap();
+        let receipt_path = store.idemp_path(&scope, "manager-routine-replay").unwrap();
+        assert!(binding_path.is_file());
+        drop(store);
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "idempotency_retention_crash_child",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("IDEMPOTENCY_RETENTION_CHILD_ROOT", &ledger)
+            .env("IDEMPOTENCY_RETENTION_CHILD_PHASE", "legacy_prune_crash")
+            .env(
+                "GROKPTAH_CRASH_STAGE",
+                "idempotency_prune_binding_before_receipt_legacy",
+            )
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(86),
+            "stdout={}\nstderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!binding_path.is_file());
+        assert!(receipt_path.is_file());
+        let store = OrchStore::open(&ledger).unwrap();
+        assert!(binding_path.is_file());
+        match store
+            .claim_idempotency(
+                &claim_scope,
+                "ptah_create_manager_plan",
+                "manager-routine-replay",
+                "manager-hash",
+                Some(sealed.to_str().unwrap()),
+            )
+            .unwrap()
+        {
+            IdempotencyClaim::Replay(Ok(value)) => {
+                assert_eq!(value["plan"]["planId"], plan.plan_id);
+            }
+            other => panic!("expected manager alias replay after reopen repair: {other:?}"),
+        }
     }
 
     fn json_paths(dir: &Path) -> Vec<PathBuf> {
