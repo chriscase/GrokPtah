@@ -11886,8 +11886,7 @@ impl OrchStore {
             )?;
         }
         crash_process_if_stage("lifecycle_before_intent");
-        self.persist_work_lifecycle_intent_unlocked(&lifecycle_intent)
-            .map_err(|error| self.note_work_recovery_required(error))?;
+        self.persist_work_lifecycle_intent_unlocked(&lifecycle_intent)?;
         crash_process_if_stage("lifecycle_after_intent");
         crash_process_if_stage("cancel_after_intent");
         pre_commit(&managed_intents).map_err(|error| self.note_work_recovery_required(error))?;
