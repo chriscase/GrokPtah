@@ -3665,6 +3665,112 @@ impl OrchStore {
         )
     }
 
+    /// Post-commit prune recovery must not settle a pending receipt while
+    /// committed manager effects are still absent. Replay only transitions
+    /// that are missing, then require every sealed effect to be present.
+    fn replay_missing_manager_mutation_effects_unlocked(
+        &self,
+        intent: &ManagerMutationIntent,
+    ) -> Result<(), OrchError> {
+        let plan_path = self.manager_plan_path(&intent.plan.plan_id)?;
+        if !self.manager_record_transition_unlocked(
+            &plan_path,
+            Some(&intent.prior_plan),
+            &intent.plan,
+        )? {
+            self.save_manager_plan_unlocked(&intent.plan)?;
+        }
+        for write in &intent.work_writes {
+            let path = self.work_item_path(&write.item.work_id)?;
+            if !self.manager_record_transition_unlocked(&path, write.prior.as_ref(), &write.item)? {
+                self.write_work_item_unlocked(&write.item)
+                    .map_err(Self::orch_error_from_anyhow)?;
+            }
+        }
+        if let Some(sequence) = &intent.sequence {
+            let current = self.read_manager_sequence_unlocked()?;
+            if current != Some(sequence.next) {
+                if current != sequence.prior && current != Some(sequence.next) {
+                    return Err(related_creation_conflict(
+                        "manager message sequence has conflicting evidence",
+                    ));
+                }
+                atomic_write_bytes(
+                    &self.lease(),
+                    &self.inner.root.join("messages/seq"),
+                    sequence.next.to_string().as_bytes(),
+                )
+                .map_err(Self::orch_error_from_anyhow)?;
+            }
+        }
+        for write in &intent.message_writes {
+            let path = self.message_path(&write.message.message_id)?;
+            if !self.manager_record_transition_unlocked(
+                &path,
+                write.prior.as_ref(),
+                &write.message,
+            )? {
+                atomic_write_json(&self.lease(), &path, &write.message)
+                    .map_err(Self::orch_error_from_anyhow)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn require_manager_mutation_committed_effects_unlocked(
+        &self,
+        intent: &ManagerMutationIntent,
+    ) -> Result<(), OrchError> {
+        let mut present = self.manager_record_transition_unlocked(
+            &self.manager_plan_path(&intent.plan.plan_id)?,
+            Some(&intent.prior_plan),
+            &intent.plan,
+        )?;
+        if !present {
+            return Err(related_creation_conflict(
+                "manager prune recovery is missing its committed plan",
+            ));
+        }
+        for write in &intent.work_writes {
+            present &= self.manager_record_transition_unlocked(
+                &self.work_item_path(&write.item.work_id)?,
+                write.prior.as_ref(),
+                &write.item,
+            )?;
+            if !present {
+                return Err(related_creation_conflict(
+                    "manager prune recovery is missing committed Work",
+                ));
+            }
+        }
+        for write in &intent.message_writes {
+            present &= self.manager_record_transition_unlocked(
+                &self.message_path(&write.message.message_id)?,
+                write.prior.as_ref(),
+                &write.message,
+            )?;
+            if !present {
+                return Err(related_creation_conflict(
+                    "manager prune recovery is missing committed notification",
+                ));
+            }
+        }
+        if let Some(sequence) = &intent.sequence {
+            let current = self.read_manager_sequence_unlocked()?;
+            if current != Some(sequence.next) {
+                return Err(related_creation_conflict(
+                    "manager prune recovery is missing committed message sequence",
+                ));
+            }
+        }
+        self.preflight_related_receipt_unlocked(
+            intent.request.as_ref(),
+            &intent.response(),
+            &intent.plan.plan_id,
+            true,
+        )
+    }
+
     fn commit_manager_mutation_unlocked(
         &self,
         intent: &ManagerMutationIntent,
@@ -8511,6 +8617,8 @@ impl OrchStore {
                 }
             }
             self.preflight_manager_mutation_unlocked(&intent)?;
+            self.replay_missing_manager_mutation_effects_unlocked(&intent)?;
+            self.require_manager_mutation_committed_effects_unlocked(&intent)?;
             self.complete_bound_request_unlocked(Some(&sealed_binding), &sealed_response)?;
             if let Err(error) = self.prune_messages_unlocked() {
                 self.note_work_recovery_required(error);

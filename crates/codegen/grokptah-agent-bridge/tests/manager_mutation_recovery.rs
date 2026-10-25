@@ -1,5 +1,7 @@
 //! Actual authenticated manager mutation callers, process death and replay.
 mod common;
+#[path = "common/copy_tree.rs"]
+mod copy_tree;
 
 use grokptah_agent_bridge::orchestration::{
     canonical_workspace, safe_id_filename, AuthContext, ManagerCoordinationMode, ManagerStepSpec,
@@ -1421,6 +1423,110 @@ fn manager_post_commit_prune_keeps_intent_when_prune_fails_again_on_reopen() {
 }
 
 #[test]
+fn manager_post_commit_prune_restores_deleted_notification_on_reopen() {
+    let root = tempfile::tempdir().unwrap();
+    write(
+        root.path().join("options.json"),
+        &json!({"seedMessages":500}),
+    );
+    exited(
+        &child(root.path(), "tick-message", "prune_remove_fault", ""),
+        0,
+    );
+    let outcome = read(root.path().join("prune_remove_fault.json"));
+    let expected_message = outcome["response"]["messages"][0].clone();
+    let message_id = expected_message["messageId"].as_str().unwrap();
+    let message_path = root
+        .path()
+        .join("home/ledger/messages")
+        .join(format!("{}.json", safe_id_filename(message_id).unwrap()));
+    assert!(message_path.is_file());
+    std::fs::remove_file(&message_path).unwrap();
+    assert!(!message_path.exists());
+    let _guard = common::ProcessEnvGuard::new();
+    set_grokptah_home_override(Some(root.path().join("home")));
+    std::env::remove_var("MANAGER_MUTATION_PHASE");
+    let store = OrchStore::open(root.path().join("home/ledger")).unwrap();
+    assert!(store.ledger_admission_closed().is_none());
+    assert!(!root
+        .path()
+        .join("home/ledger/ledger-admission-recovery.json")
+        .exists());
+    assert_eq!(receipt(root.path())["status"], "complete");
+    assert!(message_path.is_file());
+    assert_eq!(read(message_path), expected_message);
+}
+
+#[test]
+fn manager_post_commit_prune_restores_deleted_child_on_reopen() {
+    let root = tempfile::tempdir().unwrap();
+    write(
+        root.path().join("options.json"),
+        &json!({"seedMessages":500}),
+    );
+    exited(
+        &child(root.path(), "tick-message", "prune_remove_fault", ""),
+        0,
+    );
+    let work_path = paths(&root.path().join("home/ledger/work-items"))
+        .into_iter()
+        .find(|path| {
+            let item = read(path.as_path());
+            let kind = item["kind"].as_str().unwrap_or("");
+            kind != "manager-plan" && kind != "manager-decision"
+        })
+        .expect("manager tick must leave a child Work item on disk");
+    let expected_child = read(work_path.clone());
+    assert!(work_path.is_file());
+    std::fs::remove_file(&work_path).unwrap();
+    assert!(!work_path.exists());
+    let _guard = common::ProcessEnvGuard::new();
+    set_grokptah_home_override(Some(root.path().join("home")));
+    std::env::remove_var("MANAGER_MUTATION_PHASE");
+    let store = OrchStore::open(root.path().join("home/ledger")).unwrap();
+    assert!(store.ledger_admission_closed().is_none());
+    assert_eq!(receipt(root.path())["status"], "complete");
+    assert!(work_path.is_file());
+    assert_eq!(read(work_path), expected_child);
+}
+
+#[test]
+fn manager_post_commit_prune_marker_only_restores_deleted_notification_on_reopen() {
+    let root = tempfile::tempdir().unwrap();
+    write(
+        root.path().join("options.json"),
+        &json!({"seedMessages":500}),
+    );
+    exited(
+        &child(root.path(), "tick-message", "prune_remove_fault", ""),
+        0,
+    );
+    let outcome = read(root.path().join("prune_remove_fault.json"));
+    let expected_message = outcome["response"]["messages"][0].clone();
+    let message_id = expected_message["messageId"].as_str().unwrap();
+    let message_path = root
+        .path()
+        .join("home/ledger/messages")
+        .join(format!("{}.json", safe_id_filename(message_id).unwrap()));
+    let intent_paths = paths(&root.path().join("home/ledger/manager-intents"));
+    assert_eq!(intent_paths.len(), 1);
+    std::fs::remove_file(&intent_paths[0]).unwrap();
+    std::fs::remove_file(&message_path).unwrap();
+    assert!(root
+        .path()
+        .join("home/ledger/ledger-admission-recovery.json")
+        .is_file());
+    let _guard = common::ProcessEnvGuard::new();
+    set_grokptah_home_override(Some(root.path().join("home")));
+    std::env::remove_var("MANAGER_MUTATION_PHASE");
+    let store = OrchStore::open(root.path().join("home/ledger")).unwrap();
+    assert!(store.ledger_admission_closed().is_none());
+    assert_eq!(receipt(root.path())["status"], "complete");
+    assert!(message_path.is_file());
+    assert_eq!(read(message_path), expected_message);
+}
+
+#[test]
 fn manager_post_commit_prune_refuses_altered_committed_effects() {
     let root = tempfile::tempdir().unwrap();
     write(
@@ -1501,7 +1607,7 @@ fn manager_post_commit_prune_refuses_tampered_marker_without_intent() {
     ];
     for (label, tampered) in cases {
         let case_root = tempfile::tempdir().unwrap();
-        common::copy_dir_all(root.path(), case_root.path()).unwrap();
+        copy_tree::copy_dir_all(root.path(), case_root.path()).unwrap();
         let case_marker = case_root
             .path()
             .join("home/ledger/ledger-admission-recovery.json");

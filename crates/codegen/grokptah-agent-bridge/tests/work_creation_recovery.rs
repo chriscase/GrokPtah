@@ -1,5 +1,7 @@
 //! Production authenticated Work creation, process death and fresh-process replay.
 mod common;
+#[path = "common/copy_tree.rs"]
+mod copy_tree;
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -124,7 +126,10 @@ fn creation_service_child() {
                 host.session_inspect(id).expect("reload original session");
                 id
             };
-            host.session_set_cwd(session, &workspace).unwrap();
+            let invoke_workspace = std::env::var("WORK_CREATION_WORKSPACE_ALIAS")
+                .map(PathBuf::from)
+                .unwrap_or_else(|_| workspace.clone());
+            host.session_set_cwd(session, &invoke_workspace).unwrap();
             let store = OrchStore::open(root.join("ledger")).unwrap();
             if phase == "create" {
                 let count: usize = std::env::var("WORK_CREATION_SEED_COUNT")
@@ -139,13 +144,18 @@ fn creation_service_child() {
                     write_json(store.root().join("work-items").join(format!("{}.json", safe_id_filename(&item.work_id).unwrap())), &json!(item));
                 }
             }
+            let allowlist = if invoke_workspace == workspace {
+                WorkspaceAllowlist::new([workspace.clone()])
+            } else {
+                WorkspaceAllowlist::new([workspace.clone(), invoke_workspace.clone()])
+            };
             let orch = OrchestrationService::new(
                 host.clone(),
                 host.event_bus(),
                 store.clone(),
                 OrchestrationConfig {
                     bearer_token: BEARER.into(),
-                    allowlist: WorkspaceAllowlist::new([workspace.clone()]),
+                    allowlist,
                     max_concurrent_runs: 2,
                     bounds: RunBounds::default(),
                 },
@@ -173,9 +183,6 @@ fn creation_service_child() {
                     env.set("GROKPTAH_CRASH_STAGE", stage);
                 }
             }
-            let invoke_workspace = std::env::var("WORK_CREATION_WORKSPACE_ALIAS")
-                .map(PathBuf::from)
-                .unwrap_or_else(|_| workspace.clone());
             if phase == "create" && std::env::var("WORK_CREATION_WORKSPACE_ALIAS").is_ok() {
                 let stopped = orch.stop_background_tasks().await;
                 assert!(
@@ -692,8 +699,8 @@ fn legacy_schema2_585_producer_cut_reopens_on_candidate() {
         "producer bundle must be from exact #585 base"
     );
     let root = tempfile::tempdir().unwrap();
-    common::copy_dir_all(&bundle.join("ledger-tree"), &root.path().join("ledger")).unwrap();
-    common::copy_dir_all(&bundle.join("home-tree"), &root.path().join("home")).unwrap();
+    copy_tree::copy_dir_all(&bundle.join("ledger-tree"), &root.path().join("ledger")).unwrap();
+    copy_tree::copy_dir_all(&bundle.join("home-tree"), &root.path().join("home")).unwrap();
     std::fs::copy(
         bundle.join("fixture.json"),
         root.path().join("fixture.json"),
@@ -712,19 +719,67 @@ fn legacy_schema2_585_producer_cut_reopens_on_candidate() {
         actual, expected_sha,
         "receipt bytes must match preserved artifact"
     );
+    let fixture = read_json(root.path().join("fixture.json"));
+    let invoke_workspace = intent["request"]["workspaceDisplay"]
+        .as_str()
+        .expect("producer-bound request scope");
+    std::fs::create_dir_all(invoke_workspace).unwrap();
+    let original_work_id = intent["workId"].as_str().unwrap();
+    let original_objective = intent["item"]["objective"].as_str().unwrap();
     let anchored_payload_hash = receipt["payloadHash"].clone();
     let anchored_request_id = receipt["requestId"].clone();
+    let anchored_scope = json!({
+        "ownerId": receipt["ownerId"].clone(),
+        "sessionId": receipt["sessionId"].clone(),
+        "workspaceDigest": receipt["workspaceDigest"].clone(),
+        "tool": receipt["tool"].clone(),
+    });
     for reopen in 0..3 {
-        assert_exit(&child(root.path(), "replay", ""), 0);
+        assert_exit(
+            &child_with(
+                root.path(),
+                "replay",
+                "",
+                &[("WORK_CREATION_WORKSPACE_ALIAS", invoke_workspace)],
+            ),
+            0,
+        );
         let outcome = read_json(root.path().join("outcome.json"));
         assert!(
             outcome.get("response").is_some(),
             "legacy #585 reopen {reopen}: {outcome}"
         );
+        let work = &outcome["response"]["work"];
+        assert_eq!(work["workId"].as_str().unwrap(), original_work_id);
+        assert_eq!(work["objective"].as_str().unwrap(), original_objective);
+        assert_eq!(work["sessionId"], fixture["sessionId"]);
+        assert_eq!(work["createdBy"], fixture["ownerId"]);
         let settled = read_json(&receipt_file);
         assert_eq!(settled["status"], "complete");
         assert_eq!(settled["payloadHash"], anchored_payload_hash);
         assert_eq!(settled["requestId"], anchored_request_id);
+        assert_eq!(settled["ownerId"], anchored_scope["ownerId"]);
+        assert_eq!(settled["sessionId"], anchored_scope["sessionId"]);
+        assert_eq!(
+            settled["workspaceDigest"],
+            anchored_scope["workspaceDigest"]
+        );
+        assert_eq!(settled["tool"], anchored_scope["tool"]);
+        assert_eq!(records(&root.path().join("ledger/work-items")).len(), 1);
+        assert_eq!(
+            records(&root.path().join("ledger/work-items"))[0]["workId"],
+            original_work_id
+        );
+        let matching_receipts = json_paths(&root.path().join("ledger/idempotency"))
+            .into_iter()
+            .filter(|path| read_json(path)["requestId"] == REQUEST)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            matching_receipts.len(),
+            1,
+            "replay must not mint a second receipt for the original request"
+        );
+        assert_eq!(matching_receipts[0], receipt_file);
     }
 }
 
