@@ -3555,6 +3555,110 @@ impl OrchStore {
             .map_err(|_| related_creation_conflict("manager message sequence is malformed"))
     }
 
+    fn preflight_manager_mutation_observed_work_snapshots_unlocked(
+        &self,
+        intent: &ManagerMutationIntent,
+        allow_missing_committed_work: bool,
+    ) -> Result<(), OrchError> {
+        if let Some(observation) = &intent.observation {
+            for item in &observation.work_items {
+                let path = self.work_item_path(&item.work_id)?;
+                match self.related_record_matches_unlocked(&path, item)? {
+                    true => {}
+                    false
+                        if allow_missing_committed_work
+                            && intent
+                                .work_writes
+                                .iter()
+                                .any(|write| write.item.work_id == item.work_id) => {}
+                    false => {
+                        return Err(related_creation_conflict(
+                            "manager observation Work disappeared",
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Read-only transition checks for every sealed manager effect. Returns
+    /// whether every committed successor is already present. Conflicting on-disk
+    /// evidence is refused even when some effects are still absent.
+    fn preflight_manager_mutation_effect_transitions_unlocked(
+        &self,
+        intent: &ManagerMutationIntent,
+    ) -> Result<bool, OrchError> {
+        let mut present = self.manager_record_transition_unlocked(
+            &self.manager_plan_path(&intent.plan.plan_id)?,
+            Some(&intent.prior_plan),
+            &intent.plan,
+        )?;
+        for write in &intent.work_writes {
+            present &= self.manager_record_transition_unlocked(
+                &self.work_item_path(&write.item.work_id)?,
+                write.prior.as_ref(),
+                &write.item,
+            )?;
+            if write.prior.is_none()
+                && self.related_record_matches_unlocked(
+                    &self.work_item_path(&write.item.work_id)?,
+                    &write.item,
+                )?
+                && (!self
+                    .list_work_attempts_unlocked(Some(&write.item.work_id))
+                    .map_err(Self::orch_error_from_anyhow)?
+                    .is_empty()
+                    || !self
+                        .list_work_decisions_unlocked(&write.item.work_id)?
+                        .is_empty())
+            {
+                return Err(related_creation_conflict(
+                    "new manager Work has unexpected attempts or decisions",
+                ));
+            }
+        }
+        let items = intent
+            .work_writes
+            .iter()
+            .map(|write| write.item.clone())
+            .collect::<Vec<_>>();
+        self.validate_work_items_for_save_unlocked(&items)
+            .map_err(Self::orch_error_from_anyhow)?;
+        for write in &intent.message_writes {
+            present &= self.manager_record_transition_unlocked(
+                &self.message_path(&write.message.message_id)?,
+                write.prior.as_ref(),
+                &write.message,
+            )?;
+            if self.related_record_matches_unlocked(
+                &self.message_path(&write.message.message_id)?,
+                &write.message,
+            )? {
+                self.require_optional_agent_in_scope_unlocked(
+                    write.message.from_agent_id.as_deref(),
+                    write.message.session_id,
+                    &write.message.workspace,
+                )?;
+                self.require_optional_agent_in_scope_unlocked(
+                    write.message.to_agent_id.as_deref(),
+                    write.message.session_id,
+                    &write.message.workspace,
+                )?;
+            }
+        }
+        if let Some(sequence) = &intent.sequence {
+            let current = self.read_manager_sequence_unlocked()?;
+            if current != sequence.prior && current != Some(sequence.next) {
+                return Err(related_creation_conflict(
+                    "manager message sequence has conflicting evidence",
+                ));
+            }
+            present &= current == Some(sequence.next);
+        }
+        Ok(present)
+    }
+
     fn preflight_manager_mutation_observation_conflicts_unlocked(
         &self,
         intent: &ManagerMutationIntent,
@@ -3606,7 +3710,9 @@ impl OrchStore {
                 "manager mutation intent seal does not match its committed body",
             ));
         }
+        self.preflight_manager_mutation_observed_work_snapshots_unlocked(intent, true)?;
         self.preflight_manager_mutation_observation_conflicts_unlocked(intent)?;
+        self.preflight_manager_mutation_effect_transitions_unlocked(intent)?;
         let receipt = self.inspect_canonical_request_receipt_unlocked(sealed_binding)?;
         if receipt.status == "failed" || receipt.error.is_some() {
             return Err(related_creation_conflict(
@@ -3649,77 +3755,9 @@ impl OrchStore {
         intent: &ManagerMutationIntent,
     ) -> Result<(), OrchError> {
         intent.validate()?;
-        if let Some(observation) = &intent.observation {
-            for item in &observation.work_items {
-                if !self
-                    .related_record_matches_unlocked(&self.work_item_path(&item.work_id)?, item)?
-                {
-                    return Err(related_creation_conflict(
-                        "manager observation Work disappeared",
-                    ));
-                }
-            }
-            self.preflight_manager_mutation_observation_conflicts_unlocked(intent)?;
-        }
-
-        let mut present = self.manager_record_transition_unlocked(
-            &self.manager_plan_path(&intent.plan.plan_id)?,
-            Some(&intent.prior_plan),
-            &intent.plan,
-        )?;
-        for write in &intent.work_writes {
-            present &= self.manager_record_transition_unlocked(
-                &self.work_item_path(&write.item.work_id)?,
-                write.prior.as_ref(),
-                &write.item,
-            )?;
-            if write.prior.is_none()
-                && (!self
-                    .list_work_attempts_unlocked(Some(&write.item.work_id))
-                    .map_err(Self::orch_error_from_anyhow)?
-                    .is_empty()
-                    || !self
-                        .list_work_decisions_unlocked(&write.item.work_id)?
-                        .is_empty())
-            {
-                return Err(related_creation_conflict(
-                    "new manager Work has unexpected attempts or decisions",
-                ));
-            }
-        }
-        let items = intent
-            .work_writes
-            .iter()
-            .map(|write| write.item.clone())
-            .collect::<Vec<_>>();
-        self.validate_work_items_for_save_unlocked(&items)
-            .map_err(Self::orch_error_from_anyhow)?;
-        for write in &intent.message_writes {
-            present &= self.manager_record_transition_unlocked(
-                &self.message_path(&write.message.message_id)?,
-                write.prior.as_ref(),
-                &write.message,
-            )?;
-            self.require_optional_agent_in_scope_unlocked(
-                write.message.from_agent_id.as_deref(),
-                write.message.session_id,
-                &write.message.workspace,
-            )?;
-            self.require_optional_agent_in_scope_unlocked(
-                write.message.to_agent_id.as_deref(),
-                write.message.session_id,
-                &write.message.workspace,
-            )?;
-        }
-        if let Some(sequence) = &intent.sequence {
-            let current = self.read_manager_sequence_unlocked()?;
-            if current != sequence.prior && current != Some(sequence.next) {
-                return Err(related_creation_conflict(
-                    "manager message sequence has conflicting evidence",
-                ));
-            }
-            present &= current == Some(sequence.next);
-        }
+        self.preflight_manager_mutation_observed_work_snapshots_unlocked(intent, false)?;
+        self.preflight_manager_mutation_observation_conflicts_unlocked(intent)?;
+        let present = self.preflight_manager_mutation_effect_transitions_unlocked(intent)?;
         self.preflight_related_receipt_unlocked(
             intent.request.as_ref(),
             &intent.response(),

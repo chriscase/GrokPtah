@@ -1726,6 +1726,87 @@ fn manager_post_commit_prune_refusal_conflicting_observation_preserves_evidence_
     assert_refused_prune_recovery_preserves_evidence(root.path(), "pending");
 }
 
+fn tamper_observed_work_on_disk(root: &Path, intent: &Value) {
+    let observed = &intent["observation"]["workItems"][0];
+    let work_id = observed["workId"].as_str().unwrap();
+    let work_path = root
+        .join("home/ledger/work-items")
+        .join(format!("{}.json", safe_id_filename(work_id).unwrap()));
+    let mut work = read(&work_path);
+    work["objective"] = json!("tampered on-disk observed work snapshot");
+    write(&work_path, &work);
+}
+
+fn restore_prior_plan_with_tampered_notification(root: &Path, intent: &Value) {
+    let plan_id = intent["plan"]["planId"].as_str().unwrap();
+    let plan_path = root
+        .join("home/ledger/manager-plans")
+        .join(format!("{}.json", safe_id_filename(plan_id).unwrap()));
+    write(&plan_path, &intent["priorPlan"]);
+    let message = &intent["messageWrites"][0]["message"];
+    let message_path = root.join("home/ledger/messages").join(format!(
+        "{}.json",
+        safe_id_filename(message["messageId"].as_str().unwrap()).unwrap()
+    ));
+    let mut on_disk = read(&message_path);
+    on_disk["body"] = json!("tampered on-disk notification body");
+    write(&message_path, &on_disk);
+}
+
+#[test]
+fn manager_post_commit_prune_refusal_tampered_observed_work_preserves_evidence_intent_present() {
+    let root = prune_tick_prune_fault_root();
+    delete_prune_fault_notification(root.path());
+    let intent_path = paths(&root.path().join("home/ledger/manager-intents"))
+        .pop()
+        .unwrap();
+    let intent = read(&intent_path);
+    tamper_observed_work_on_disk(root.path(), &intent);
+    assert_refused_prune_recovery_preserves_evidence(root.path(), "pending");
+}
+
+#[test]
+fn manager_post_commit_prune_refusal_tampered_observed_work_preserves_evidence_marker_only() {
+    let root = prune_tick_prune_fault_root();
+    delete_prune_fault_notification(root.path());
+    let marker_path = root
+        .path()
+        .join("home/ledger/ledger-admission-recovery.json");
+    let intent = read(&marker_path)["sealedMutationIntent"].clone();
+    tamper_observed_work_on_disk(root.path(), &intent);
+    for path in paths(&root.path().join("home/ledger/manager-intents")) {
+        std::fs::remove_file(path).unwrap();
+    }
+    assert_refused_prune_recovery_preserves_evidence(root.path(), "pending");
+}
+
+#[test]
+fn manager_post_commit_prune_refusal_prior_plan_and_tampered_notification_preserves_evidence_intent_present(
+) {
+    let root = prune_tick_prune_fault_root();
+    let intent_path = paths(&root.path().join("home/ledger/manager-intents"))
+        .pop()
+        .unwrap();
+    let intent = read(&intent_path);
+    restore_prior_plan_with_tampered_notification(root.path(), &intent);
+    assert_refused_prune_recovery_preserves_evidence(root.path(), "pending");
+}
+
+#[test]
+fn manager_post_commit_prune_refusal_prior_plan_and_tampered_notification_preserves_evidence_marker_only(
+) {
+    let root = prune_tick_prune_fault_root();
+    let marker_path = root
+        .path()
+        .join("home/ledger/ledger-admission-recovery.json");
+    let intent = read(&marker_path)["sealedMutationIntent"].clone();
+    restore_prior_plan_with_tampered_notification(root.path(), &intent);
+    for path in paths(&root.path().join("home/ledger/manager-intents")) {
+        std::fs::remove_file(path).unwrap();
+    }
+    assert_refused_prune_recovery_preserves_evidence(root.path(), "pending");
+}
+
 #[test]
 fn manager_post_commit_prune_refuses_tampered_marker_without_intent() {
     let root = tempfile::tempdir().unwrap();

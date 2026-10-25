@@ -2368,7 +2368,7 @@ fn validate_completion(
     Ok((tools.len() as u32, usage, snapshot))
 }
 
-#[cfg(all(test, target_os = "macos"))]
+#[cfg(test)]
 #[path = "managed_provider_offline_tests.rs"]
 mod offline_tests;
 
