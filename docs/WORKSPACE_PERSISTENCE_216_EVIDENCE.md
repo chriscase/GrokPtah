@@ -240,8 +240,21 @@ execution) at head `70d5eac9`. Verdict: **BLOCKING**, solely on F1.
 | F10: Windows concurrent renames | uncertain | Documented as a residual. |
 | Stale comment `host.rs:666-667` | nit, out of scope | Documented as a residual. |
 
-The same reviewer re-reviews the corrected final head. Its result is recorded
-in the handoff manifest.
+**R2:** the same reviewer reviewed source only at head `66bec50e` (A1 plus the
+R1 corrections). Verdict: **BLOCKING**, solely on N1. It found A1 and every R1
+correction otherwise resolved.
+
+| Finding | Severity | Disposition |
+|---|---|---|
+| N1: `QueueObstacle { dir, removed: false }` exceeds rustfmt's default `struct_lit_width` (18) | blocking (fmt) | Reformatted vertically. |
+| N2: the integration-test obstacle is removed only on the success path | nit | Left as is. On a panic, implicit `HostRuntime` drop does not flush queues, and `TempDir` removes the tree. A guard would widen the authorized fixture. |
+| N3: the A1 tests do not pin the failure reason to the rename | nit | Left as is. Pinning it would change behavioural assertions beyond the fixture-only scope; the reason is right by construction. |
+| N4: with `{error:#}`, the cleanup note repeats the original top message | cosmetic | Accepted. The repetition is the price of keeping `{error}` readers correct. |
+| N5: A1 adds fixture items (`QUEUE_OBSTACLE_SENTINEL`, `QueueObstacle`) inside `host.rs` `mod tests` | scope observation | Every item is part of the `block_queue_persistence` fixture; reported to the coordinator. |
+| N6: the owner-reconciliation claims cannot be verified locally | cannot verify | These are coordinator records and are labelled as such. |
+
+The N1 fix is confirmed by the same reviewer at the final head, recorded in the
+handoff manifest.
 
 ## Execution status
 

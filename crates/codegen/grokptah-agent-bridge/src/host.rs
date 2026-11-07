@@ -12867,7 +12867,10 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("place the queue obstacle");
         std::fs::write(dir.join(QUEUE_OBSTACLE_SENTINEL), QUEUE_OBSTACLE_SENTINEL)
             .expect("seed the obstacle sentinel");
-        QueueObstacle { dir, removed: false }
+        QueueObstacle {
+            dir,
+            removed: false,
+        }
     }
 
     /// A test-owned obstacle at a session's final `prompt_queue.json`.
