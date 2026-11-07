@@ -12860,8 +12860,9 @@ mod tests {
     /// assertions are done; it is removed before the host is torn down.
     fn block_queue_persistence(session_id: Uuid) -> QueueObstacle {
         let dir = crate::session_store::session_dir(session_id).join("prompt_queue.json");
+        let initial = std::fs::symlink_metadata(&dir).map_err(|error| error.kind());
         assert!(
-            std::fs::symlink_metadata(&dir).is_err(),
+            matches!(initial, Err(std::io::ErrorKind::NotFound)),
             "the queue destination must not exist before the obstacle is placed"
         );
         std::fs::create_dir_all(&dir).expect("place the queue obstacle");

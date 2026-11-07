@@ -1289,7 +1289,9 @@ mod tests {
         );
         let error = result.expect_err("the write failure must be reported");
 
-        let own = staged_rx.recv().expect("the write reached its staging file");
+        let own = staged_rx
+            .recv()
+            .expect("the write reached its staging file");
         assert_eq!(error.root_cause().to_string(), "injected write failure");
         let msg = format!("{error:#}");
         let write = format!("write {}", own.display());
@@ -1366,7 +1368,9 @@ mod tests {
         );
         let error = result.expect_err("the rename failure must be reported");
 
-        let own = staged_rx.recv().expect("the seam replaced the staging file");
+        let own = staged_rx
+            .recv()
+            .expect("the seam replaced the staging file");
         assert_eq!(error.root_cause().to_string(), "injected rename failure");
         // Callers that print only the outermost message still see the
         // original failure first, then the cleanup failure.

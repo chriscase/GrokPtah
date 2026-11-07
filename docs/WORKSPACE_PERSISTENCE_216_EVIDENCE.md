@@ -7,7 +7,7 @@ Issue: [chriscase/GrokPtah#216](https://github.com/chriscase/GrokPtah/issues/216
 |---|---|
 | Writer | `GP-216-CLAUDE-20261107-R1` (sole source writer); amendment `GP-216-CLAUDE-20261107-R1-A1`, same writer |
 | Base | `main` `7ddce0d5af8b7d4ac8a3e27e839ab6a232ab141e`, tree `ce88b95730e03ce7dfc499efb17d50ed5d69aab2` |
-| Branch | local `claude/grokptah-216-workspace-atomic-save` (not pushed) |
+| Branch | local `claude/grokptah-216-workspace-atomic-save`, pushed (no force) to the assigned remote branch `claude/great-clarke-gxc4hm`; no PR |
 | Product paths | `crates/codegen/grokptah-agent-bridge/src/session_store.rs` (private helper, local imports, focused tests); this file |
 | A1 test-only paths | `crates/codegen/grokptah-agent-bridge/src/host.rs` (test fixture only); `crates/codegen/grokptah-agent-bridge/tests/orchestration_adversarial.rs` (one test's fixture only) |
 | Execution | **UNRUN**: see [Execution status](#execution-status) |
@@ -266,6 +266,23 @@ Verdict: **NON-BLOCKING**. N1 is resolved, the R2 table matches its report, and
 the N2 to N6 items and the documented residuals are open but not blocking.
 This head differs from `4368e89d` only by this provenance correction, so R3
 does not carry over to it.
+
+**D1, distinct reviewer session.** A separate cloud session reviewed the
+frozen head `862d91e4` (tree `bf8f54be`), source only and read-only. Verdict:
+**BLOCKING**, solely on its F1. It found every acceptance item and A1 met by
+source tracing. The full report is in the handoff packet.
+
+| D1 finding | Severity | Disposition |
+|---|---|---|
+| F1: two one-line `staged_rx.recv().expect(..)` chains in the write-failure and cleanup-failure tests are 61 characters, over rustfmt's `chain_width` (60) | blocking (fmt) | Both chains split vertically. A mechanical scan of every added Rust line found no other chain of 59 or more. It also found no struct-literal body over 16 and no comma-separated one-line argument list over the limit. The two sole-closure arguments wider than 60 match an overflow layout that the crate's fmt-clean base code uses 568 times. |
+| F2: the doc's branch row said "not pushed" | nit | Updated: pushed without force to `claude/great-clarke-gxc4hm`, no PR. |
+| F3: the A1 initial-state check treated any error as "absent" | nit | Both fixtures now require `ErrorKind::NotFound` exactly. |
+| F4: the integration-test obstacle is cleaned up only on success | nit | Unchanged; already documented (R2 N2). |
+| F5: Windows concurrent renames | uncertain | Unchanged; documented residual. |
+| F6: other stores still use a fixed shared `.tmp` | out of scope | Unchanged; documented residual. |
+
+D1 does not carry over to the corrected head. That head needs its own
+distinct-session review, recorded in the handoff manifest.
 
 ## Execution status
 

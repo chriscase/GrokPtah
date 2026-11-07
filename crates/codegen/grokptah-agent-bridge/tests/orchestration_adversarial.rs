@@ -1057,8 +1057,9 @@ async fn queue_persistence_failure_does_not_mutate_memory() {
         .join("sessions")
         .join(session.id.to_string())
         .join("prompt_queue.json");
+    let initial = std::fs::symlink_metadata(&obstacle).map_err(|error| error.kind());
     assert!(
-        std::fs::symlink_metadata(&obstacle).is_err(),
+        matches!(initial, Err(std::io::ErrorKind::NotFound)),
         "the queue destination must not exist before the obstacle is placed"
     );
     let sentinel = obstacle.join("queue-obstacle-sentinel");
