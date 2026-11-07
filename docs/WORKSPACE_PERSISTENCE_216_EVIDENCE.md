@@ -223,8 +223,16 @@ and no 1.97 substitute was used.
 
 ## Independent review
 
-**R1:** one distinct, read-only Claude Opus reviewer reviewed source only (no
-execution) at head `70d5eac9`. Verdict: **BLOCKING**, solely on F1.
+**Provenance.** R1 to R3 below were run by one **in-session background
+subagent**: a read-only Claude Opus agent with no author context, started from
+the author's session. It is independent of the author's reasoning but it is
+**not a distinct reviewer session**, so it does not satisfy the
+distinct-session review gate. That gate needs a separate session reviewing the
+exact frozen head, recorded in the handoff manifest. None of these verdicts
+transfers to any later head.
+
+**R1:** the background subagent reviewed source only (no execution) at head
+`70d5eac9`. Verdict: **BLOCKING**, solely on F1.
 
 | Finding | Severity | Disposition |
 |---|---|---|
@@ -240,7 +248,7 @@ execution) at head `70d5eac9`. Verdict: **BLOCKING**, solely on F1.
 | F10: Windows concurrent renames | uncertain | Documented as a residual. |
 | Stale comment `host.rs:666-667` | nit, out of scope | Documented as a residual. |
 
-**R2:** the same reviewer reviewed source only at head `66bec50e` (A1 plus the
+**R2:** the same background subagent reviewed source only at head `66bec50e` (A1 plus the
 R1 corrections). Verdict: **BLOCKING**, solely on N1. It found A1 and every R1
 correction otherwise resolved.
 
@@ -253,8 +261,11 @@ correction otherwise resolved.
 | N5: A1 adds fixture items (`QUEUE_OBSTACLE_SENTINEL`, `QueueObstacle`) inside `host.rs` `mod tests` | scope observation | Every item is part of the `block_queue_persistence` fixture; reported to the coordinator. |
 | N6: the owner-reconciliation claims cannot be verified locally | cannot verify | These are coordinator records and are labelled as such. |
 
-The N1 fix is confirmed by the same reviewer at the final head, recorded in the
-handoff manifest.
+**R3:** the same background subagent reviewed source only at `4368e89d`.
+Verdict: **NON-BLOCKING**. N1 is resolved, the R2 table matches its report, and
+the N2 to N6 items and the documented residuals are open but not blocking.
+This head differs from `4368e89d` only by this provenance correction, so R3
+does not carry over to it.
 
 ## Execution status
 
@@ -297,7 +308,7 @@ admission.
    #216 is gone and not caused by another mechanism (see
    [Parent mechanism](#parent-mechanism-source-confirmed)).
 6. An independent adversarial review of concurrency, failure handling, privacy
-   and write authority by a reviewer other than the author, completed on the
+   and write authority, in a **distinct reviewer session** on the exact frozen
    final head.
 
 Formatting and lint conformance were checked by hand against `rustfmt.toml`,
