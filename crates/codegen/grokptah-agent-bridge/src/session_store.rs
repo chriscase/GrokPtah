@@ -665,16 +665,20 @@ fn sync_parent_best_effort(path: &Path) {
 }
 
 /// Remove the staging file this failed operation created, and nothing else.
-/// The original failure stays the error's source; a cleanup failure is added
-/// as context instead of replacing it.
+/// The original failure stays the error's source. A cleanup failure is added
+/// as context that repeats the original message first, so callers that print
+/// only the outermost message (`{error}`) still see what actually failed.
 fn discard_own_staging(tmp: &Path, error: anyhow::Error) -> anyhow::Error {
     match fs::remove_file(tmp) {
         Ok(()) => error,
         Err(cleanup) if cleanup.kind() == ErrorKind::NotFound => error,
-        Err(cleanup) => error.context(format!(
-            "also could not remove staging file {}: {cleanup}",
-            tmp.display()
-        )),
+        Err(cleanup) => {
+            let note = format!(
+                "{error}; also could not remove staging file {}: {cleanup}",
+                tmp.display()
+            );
+            error.context(note)
+        }
     }
 }
 
@@ -1029,9 +1033,10 @@ mod tests {
     ///
     /// Writer B has staged a complete snapshot under `workspace.json.tmp`, the
     /// one name the previous helper used for every writer, and has not renamed
-    /// it yet. Writer A then saves. The previous helper's `File::create`
-    /// reopened B's file, replaced its bytes with A's and renamed it away, so
-    /// B's own rename failed with ENOENT: the soak residual in #216.
+    /// it yet. Writer A then saves, and B finishes with its own rename. The
+    /// previous helper's `File::create` reopened B's file, replaced its bytes
+    /// with A's and renamed it away, so B's rename failed with ENOENT: the
+    /// `rename … ENOENT` symptom reported in #216.
     #[test]
     fn save_chrome_leaves_another_writers_staged_snapshot_alone() {
         let home = IsolatedHome::new();
@@ -1043,13 +1048,13 @@ mod tests {
 
         save_chrome(&write_authority(), &a).expect("writer A saves");
         assert_eq!(read_bytes(&dest), snapshot(&a));
-        assert_eq!(
-            fs::read(&shared).ok(),
-            Some(snapshot(&b)),
-            "writer A reopened, truncated or moved writer B's staging file"
-        );
 
         fs::rename(&shared, &dest).expect("writer B's rename still finds its own file");
+        assert_eq!(
+            read_bytes(&dest),
+            snapshot(&b),
+            "writer A truncated or replaced writer B's staged snapshot"
+        );
         let (reopened, _) = load_workspace(&write_authority()).expect("reopen");
         assert_eq!(snapshot(&reopened), snapshot(&b));
         assert!(staging_names(&home.home).is_empty());
@@ -1179,15 +1184,19 @@ mod tests {
         let submitted: Vec<WorkspaceChrome> = (0..WRITERS)
             .map(|n| chrome(&format!("/work/writer-{n}"), &format!("model-{n}")))
             .collect();
-        let start = std::sync::Barrier::new(WRITERS);
+        let gate = std::sync::RwLock::new(());
 
         std::thread::scope(|scope| {
+            // Held until every writer is spawned so they start together. If a
+            // spawn panics, unwinding drops it and the writers already started
+            // still finish, so the scope's join cannot hang.
+            let hold = gate.write().expect("fresh start gate");
             let writers: Vec<_> = submitted
                 .iter()
                 .map(|mine| {
-                    let start = &start;
+                    let gate = &gate;
                     scope.spawn(move || {
-                        start.wait();
+                        let _started = gate.read();
                         for _ in 0..ROUNDS {
                             save_chrome(&write_authority(), mine)?;
                         }
@@ -1195,6 +1204,7 @@ mod tests {
                     })
                 })
                 .collect();
+            drop(hold);
             for writer in writers {
                 writer
                     .join()
@@ -1358,10 +1368,12 @@ mod tests {
 
         let own = staged_rx.recv().expect("the seam replaced the staging file");
         assert_eq!(error.root_cause().to_string(), "injected rename failure");
-        let msg = format!("{error:#}");
+        // Callers that print only the outermost message still see the
+        // original failure first, then the cleanup failure.
+        let top = error.to_string();
         let rename = format!("rename {}", dest.display());
-        assert!(msg.contains(&rename), "{msg}");
-        assert!(msg.contains("could not remove staging"), "{msg}");
+        assert!(top.starts_with(&rename), "{top}");
+        assert!(top.contains("could not remove staging"), "{top}");
         assert!(own.join("occupant").is_file(), "cleanup removed a tree");
         assert_eq!(read_bytes(&dest), snapshot(&a));
         assert_eq!(staging_names(&home.home).len(), 1);

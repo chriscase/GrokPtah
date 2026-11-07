@@ -27,8 +27,15 @@ same destination can overlap:
 1. Writer B creates `workspace.json.tmp` and writes its snapshot.
 2. Writer A's `File::create` reopens **the same file** and truncates it, writes
    A's bytes, and renames it to `workspace.json`.
-3. B's `rename` fails with `ENOENT`: its staging file is gone. This is the soak
-   residual reported in #216.
+3. B's `rename` fails with `ENOENT`: its staging file is gone. This produces
+   the `rename … ENOENT` symptom reported in #216.
+
+The issue does not record which trigger the soak run hit. This race is a
+confirmed mechanism for that symptom, but it may not be the only one. A write
+still in flight when a test's temporary home is removed, or when the home
+override is restored underneath it, also ends in `ENOENT`. This change does not
+address that path. Such a write still fails with an honest `ENOENT`. A soak
+re-run therefore stays an open gate (see the end of this document).
 
 A second interleaving corrupts the published file. If B opened the shared name
 before A published it but writes after, B's bytes land in the inode that is now
@@ -57,9 +64,11 @@ behaviour, and every `DurableWriteGuard` requirement are untouched.
   rename failures are returned with their cause as the error's source. On
   failure the helper unlinks **only** the staging path this operation created
   (`remove_file`, never a tree), ignoring `NotFound`. If that unlink fails too,
-  the cleanup failure is added as context and the original failure stays the
-  root cause. Other writers' staging files and the destination are never
-  removed.
+  the original failure stays the root cause. The cleanup failure is added as
+  outer context that starts with the original message, so callers that print
+  only `{error}` (for example `persist steering recovery: {error}` in
+  `host.rs`) still see the original failure first. Other writers' staging
+  files and the destination are never removed.
 - **Ordering.** Concurrent successes leave exactly one complete submitted
   snapshot: whichever rename commits last. No start-order guarantee is claimed.
 - **Test seam.** A `#[cfg(test)]` thread-local seam (`staging_seam`) provides
@@ -69,23 +78,29 @@ behaviour, and every `DurableWriteGuard` requirement are untouched.
 
 ## Focused regressions (authored, not executed)
 
-All of these are in `session_store::tests`. Each runs under an isolated project
-home (`IsolatedHome`: `home_override_serial` plus a temporary directory) whose
-drop restores the override before removing the directory. Tests that start
-workers use `std::thread::scope`, so every worker is joined first, including on
-panic. No real home, global settings, sleeps or new dependencies are involved.
+All of these are in `session_store::tests`. Every test that touches the
+filesystem runs under an isolated project home (`IsolatedHome`:
+`home_override_serial` plus a temporary directory). Its drop restores the
+override before removing the directory. Tests that start workers use
+`std::thread::scope`, so every worker is joined first, including on panic.
+
+The concurrent test starts its writers behind an `RwLock` gate that the main
+thread releases once all writers are spawned. If a spawn panics, unwinding
+drops the gate and the writers already started can still finish, so the join
+cannot hang. No real home, global settings, sleeps or new dependencies are
+involved.
 
 | Test | Covers | Seam |
 |---|---|---|
-| `save_chrome_leaves_another_writers_staged_snapshot_alone` | **Parent-red.** Another writer's staged file is not truncated or moved, and its rename still succeeds (the base fails with ENOENT). Reopen. | none |
+| `save_chrome_leaves_another_writers_staged_snapshot_alone` | **Parent-red.** Another writer's staged file is neither truncated nor moved. Its own rename still succeeds and publishes its exact bytes; on the base, this `expect` fails with the issue's `No such file or directory`. Reopen. | none |
 | `a_writer_holding_the_old_shared_staging_name_cannot_tear_published_chrome` | **Parent-red.** A writer still holding the shared name cannot tear the published chrome (the base publishes `B + tail of A`). Reopen. | none |
 | `interleaved_save_chrome_writers_stage_privately_and_both_commit` | Two real `save_chrome` writers, deterministically interleaved: distinct same-directory staging files, no truncation, both succeed, commit-order survivor, no leftovers, reopen. | `BeforeRename` park |
-| `concurrent_save_chrome_writers_all_succeed_and_publish_a_submitted_snapshot` | 4 writers × 8 rounds behind a barrier: all succeed, the published file is one submitted snapshot, no ordering assumed. | none |
+| `concurrent_save_chrome_writers_all_succeed_and_publish_a_submitted_snapshot` | 4 writers × 8 rounds behind a start gate: all succeed, the published file is one submitted snapshot, no ordering assumed. | none |
 | `save_chrome_overwrite_replaces_the_whole_previous_snapshot` | A short overwrite leaves no tail of the longer predecessor. Reopen. | none |
 | `serialization_failure_creates_nothing_and_preserves_the_destination` | A real encoder error; no staging file; destination and foreign staging byte-identical. | none |
-| `write_failure_is_reported_and_removes_only_its_own_staging_file` | A write failure is reported with its cause; only the write's own staging file is removed; foreign staging and destination intact. | `BeforeWrite` fault |
+| `write_failure_is_reported_and_removes_only_its_own_staging_file` | A write failure is reported with its cause; only the write's own staging file is removed; foreign staging and destination intact. The fault is injected just before `write_all`. A real `write_all` or `flush` error goes through the same `?` path but is not exercised. | `BeforeWrite` fault |
 | `real_rename_failure_is_reported_and_removes_only_its_own_staging_file` | A real OS rename refusal (a directory occupies the destination): the OS error is the cause; the occupant and foreign staging are intact. | observe only |
-| `cleanup_failure_keeps_the_original_error_and_never_removes_a_tree` | A failed unlink keeps the original root cause; cleanup never removes a directory tree. | `BeforeRename` fault |
+| `cleanup_failure_keeps_the_original_error_and_never_removes_a_tree` | A failed unlink keeps the original root cause, and the outermost message still starts with the original failure. Cleanup never removes a directory tree. | `BeforeRename` fault |
 | `an_existing_staging_name_is_skipped_untouched` | A colliding name is skipped without being opened or modified. | forced suffix |
 | `exhausted_staging_names_fail_without_touching_anything` | Bounded attempts; every taken name and the destination are unchanged. | forced suffixes |
 | `v1_migration_still_splits_sessions_and_rewrites_chrome` | v1 migration: chrome fields, byte-exact `.v1.bak`, per-session meta and transcript, no staging leftovers. | none |
@@ -95,6 +110,26 @@ panic. No real home, global settings, sleeps or new dependencies are involved.
 "Parent-red" is a claim from reading the source: the first two tests use only
 APIs that exist on the base, and their assertions contradict the base
 behaviour described above. It has **not** been demonstrated by execution.
+
+**Running the parent-red tests on the base.** The rest of this test module uses
+`staging_seam` and `STAGING_ATTEMPTS`, which do not exist on the base, so the
+module as a whole will not compile there. To run the parent-red check:
+
+1. Start from the base `session_store.rs` (`7ddce0d5`).
+2. Append these items from this change's `tests` module, and nothing else:
+   `IsolatedHome` (struct and both impls), `write_authority`, `chrome`,
+   `snapshot`, `read_bytes`, `staging_names`,
+   `save_chrome_leaves_another_writers_staged_snapshot_alone` and
+   `a_writer_holding_the_old_shared_staging_name_cannot_tear_published_chrome`.
+   They need no import beyond the base module's.
+3. Run only those two tests.
+
+Expected result on the base:
+
+- The first test fails at writer B's rename with `No such file or directory`.
+- The second fails because the published bytes are not A's snapshot.
+
+The same two tests must then pass unchanged on this head.
 
 ## A1: test-only fault-injector replacement
 
@@ -172,8 +207,41 @@ and no 1.97 substitute was used.
 - A crash between staging and rename now leaves an orphaned
   `.<name>.tmp-<uuid>`. Before this change the next write reused the shared
   name. By contract, cleanup removes only the failing operation's own file, so
-  no sweep was added. A legacy `*.json.tmp` left by an older build is likewise
-  left alone.
+  no sweep was added. Repeated crashes can therefore accumulate orphans without
+  bound. An owner-scoped startup sweep, run under the instance lock, would be
+  a separate follow-up. A legacy `*.json.tmp` left by an older build is
+  likewise left alone.
+- `src/host.rs` lines 666–667 still justify skipping a second recovery write
+  as avoiding "contention on the session's temp file". With private staging
+  files there is no shared temp file to contend on. The reasoning (the write is
+  already durable) still holds, but the wording is stale. The comment is
+  production code outside the A1 test-only scope, so it was left as is.
+- Windows was not analysed beyond std's documented rename-over-existing
+  behaviour. Whether many concurrent replace-renames onto one destination can
+  return a sporadic access-denied error depends on std's Windows rename path.
+  Bridge CI runs on macOS only.
+
+## Independent review
+
+**R1:** one distinct, read-only Claude Opus reviewer reviewed source only (no
+execution) at head `70d5eac9`. Verdict: **BLOCKING**, solely on F1.
+
+| Finding | Severity | Disposition |
+|---|---|---|
+| F1: three out-of-scope tests lose their fault injector | blocking | Fixed by A1 (`1759f6f4`). |
+| F2: test 1 failed on the base before reaching the ENOENT rename | should-fix | B's rename now runs before the content check, so the base fails with the real ENOENT. |
+| F3: the parent-red procedure on the base was not stated | should-fix | Transplant procedure added above. |
+| F4: the root cause was asserted, not shown | should-fix | Reworded; soak re-run kept as an open gate. |
+| F5: on cleanup failure, `{error}` callers lost the original message | nit | The outer context now starts with the original message; the test checks it. |
+| F6: a real `write_all`/`flush` error is not exercised | nit | Documented in the test table. |
+| F7: not every test runs under an isolated home | nit | Wording corrected. |
+| F8: orphan accumulation | nit | Documented as a residual and a follow-up. |
+| F9: barrier hang if a spawn panics | nit | Replaced with an `RwLock` start gate released by unwinding. |
+| F10: Windows concurrent renames | uncertain | Documented as a residual. |
+| Stale comment `host.rs:666-667` | nit, out of scope | Documented as a residual. |
+
+The same reviewer re-reviews the corrected final head. Its result is recorded
+in the handoff manifest.
 
 ## Execution status
 
@@ -212,8 +280,12 @@ admission.
 3. Supported Desktop Rust tests (`desktop/src-tauri` `cargo test --locked`), and
    frontend `npm ci && npm run typecheck && npm test`.
 4. Exact-head hosted Desktop CI.
-5. An independent adversarial review of concurrency, failure handling, privacy
-   and write authority by a reviewer other than the author.
+5. A soak re-run under the home override, to confirm the residual reported in
+   #216 is gone and not caused by another mechanism (see
+   [Parent mechanism](#parent-mechanism-source-confirmed)).
+6. An independent adversarial review of concurrency, failure handling, privacy
+   and write authority by a reviewer other than the author, completed on the
+   final head.
 
 Formatting and lint conformance were checked by hand against `rustfmt.toml`,
 `clippy.toml` and the default clippy lint set. Treat that as review, not as a
