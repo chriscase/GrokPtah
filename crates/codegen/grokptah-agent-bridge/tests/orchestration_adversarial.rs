@@ -1048,13 +1048,22 @@ async fn queue_persistence_failure_does_not_mutate_memory() {
     let (home, _lock) = setup_home();
     let host = started_host();
     let session = host.session_new_kind(SessionKind::Build).unwrap();
-    let tmp_path = home
+    // A genuine filesystem failure that does not depend on how the store
+    // names its staging file (#216): an owned, non-empty directory at the
+    // final `prompt_queue.json`, which no rename can replace.
+    let obstacle = home
         .path()
         .join(".grokptah")
         .join("sessions")
         .join(session.id.to_string())
-        .join("prompt_queue.json.tmp");
-    std::fs::create_dir_all(&tmp_path).unwrap();
+        .join("prompt_queue.json");
+    assert!(
+        std::fs::symlink_metadata(&obstacle).is_err(),
+        "the queue destination must not exist before the obstacle is placed"
+    );
+    let sentinel = obstacle.join("queue-obstacle-sentinel");
+    std::fs::create_dir_all(&obstacle).unwrap();
+    std::fs::write(&sentinel, "queue-obstacle-sentinel").unwrap();
     assert!(host
         .session_queue_add_with_source(
             session.id,
@@ -1065,6 +1074,14 @@ async fn queue_persistence_failure_does_not_mutate_memory() {
         )
         .is_err());
     assert!(host.session_queue_list(session.id).unwrap().is_empty());
+    // The failed write left the obstacle as placed; remove only it, before
+    // the host is torn down.
+    assert_eq!(
+        std::fs::read_to_string(&sentinel).unwrap(),
+        "queue-obstacle-sentinel"
+    );
+    std::fs::remove_file(&sentinel).unwrap();
+    std::fs::remove_dir(&obstacle).unwrap();
     set_grokptah_home_override(None);
 }
 

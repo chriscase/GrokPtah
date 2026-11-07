@@ -12851,12 +12851,57 @@ mod tests {
         assert_eq!(entries[0].version, steering.version + 1);
     }
 
-    /// Make the durable write fail deterministically: `atomic_write_json`
-    /// creates `<queue>.json.tmp`, so a directory at that path fails the
-    /// create without touching anything else.
-    fn block_queue_persistence(session_id: Uuid) {
-        let blocked = crate::session_store::session_dir(session_id).join("prompt_queue.json.tmp");
-        std::fs::create_dir_all(&blocked).expect("block the queue temp path");
+    const QUEUE_OBSTACLE_SENTINEL: &str = "queue-obstacle-sentinel";
+
+    /// Make the durable queue write fail with a genuine filesystem error that
+    /// does not depend on how the store names its staging file (#216): an
+    /// owned, non-empty directory at the session's final `prompt_queue.json`,
+    /// which no rename can replace. Keep the returned obstacle alive until the
+    /// assertions are done; it is removed before the host is torn down.
+    fn block_queue_persistence(session_id: Uuid) -> QueueObstacle {
+        let dir = crate::session_store::session_dir(session_id).join("prompt_queue.json");
+        assert!(
+            std::fs::symlink_metadata(&dir).is_err(),
+            "the queue destination must not exist before the obstacle is placed"
+        );
+        std::fs::create_dir_all(&dir).expect("place the queue obstacle");
+        std::fs::write(dir.join(QUEUE_OBSTACLE_SENTINEL), QUEUE_OBSTACLE_SENTINEL)
+            .expect("seed the obstacle sentinel");
+        QueueObstacle { dir, removed: false }
+    }
+
+    /// A test-owned obstacle at a session's final `prompt_queue.json`.
+    struct QueueObstacle {
+        dir: std::path::PathBuf,
+        removed: bool,
+    }
+
+    impl QueueObstacle {
+        /// Check the failed write left the obstacle exactly as placed, then
+        /// remove only what this fixture created.
+        fn verify_and_remove(mut self) {
+            let sentinel = self.dir.join(QUEUE_OBSTACLE_SENTINEL);
+            assert_eq!(
+                std::fs::read_to_string(&sentinel).ok().as_deref(),
+                Some(QUEUE_OBSTACLE_SENTINEL),
+                "the failed write disturbed the queue obstacle"
+            );
+            std::fs::remove_file(&sentinel).expect("remove the obstacle sentinel");
+            std::fs::remove_dir(&self.dir).expect("remove the queue obstacle");
+            self.removed = true;
+        }
+    }
+
+    impl Drop for QueueObstacle {
+        fn drop(&mut self) {
+            // A test that fails before `verify_and_remove` still clears the
+            // obstacle before the host drops: the sentinel, then the directory,
+            // which `remove_dir` leaves in place if anything else is inside.
+            if !self.removed {
+                let _ = std::fs::remove_file(self.dir.join(QUEUE_OBSTACLE_SENTINEL));
+                let _ = std::fs::remove_dir(&self.dir);
+            }
+        }
     }
 
     fn seed_pending_steering(
@@ -12887,7 +12932,7 @@ mod tests {
     fn a_failed_recovery_write_keeps_the_steering_and_reports_the_failure() {
         let (_home, host, session_id) = test_host();
         let (_queued, steering) = seed_pending_steering(&host, session_id);
-        block_queue_persistence(session_id);
+        let obstacle = block_queue_persistence(session_id);
         let mut events = host.event_bus().subscribe();
 
         let error = host
@@ -12913,6 +12958,7 @@ mod tests {
                 "an uncommitted recovery must not publish a queue snapshot"
             );
         }
+        obstacle.verify_and_remove();
     }
 
     /// The abort path is the common one and used to swallow the error whole.
@@ -12920,7 +12966,7 @@ mod tests {
     fn the_abort_path_reports_a_failed_recovery_write_too() {
         let (_home, host, session_id) = test_host();
         let (_queued, steering) = seed_pending_steering(&host, session_id);
-        block_queue_persistence(session_id);
+        let obstacle = block_queue_persistence(session_id);
         let mut events = host.event_bus().subscribe();
 
         {
@@ -12945,6 +12991,7 @@ mod tests {
 
         let entries = host.session_queue_list(session_id).expect("queue readable");
         assert_eq!(entries[0].id, steering.id);
+        obstacle.verify_and_remove();
     }
 
     #[test]

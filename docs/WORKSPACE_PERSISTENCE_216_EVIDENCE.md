@@ -5,10 +5,11 @@ Issue: [chriscase/GrokPtah#216](https://github.com/chriscase/GrokPtah/issues/216
 
 | Field | Value |
 |---|---|
-| Writer | `GP-216-CLAUDE-20261107-R1` (sole source writer) |
+| Writer | `GP-216-CLAUDE-20261107-R1` (sole source writer); amendment `GP-216-CLAUDE-20261107-R1-A1`, same writer |
 | Base | `main` `7ddce0d5af8b7d4ac8a3e27e839ab6a232ab141e`, tree `ce88b95730e03ce7dfc499efb17d50ed5d69aab2` |
 | Branch | local `claude/grokptah-216-workspace-atomic-save` (not pushed) |
 | Product paths | `crates/codegen/grokptah-agent-bridge/src/session_store.rs` (private helper, local imports, focused tests); this file |
+| A1 test-only paths | `crates/codegen/grokptah-agent-bridge/src/host.rs` (test fixture only); `crates/codegen/grokptah-agent-bridge/tests/orchestration_adversarial.rs` (one test's fixture only) |
 | Execution | **UNRUN**: see [Execution status](#execution-status) |
 
 The exact head, tree, diff and bundle for a handoff are recorded in the
@@ -95,28 +96,71 @@ panic. No real home, global settings, sleeps or new dependencies are involved.
 APIs that exist on the base, and their assertions contradict the base
 behaviour described above. It has **not** been demonstrated by execution.
 
-## Required span outside this assignment
+## A1: test-only fault-injector replacement
 
-Changing the helper stops the existing fault injectors of **three tests outside
-the two allowed paths** from working. Each one plants a directory at the old
-shared staging name `sessions/<id>/prompt_queue.json.tmp` so that `File::create`
-fails. With private staging names that directory no longer blocks the write, so
-these tests will fail until their injector is replaced:
+**Need.** The helper change disabled the fault injector of three existing tests
+outside the original two paths. Each planted a directory at the old shared
+staging name `sessions/<id>/prompt_queue.json.tmp` so that `File::create`
+failed. With private staging names that directory no longer blocks anything.
 
-- `crates/codegen/grokptah-agent-bridge/src/host.rs`: `block_queue_persistence`
-  (around line 12857), used by
+**Authorization.** The coordinator bound amendment
+`GP-216-CLAUDE-20261107-R1-A1` to the same writer on the unchanged base. Its
+scope is test-only:
+
+- `src/host.rs`: `tests::block_queue_persistence` and its explanatory comment
+  (base line 12854), plus only the fixture setup and cleanup needed in
   `a_failed_recovery_write_keeps_the_steering_and_reports_the_failure` and
   `the_abort_path_reports_a_failed_recovery_write_too`.
-- `crates/codegen/grokptah-agent-bridge/tests/orchestration_adversarial.rs`:
-  `queue_persistence_failure_does_not_mutate_memory` (around line 1050).
+- `tests/orchestration_adversarial.rs`: only the failure fixture and the cleanup
+  needed in `queue_persistence_failure_does_not_mutate_memory` (base line 1047).
 
-Suggested equivalent injector, for whoever owns that span: plant the directory
-at the **destination** `sessions/<id>/prompt_queue.json` instead. Then the real
-`rename` fails on both the base and this helper. These tests read the queue
-from memory (`session_queue_list` uses the in-memory snapshot; disk is read
-only at host boot), so the change should not otherwise alter what they observe.
-It has not been run. These files were not edited here; the change is returned
-to the coordinator for a span decision.
+**Replacement.** The new injector is a genuine filesystem failure that does not
+depend on any staging name: an owned, non-empty directory at the **final**
+`sessions/<id>/prompt_queue.json`. The store's real `rename` over it fails on
+both the base helper and this one (`EISDIR` on Linux and macOS; refused on
+Windows). Each fixture:
+
+1. Asserts the destination does not exist yet. `session_new_kind` writes only
+   meta, transcript and chrome; queues reach disk only on a queue mutation or
+   an ordered-shutdown flush.
+2. Creates the directory and writes a sentinel file inside it.
+3. After the behavioural assertions, asserts the sentinel is byte-identical,
+   then removes only the sentinel and the directory. `remove_dir` is
+   non-recursive, so it refuses to delete a directory that holds anything
+   else. This happens before host teardown.
+
+In `host.rs`, `block_queue_persistence` now returns a `QueueObstacle` guard.
+`verify_and_remove` performs step 3 and surfaces any failure. On a panic path,
+`Drop` performs the same non-recursive removal best-effort. The guard is bound
+after the host, so it is dropped before the host. Implicit `HostRuntime` drop
+seals durable writes and quarantines the lock, but does not flush prompt
+queues.
+
+**Unchanged.** No production code, fault switch, permission change, transcript
+change, API change, guard change or queue change. Every behavioural assertion
+is kept:
+
+- A failed steering recovery keeps the live steering and reports
+  `persist steering recovery`.
+- It publishes no authoritative `PromptQueueChanged`.
+- The abort path reports the same failure.
+- A failed queue addition leaves memory unchanged.
+
+The queue is read from memory in all three tests (`session_queue_list` uses the
+in-memory snapshot; disk is read only at host boot).
+
+**Owner reconciliation, as recorded by the coordinator:**
+
+- #585 changes neither file.
+- The recorded #586 head `66157216` patches `host.rs` only near base line 2640
+  and excludes `orchestration_adversarial.rs`. Every A1 hunk in `host.rs` is in
+  the `tests` module from base line 12853 onward.
+- The historical #417 host tests, #474 auth arguments and assertions, and the
+  published #468 test hunks are not touched.
+- No production span, draft or lock of those owners is released.
+
+A1 is UNRUN like everything else here. The Rust 1.92 toolchain is unavailable,
+and no 1.97 substitute was used.
 
 ## Out-of-scope residuals (not changed)
 
@@ -162,8 +206,9 @@ admission.
 1. The focused `session_store` regressions above, including an executed
    parent-red run of the first two tests against the base helper.
 2. Bridge `cargo fmt --check`, `cargo clippy --locked --all-targets -- -D
-   warnings`, and `cargo test --locked -- --test-threads=1`. These need the
-   cross-span injector change first.
+   warnings`, and `cargo test --locked -- --test-threads=1`. These include the
+   two A1 `host.rs` fixture tests, the A1 integration test and the
+   `session_store` tests.
 3. Supported Desktop Rust tests (`desktop/src-tauri` `cargo test --locked`), and
    frontend `npm ci && npm run typecheck && npm test`.
 4. Exact-head hosted Desktop CI.
