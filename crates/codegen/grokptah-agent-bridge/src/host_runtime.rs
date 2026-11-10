@@ -1073,6 +1073,31 @@ pub struct HostRuntime {
     completed: tokio::sync::Mutex<Option<HostShutdownReport>>,
 }
 
+/// Whether these flush errors may accompany a release of *our* instance lock.
+///
+/// An empty list is the clean shutdown. A list that is only the journal
+/// writer's bounded-queue overflow is a recorded gap after that writer has
+/// already been required to stop; it must not keep this process's lock.
+/// Anything else — a writer that panicked, a writer that did not stop, an
+/// audit failure, a refused durable write — still quarantines.
+fn flush_errors_permit_lock_release(errors: &[String]) -> bool {
+    errors.is_empty()
+        || errors
+            .iter()
+            .all(|error| is_journal_queue_overflow_flush_error(error))
+}
+
+fn is_journal_queue_overflow_flush_error(error: &str) -> bool {
+    const RAW: &str = "journal writer queue is full";
+    let detail = error
+        .strip_prefix("close the durable event journal: ")
+        .or_else(|| {
+            error.strip_prefix("durable event journal degraded after sealing publication: ")
+        })
+        .unwrap_or(error);
+    detail == RAW
+}
+
 impl HostRuntime {
     pub(crate) fn new(handle: AgentHostHandle, lifecycle: Arc<HostLifecycle>) -> Self {
         Self {
@@ -1216,12 +1241,15 @@ impl HostRuntime {
     /// 4. Drain the durable writer threads while authority still exists.
     /// 5. Seal durable-write authority and wait for in-flight writes, bounded.
     /// 6. Flush durable state and run shutdown hooks; record every failure.
-    /// 7. Mark closed, then release the advisory OS lock exactly once —
-    ///    **only** if durable writes are sealed. Keeps the lock file.
+    /// 7. Mark closed, then release the advisory OS lock exactly once when
+    ///    durable writes are sealed, every server and task joined, and the
+    ///    flush is clean — or the only flush errors are a journal-writer queue
+    ///    overflow recorded after that writer has stopped. Keeps the lock file.
     ///
-    /// If the seal fails the lock is deliberately retained: refusing a
-    /// replacement is the safe outcome, because releasing would permit two
-    /// durable writers on one home.
+    /// If the seal fails, the writer is still running, or any other flush
+    /// failed, the lock is deliberately retained: refusing a replacement is
+    /// the safe outcome, because releasing would permit two durable writers
+    /// on one home. Releasing drops only the lock this process acquired.
     pub async fn shutdown(&self) -> HostShutdownReport {
         let mut completed = self.completed.lock().await;
         if let Some(report) = completed.as_ref() {
@@ -1475,11 +1503,17 @@ impl HostRuntime {
                 // re-acquired.
                 self.lifecycle.mark_closed();
 
+                // A filled journal queue is a recorded gap. Once the writer has
+                // joined and every flush error is that overflow, keeping this
+                // process's advisory lock would only refuse the next launch of
+                // the same home. Any other flush failure still fails closed.
+                // This drops only the `InstanceLock` we acquired: the lock file
+                // stays, and a flock held by another process is never taken.
                 let release_is_safe = durable_writes_sealed
                     && !join_timed_out
                     && control_servers_unjoined == 0
                     && join_errors.is_empty()
-                    && flush_errors.is_empty();
+                    && flush_errors_permit_lock_release(&flush_errors);
                 let released = if release_is_safe {
                     self.lifecycle.release_process_lock()
                 } else {
@@ -1547,8 +1581,9 @@ impl Drop for HostRuntime {
     /// Callers that need the full join barrier must await `shutdown()`.
     fn drop(&mut self) {
         // An ordered shutdown already ran and reached its terminal state: it
-        // either released the lock (clean) or quarantined it (unclean), and in
-        // both cases the lock is no longer this object's to decide about.
+        // either released the lock or quarantined it, and in both cases the
+        // lock is no longer this object's to decide about. A recorded journal
+        // queue overflow releases the lock and is still not a clean report.
         if self.lifecycle.phase() == HostPhase::Closed && self.lifecycle.durable_writes_sealed() {
             debug_assert!(
                 !self.lifecycle.process_lock_held() || self.lifecycle.lock_is_quarantined(),

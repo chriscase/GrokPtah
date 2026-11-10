@@ -2372,3 +2372,116 @@ async fn a_store_cannot_be_bound_to_a_runtime_that_owns_another_home() {
 
     drop(foreign);
 }
+
+/// Resumes a journal writer that this test started paused, including on panic,
+/// so a failed assertion cannot leave the writer blocked in its gate.
+struct JournalWriterResume {
+    bus: grokptah_agent_bridge::event_bus::EventBus,
+}
+
+impl Drop for JournalWriterResume {
+    fn drop(&mut self) {
+        self.bus.release_journal_writer_for_test();
+    }
+}
+
+/// A journal-queue overflow is a recorded gap, not a lock another process holds.
+///
+/// After the writer stops, ordered shutdown must drop *this* process's advisory
+/// lock, keep the lock file, and leave the report unclean. A second acquire
+/// while this process still holds the home must still fail, and that refusal
+/// must not delete the lock file.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn journal_queue_overflow_releases_our_lock_and_a_live_holder_still_blocks() {
+    let lane = Lane::new();
+    grokptah_agent_bridge::event_bus::EventBus::pause_next_journal_writer_for_test();
+    let (runtime, session_id) = lane.boot();
+    let resume = JournalWriterResume {
+        bus: runtime.event_bus(),
+    };
+
+    let blocked = AgentHost::create(HostConfig {
+        always_approve: true,
+        ..HostConfig::default()
+    });
+    let Err(error) = blocked else {
+        panic!("a live holder must keep the instance lock");
+    };
+    let message = format!("{error:#}");
+    assert!(
+        message.contains("another GrokPtah instance is already using"),
+        "{message}"
+    );
+    assert!(
+        lane.instance_lock().is_file(),
+        "refusing a second acquire must not delete the lock file"
+    );
+
+    let bus = runtime.event_bus();
+    for i in 0..300 {
+        bus.publish(SessionUpdate::AgentMessageChunk {
+            session_id,
+            text: format!("overflow-{i}"),
+        });
+    }
+    let persisted = bus.last_persistence_error();
+    assert_eq!(
+        persisted.as_deref(),
+        Some("journal writer queue is full"),
+        "the writer was paused before recv, so the bounded queue must fill: {persisted:?}"
+    );
+
+    let quarantined_before = grokptah_agent_bridge::quarantined_process_lock_count();
+    bus.release_journal_writer_for_test();
+    let report = runtime.shutdown().await;
+
+    assert!(
+        !report.flush_errors.is_empty(),
+        "the overflow must stay on the report: {}",
+        report.operator_summary()
+    );
+    assert!(
+        report
+            .flush_errors
+            .iter()
+            .all(|error| error.contains("journal writer queue is full")),
+        "only the overflow may be present, otherwise the lock must stay: {:?}",
+        report.flush_errors
+    );
+    assert!(
+        !report.is_clean(),
+        "a recorded gap is not a clean shutdown: {}",
+        report.operator_summary()
+    );
+    assert!(
+        report.durable_writes_sealed,
+        "{}",
+        report.operator_summary()
+    );
+    assert!(!report.join_timed_out, "{}", report.operator_summary());
+    assert!(
+        report.process_lock_released,
+        "{}",
+        report.operator_summary()
+    );
+    assert!(
+        !report.process_lock_retained_for_safety,
+        "{}",
+        report.operator_summary()
+    );
+    assert!(
+        !report.process_lock_held_after,
+        "{}",
+        report.operator_summary()
+    );
+    assert!(report.lock_file_present);
+    assert_eq!(
+        grokptah_agent_bridge::quarantined_process_lock_count(),
+        quarantined_before,
+        "an overflow after the writer stops must not quarantine our lock"
+    );
+
+    let replacement = restart_same_home_now(&lane);
+    assert_clean_shutdown(&replacement.shutdown().await);
+    drop(resume);
+}
