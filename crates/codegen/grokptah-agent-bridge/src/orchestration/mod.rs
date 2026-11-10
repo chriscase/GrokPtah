@@ -104,8 +104,8 @@ pub use types::{
     OrchErrorCode, PromotionState, RunAggregates, RunApproval, RunBounds, RunExecution,
     RunExecutionMode, RunProgress, RunPurpose, RunRecord, RunState, RunStopCause, TestObservation,
     AGENT_SPEC_SCHEMA_VERSION, CONTROL_TOOLS, DEFAULT_AGENT_TOOL_IDS,
-    DEFAULT_PERSISTENT_AGENT_MAX_TOTAL_TOKENS, FORBIDDEN_TOOLS, LEGACY_DESKTOP_CLIENT_ID,
-    LOCAL_DESKTOP_ORIGIN_ID, MAX_AGENT_CONTEXT_BYTES,
+    DEFAULT_PERSISTENT_AGENT_MAX_TOTAL_TOKENS, FORBIDDEN_TOOLS, INTERRUPTED_CLAIM_DETAIL,
+    LEGACY_DESKTOP_CLIENT_ID, LOCAL_DESKTOP_ORIGIN_ID, MAX_AGENT_CONTEXT_BYTES,
 };
 pub use work_page::{
     attempt_content_fence, attempt_list_fence, encoded_tools_call_response, issue_cursor_for_tests,
