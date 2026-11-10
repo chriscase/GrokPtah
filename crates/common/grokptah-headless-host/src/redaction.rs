@@ -198,10 +198,12 @@ fn normalize_secret_name(name: &str) -> String {
 }
 
 fn is_secret_key(key: &str) -> bool {
-    const EXACT: [&str; 14] = [
+    const EXACT: [&str; 19] = [
         "authorization",
         "apikey",
         "api_key",
+        "apikeys",
+        "api_keys",
         "token",
         "secret",
         "password",
@@ -213,12 +215,15 @@ fn is_secret_key(key: &str) -> bool {
         "session_key",
         "passphrase",
         "accesstoken",
+        "session_id",
+        "sessionid",
+        "phpsessid",
     ];
     let lowered = normalize_secret_name(key);
     if EXACT.contains(&lowered.as_str()) {
         return true;
     }
-    const WORDS: [&str; 9] = [
+    const WORDS: [&str; 11] = [
         "token",
         "key",
         "secret",
@@ -228,11 +233,35 @@ fn is_secret_key(key: &str) -> bool {
         "cookie",
         "passphrase",
         "authorization",
+        "session_id",
+        "sessionid",
     ];
-    lowered.ends_with("apikey")
+    if lowered.ends_with("apikey")
+        || lowered.ends_with("apikeys")
+        || lowered.ends_with("api_keys")
+        || lowered.ends_with("phpsessid")
         || WORDS
             .iter()
             .any(|word| ends_with_secret_word(&lowered, word))
+    {
+        return true;
+    }
+    // A lowercase compound such as `clientsecret` has no separator to split
+    // on. `key` stays delimited: `monkey` ends in those three letters.
+    const GLUED: [&str; 9] = [
+        "authorization",
+        "credentials",
+        "credential",
+        "passphrase",
+        "password",
+        "secret",
+        "cookie",
+        "token",
+        "sessionid",
+    ];
+    GLUED
+        .iter()
+        .any(|word| ends_with_glued_word(&lowered, word))
 }
 
 /// `=` and `:` are deliberately excluded so `NAME=value` and `Header: value`
@@ -250,6 +279,17 @@ fn ends_with_secret_word(lowered: &str, word: &str) -> bool {
             .is_some_and(|head| head.ends_with(['_', '-', '.']))
 }
 
+/// A secret word fused onto a lowercase prefix, with no `_`, `-`, or `.`.
+fn ends_with_glued_word(lowered: &str, word: &str) -> bool {
+    lowered
+        .strip_suffix(word)
+        .is_some_and(|head| head.ends_with(|character: char| character.is_ascii_lowercase()))
+}
+
+fn is_basic_scheme(run: &str) -> bool {
+    run.eq_ignore_ascii_case("basic")
+}
+
 fn is_secret_assignment_name(run: &str) -> bool {
     if run.eq_ignore_ascii_case("bearer") || is_secret_key(run) {
         return true;
@@ -261,7 +301,8 @@ fn is_secret_assignment_name(run: &str) -> bool {
 }
 
 /// Mask credential-shaped runs: issuer-prefixed tokens, `NAME=value` secret
-/// assignments, and `Authorization`/`Bearer` values.
+/// assignments, and `Authorization` / `Proxy-Authorization` values. `Bearer`
+/// and `Basic` name the scheme; the following run is the credential.
 fn mask_credentials(input: &str) -> String {
     let bytes = input.as_bytes();
     let mut out = String::with_capacity(input.len());
@@ -288,9 +329,11 @@ fn mask_credentials(input: &str) -> String {
         let run = &input[start..index];
 
         if mask_next_run {
-            if is_secret_assignment_name(run) {
-                // `Authorization: Bearer <token>` — `Bearer` is the scheme, so
-                // the run after it is still the secret.
+            if is_secret_assignment_name(run) || is_basic_scheme(run) {
+                // `Authorization: Bearer <token>` and `Authorization: Basic
+                // <credential>` — the scheme is not the secret. `Basic` is
+                // only a scheme once a secret name is already open, so the
+                // word "basic" elsewhere stays visible.
                 out.push_str(run);
                 mask_next_run = bytes
                     .get(index)
@@ -463,6 +506,96 @@ mod tests {
         assert_eq!(value["tokenCount"], 7);
         assert_eq!(value["keyId"], "key-visible");
         assert_eq!(value["monkey"], "monkey-visible");
+    }
+
+    /// `Basic` is an auth scheme, like `Bearer`: the credential after it is the
+    /// secret. Lowercase compounds, plural API-key names, and session ids are
+    /// secret names. Lookalikes stay visible.
+    #[test]
+    fn basic_authorization_compounds_and_session_ids_are_redacted() {
+        let basic = policy().scrub("Authorization: Basic dXNlcjpwYXNz");
+        assert!(
+            basic.contains("Authorization: Basic "),
+            "scheme was consumed as the secret: {basic}"
+        );
+        assert!(basic.contains(REDACTED), "{basic}");
+        assert!(
+            !basic.contains("dXNlcjpwYXNz"),
+            "basic credential left visible: {basic}"
+        );
+
+        let proxy = policy().scrub("Proxy-Authorization: Basic cHJveHk6c2VjcmV0");
+        assert!(
+            proxy.contains("Proxy-Authorization: Basic "),
+            "proxy scheme was consumed as the secret: {proxy}"
+        );
+        assert!(proxy.contains(REDACTED), "{proxy}");
+        assert!(
+            !proxy.contains("cHJveHk6c2VjcmV0"),
+            "proxy basic credential left visible: {proxy}"
+        );
+
+        let value = policy().scrub_value(&json!({
+            "clientsecret": "rho-secret-value",
+            "apisecret": "sigma-secret-value",
+            "userpassword": "tau-pass-value",
+            "apikeys": "upsilon-keys-value",
+            "apiKeys": "phi-keys-value",
+            "api_keys": "chi-keys-value",
+            "sessionId": "psi-session-value",
+            "session_id": "omega-session-value",
+            "SESSIONID": "alpha-session-value",
+            "PHPSESSID": "beta-session-value",
+            "tokenCount": 7,
+            "keyId": "key-visible",
+            "keyboard": "keyboard-visible",
+            "cookieConsent": "consent-visible",
+            "monkey": "monkey-visible"
+        }));
+        for (key, secret) in [
+            ("clientsecret", "rho-secret-value"),
+            ("apisecret", "sigma-secret-value"),
+            ("userpassword", "tau-pass-value"),
+            ("apikeys", "upsilon-keys-value"),
+            ("apiKeys", "phi-keys-value"),
+            ("api_keys", "chi-keys-value"),
+            ("sessionId", "psi-session-value"),
+            ("session_id", "omega-session-value"),
+            ("SESSIONID", "alpha-session-value"),
+            ("PHPSESSID", "beta-session-value"),
+        ] {
+            assert_eq!(value[key], REDACTED, "{key}");
+            assert!(
+                !value.to_string().contains(secret),
+                "{key} left {secret} in {value}"
+            );
+        }
+        assert_eq!(value["tokenCount"], 7);
+        assert_eq!(value["keyId"], "key-visible");
+        assert_eq!(value["keyboard"], "keyboard-visible");
+        assert_eq!(value["cookieConsent"], "consent-visible");
+        assert_eq!(value["monkey"], "monkey-visible");
+
+        let assigned = policy().scrub(
+            "clientsecret=rho-secret-value apisecret=sigma-secret-value userpassword=tau-pass-value apikeys=upsilon-keys-value api_keys=chi-keys-value sessionId=psi-session-value session_id=omega-session-value SESSIONID=alpha-session-value PHPSESSID=beta-session-value",
+        );
+        for secret in [
+            "rho-secret-value",
+            "sigma-secret-value",
+            "tau-pass-value",
+            "upsilon-keys-value",
+            "chi-keys-value",
+            "psi-session-value",
+            "omega-session-value",
+            "alpha-session-value",
+            "beta-session-value",
+        ] {
+            assert!(!assigned.contains(secret), "{assigned}");
+        }
+        assert_eq!(
+            policy().scrub("tokenCount=7 keyId=key-visible keyboard=keyboard-visible cookieConsent=consent-visible monkey=monkey-visible"),
+            "tokenCount=7 keyId=key-visible keyboard=keyboard-visible cookieConsent=consent-visible monkey=monkey-visible"
+        );
     }
 
     #[test]
