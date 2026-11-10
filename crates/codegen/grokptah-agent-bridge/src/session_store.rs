@@ -1442,7 +1442,9 @@ mod tests {
         let mut session = Session::new("/work/v1".into(), "model-v1".into(), EffortLevel::Medium);
         session.title = "Migrated".into();
         session.transcript.push(TranscriptEntry::user("question"));
-        session.transcript.push(TranscriptEntry::assistant("answer"));
+        session
+            .transcript
+            .push(TranscriptEntry::assistant("answer"));
         let id = session.id;
         let v1 = serde_json::json!({
             "version": 1,
