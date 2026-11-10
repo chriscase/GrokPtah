@@ -166,18 +166,29 @@ pub fn relative_path(path: &str, max_bytes: usize) -> Option<String> {
     Some(trimmed.to_owned())
 }
 
-/// Split camelCase and acronym boundaries, then lowercase, so `accessToken`
-/// and `APIKey` meet the same checks as `access_token` and `api_key`.
+/// Fold a key into the shape the secret-word checks understand.
+///
+/// `-` and `.` become `_`, so `x-api-key` and `client.secret` meet the same
+/// test as `x_api_key` and `client_secret`. A lowercase letter or digit before
+/// a capital splits (`oauth2Token`, `accessToken`). An all-caps run stays
+/// together, except the capital that starts a lowercase tail (`APIKey`), so
+/// `XAI_API_KEY` is still one name.
 fn normalize_secret_name(name: &str) -> String {
     let chars: Vec<char> = name.chars().collect();
     let mut out = String::with_capacity(name.len() + 4);
     for (index, character) in chars.iter().copied().enumerate() {
+        if matches!(character, '-' | '.') {
+            out.push('_');
+            continue;
+        }
         if character.is_ascii_uppercase() && index > 0 {
             let previous = chars[index - 1];
-            let next_is_lower = chars
-                .get(index + 1)
-                .is_some_and(|next| next.is_ascii_lowercase());
-            if previous.is_ascii_lowercase() || (previous.is_ascii_uppercase() && next_is_lower) {
+            let lowercase_or_digit = previous.is_ascii_lowercase() || previous.is_ascii_digit();
+            let acronym_tail = previous.is_ascii_uppercase()
+                && chars
+                    .get(index + 1)
+                    .is_some_and(|next| next.is_ascii_lowercase());
+            if lowercase_or_digit || acronym_tail {
                 out.push('_');
             }
         }
@@ -187,7 +198,7 @@ fn normalize_secret_name(name: &str) -> String {
 }
 
 fn is_secret_key(key: &str) -> bool {
-    const EXACT: [&str; 12] = [
+    const EXACT: [&str; 14] = [
         "authorization",
         "apikey",
         "api_key",
@@ -200,16 +211,28 @@ fn is_secret_key(key: &str) -> bool {
         "cookie",
         "private_key",
         "session_key",
+        "passphrase",
+        "accesstoken",
     ];
     let lowered = normalize_secret_name(key);
     if EXACT.contains(&lowered.as_str()) {
         return true;
     }
-    lowered.ends_with("_token")
-        || lowered.ends_with("_key")
-        || lowered.ends_with("_secret")
-        || lowered.ends_with("_password")
-        || lowered.ends_with("apikey")
+    const WORDS: [&str; 9] = [
+        "token",
+        "key",
+        "secret",
+        "password",
+        "credential",
+        "credentials",
+        "cookie",
+        "passphrase",
+        "authorization",
+    ];
+    lowered.ends_with("apikey")
+        || WORDS
+            .iter()
+            .any(|word| ends_with_secret_word(&lowered, word))
 }
 
 /// `=` and `:` are deliberately excluded so `NAME=value` and `Header: value`
@@ -398,6 +421,48 @@ mod tests {
         assert!(assigned.contains(REDACTED));
         assert_eq!(policy().scrub("monkey=business"), "monkey=business");
         assert_eq!(policy().scrub("keystone habits"), "keystone habits");
+    }
+
+    #[test]
+    fn header_and_compound_secret_keys_are_redacted() {
+        let value = policy().scrub_value(&json!({
+            "x-api-key": "zeta-key-value",
+            "X-Api-Key": "eta-key-value",
+            "access-token": "theta-token-value",
+            "client.secret": "iota-secret-value",
+            "Proxy-Authorization": "kappa-auth-value",
+            "Set-Cookie": "lambda-cookie-value",
+            "oauth2Token": "mu-token-value",
+            "clientCredentials": "nu-cred-value",
+            "client_credentials": "xi-cred-value",
+            "passphrase": "omicron-pass-value",
+            "accesstoken": "pi-token-value",
+            "tokenCount": 7,
+            "keyId": "key-visible",
+            "monkey": "monkey-visible"
+        }));
+        for (key, secret) in [
+            ("x-api-key", "zeta-key-value"),
+            ("X-Api-Key", "eta-key-value"),
+            ("access-token", "theta-token-value"),
+            ("client.secret", "iota-secret-value"),
+            ("Proxy-Authorization", "kappa-auth-value"),
+            ("Set-Cookie", "lambda-cookie-value"),
+            ("oauth2Token", "mu-token-value"),
+            ("clientCredentials", "nu-cred-value"),
+            ("client_credentials", "xi-cred-value"),
+            ("passphrase", "omicron-pass-value"),
+            ("accesstoken", "pi-token-value"),
+        ] {
+            assert_eq!(value[key], REDACTED, "{key}");
+            assert!(
+                !value.to_string().contains(secret),
+                "{key} left {secret} in {value}"
+            );
+        }
+        assert_eq!(value["tokenCount"], 7);
+        assert_eq!(value["keyId"], "key-visible");
+        assert_eq!(value["monkey"], "monkey-visible");
     }
 
     #[test]
