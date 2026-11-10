@@ -381,6 +381,210 @@ Never claim a test, build, or file change that you did not actually observe.\n\
 "
 }
 
+/// Prompt that asks for a type rename while keeping `PRODUCT_LABEL` text.
+///
+/// Returns the source and destination identifiers. A prompt that does not
+/// require the product label to stay put is ignored.
+pub(crate) fn preserved_label_rename_request(prompt: &str) -> Option<(String, String)> {
+    if !prompt.contains("PRODUCT_LABEL") {
+        return None;
+    }
+    let lower = prompt.to_ascii_lowercase();
+    if !lower.contains("remain") && !lower.contains("do not rename") {
+        return None;
+    }
+    let tail = prompt.split("Rename the type ").nth(1)?;
+    let (from, rest) = take_rust_ident(tail)?;
+    let rest = rest.strip_prefix(" to ")?;
+    let (to, _) = take_rust_ident(rest)?;
+    if from == to {
+        return None;
+    }
+    Some((from, to))
+}
+
+fn take_rust_ident(text: &str) -> Option<(String, &str)> {
+    let mut end = 0usize;
+    for (index, character) in text.char_indices() {
+        let ok = if index == 0 {
+            character == '_' || character.is_ascii_alphabetic()
+        } else {
+            character == '_' || character.is_ascii_alphanumeric()
+        };
+        if !ok {
+            break;
+        }
+        end = index + character.len_utf8();
+    }
+    if end == 0 {
+        return None;
+    }
+    Some((text[..end].to_string(), &text[end..]))
+}
+
+/// Rename a Rust identifier. String, character, byte, and raw-string literals
+/// are copied unchanged, and so are comments.
+pub(crate) fn rename_rust_ident_keep_literals(source: &str, from: &str, to: &str) -> String {
+    let bytes = source.as_bytes();
+    let mut out = String::with_capacity(source.len() + to.len());
+    let mut index = 0usize;
+    while index < bytes.len() {
+        if bytes[index] == b'/' && bytes.get(index + 1) == Some(&b'/') {
+            let end = bytes[index..]
+                .iter()
+                .position(|byte| *byte == b'\n')
+                .map(|offset| index + offset + 1)
+                .unwrap_or(bytes.len());
+            out.push_str(&source[index..end]);
+            index = end;
+            continue;
+        }
+        if bytes[index] == b'/' && bytes.get(index + 1) == Some(&b'*') {
+            if let Some(relative) = source[index + 2..].find("*/") {
+                let end = index + 2 + relative + 2;
+                out.push_str(&source[index..end]);
+                index = end;
+                continue;
+            }
+        }
+        if let Some(end) = raw_string_end(source, index) {
+            out.push_str(&source[index..end]);
+            index = end;
+            continue;
+        }
+        if bytes[index] == b'b' && bytes.get(index + 1) == Some(&b'"') {
+            let end = ordinary_string_end(source, index + 1);
+            out.push_str(&source[index..end]);
+            index = end;
+            continue;
+        }
+        if bytes[index] == b'b' && bytes.get(index + 1) == Some(&b'\'') {
+            if let Some(end) = char_literal_end(source, index + 1) {
+                out.push_str(&source[index..end]);
+                index = end;
+                continue;
+            }
+        }
+        if bytes[index] == b'"' {
+            let end = ordinary_string_end(source, index);
+            out.push_str(&source[index..end]);
+            index = end;
+            continue;
+        }
+        if bytes[index] == b'\'' {
+            if let Some(end) = char_literal_end(source, index) {
+                out.push_str(&source[index..end]);
+                index = end;
+                continue;
+            }
+        }
+        if is_ident_start(bytes[index]) {
+            let start = index;
+            index += 1;
+            while index < bytes.len() && is_ident_continue(bytes[index]) {
+                index += 1;
+            }
+            let ident = &source[start..index];
+            if ident == from {
+                out.push_str(to);
+            } else {
+                out.push_str(ident);
+            }
+            continue;
+        }
+        let character = source[index..].chars().next().unwrap_or('\u{fffd}');
+        out.push(character);
+        index += character.len_utf8();
+    }
+    out
+}
+
+fn is_ident_start(byte: u8) -> bool {
+    byte.is_ascii_alphabetic() || byte == b'_'
+}
+
+fn is_ident_continue(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_'
+}
+
+fn ordinary_string_end(source: &str, open_quote: usize) -> usize {
+    let bytes = source.as_bytes();
+    let mut index = open_quote + 1;
+    while index < bytes.len() {
+        if bytes[index] == b'\\' {
+            index = index.saturating_add(2).min(bytes.len());
+            continue;
+        }
+        if bytes[index] == b'"' {
+            return index + 1;
+        }
+        index += 1;
+    }
+    source.len()
+}
+
+fn char_literal_end(source: &str, open_quote: usize) -> Option<usize> {
+    let bytes = source.as_bytes();
+    let mut index = open_quote + 1;
+    if bytes.get(index) == Some(&b'\\') {
+        index += 1;
+        if index >= bytes.len() {
+            return None;
+        }
+        index += 1;
+    } else {
+        let character = source.get(index..)?.chars().next()?;
+        if character == '\'' {
+            return None;
+        }
+        index += character.len_utf8();
+    }
+    if bytes.get(index) == Some(&b'\'') {
+        Some(index + 1)
+    } else {
+        None
+    }
+}
+
+fn raw_string_end(source: &str, start: usize) -> Option<usize> {
+    let bytes = source.as_bytes();
+    let mut index = start;
+    if bytes.get(index) == Some(&b'b') && bytes.get(index + 1) == Some(&b'r') {
+        index += 2;
+    } else if bytes.get(index) == Some(&b'r') {
+        index += 1;
+    } else {
+        return None;
+    }
+    let mut hashes = 0usize;
+    while bytes.get(index) == Some(&b'#') {
+        hashes += 1;
+        index += 1;
+    }
+    if bytes.get(index) != Some(&b'"') {
+        return None;
+    }
+    index += 1;
+    let closer = format!("\"{}", "#".repeat(hashes));
+    let relative = source.get(index..)?.find(&closer)?;
+    Some(index + relative + closer.len())
+}
+
+/// Rust sources under `src/`, skipping nothing else in that tree.
+pub(crate) fn collect_rust_sources(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_rust_sources(&path, out);
+        } else if path.extension().is_some_and(|ext| ext == "rs") {
+            out.push(path);
+        }
+    }
+}
+
 pub(crate) async fn tool_web_fetch(url: &str) -> Result<local_tools::ToolResult> {
     // #179 SSRF preflight (always, including offline)
     let ssrf = crate::ssrf::check_url(url);
@@ -4228,6 +4432,42 @@ mod efficiency_tests {
             g.contains("blind") && g.contains("sed"),
             "must warn against blind whole-tree rewrites"
         );
+    }
+
+    #[test]
+    fn preserved_label_rename_keeps_literals_and_ignores_other_prompts() {
+        let prompt = "Rename the type OldThing to NewThing across the crate so cargo test passes. \
+                      The user-facing PRODUCT_LABEL string must remain exactly the characters OldThing.";
+        assert_eq!(
+            preserved_label_rename_request(prompt),
+            Some(("OldThing".into(), "NewThing".into()))
+        );
+        assert!(preserved_label_rename_request("Rename the type OldThing to NewThing").is_none());
+
+        let source = "\
+use crate::OldThing;
+/// User-facing product name — MUST stay exactly \"OldThing\" for telemetry.
+pub const PRODUCT_LABEL: &str = \"OldThing\";
+pub struct OldThing { pub id: u32 }
+impl OldThing { pub fn new(id: u32) -> Self { Self { id } } }
+pub fn banner(t: &OldThing) -> String { format!(\"{PRODUCT_LABEL}#{}\", t.id) }
+const RAW: &str = r#\"OldThing\"#;
+const BYTE: &[u8] = b\"OldThing\";
+fn OldThingExtra() {}
+/* struct OldThing stays in a comment */
+";
+        let renamed = rename_rust_ident_keep_literals(source, "OldThing", "NewThing");
+        assert!(renamed.contains("use crate::NewThing;"));
+        assert!(renamed.contains("pub struct NewThing"));
+        assert!(renamed.contains("impl NewThing"));
+        assert!(renamed.contains("&NewThing"));
+        assert!(renamed.contains("\"OldThing\""));
+        assert!(renamed.contains("r#\"OldThing\"#"));
+        assert!(renamed.contains("b\"OldThing\""));
+        assert!(renamed.contains("fn OldThingExtra()"));
+        assert!(renamed.contains("/* struct OldThing stays in a comment */"));
+        assert!(!renamed.contains("struct OldThing {"));
+        assert!(!renamed.contains("use crate::OldThing"));
     }
 
     #[test]

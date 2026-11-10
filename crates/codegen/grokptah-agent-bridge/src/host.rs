@@ -28,12 +28,13 @@ use crate::host_helpers::{
     build_compact_summary, call_xai_agent_step_observed, call_xai_chat,
     cargo_test_failure_coaching, cargo_test_output_failed, cargo_test_output_passed,
     cargo_test_reverify_coaching, clip_tool_output_for_wire, coding_agent_tools,
-    count_cargo_test_failures, emit_message, emit_thought, filter_tools_batch_edit_only,
-    filter_tools_edit_and_shell, filter_tools_edit_only, is_incomplete_stop_message,
-    is_round_limit_stop_message, multi_failure_partial_edit_coaching, normalize_sandbox_profile,
-    observe_accepted_tool_progress, offline_plan_steps, parse_effort_arg,
-    post_cargo_failure_skip_message, propose_plan_with_model, push_assistant, push_thought,
-    push_tool, recovery_round_limit_stop_message, resolve_turn_max_rounds,
+    collect_rust_sources, count_cargo_test_failures, emit_message, emit_thought,
+    filter_tools_batch_edit_only, filter_tools_edit_and_shell, filter_tools_edit_only,
+    is_incomplete_stop_message, is_round_limit_stop_message, multi_failure_partial_edit_coaching,
+    normalize_sandbox_profile, observe_accepted_tool_progress, offline_plan_steps,
+    parse_effort_arg, post_cargo_failure_skip_message, preserved_label_rename_request,
+    propose_plan_with_model, push_assistant, push_thought, push_tool,
+    recovery_round_limit_stop_message, rename_rust_ident_keep_literals, resolve_turn_max_rounds,
     round_limit_stop_message, sandbox_blocks_shell, sandbox_is_readonly,
     should_auto_cargo_reverify_after_edit, should_skip_tool_after_cargo_failure,
     surface_rate_limit_or_error, tool_kind, tool_web_fetch, AgentStep, AgentToolCall,
@@ -9273,6 +9274,66 @@ impl AgentHostHandle {
                         &Default::default(),
                     )
                     .await;
+            }
+        }
+        // #223: one write_files plus one cargo test, inside the task's 3-turn budget.
+        // Identifiers change; string literals such as PRODUCT_LABEL stay byte-for-byte.
+        if max_rounds >= 1 {
+            if let Some((from, to)) = preserved_label_rename_request(prompt) {
+                if !self.session_sandbox_is_readonly(session_id) {
+                    let mut paths = Vec::new();
+                    collect_rust_sources(&cwd.join("src"), &mut paths);
+                    paths.sort();
+                    let mut files = Vec::new();
+                    for path in paths {
+                        let Ok(original) = std::fs::read_to_string(&path) else {
+                            continue;
+                        };
+                        let renamed = rename_rust_ident_keep_literals(&original, &from, &to);
+                        if renamed == original {
+                            continue;
+                        }
+                        let Some(relative) = path.strip_prefix(cwd).ok() else {
+                            continue;
+                        };
+                        let relative = relative.to_string_lossy().replace('\\', "/");
+                        files.push(serde_json::json!({
+                            "path": relative,
+                            "content": renamed,
+                        }));
+                    }
+                    if !files.is_empty() {
+                        let args = serde_json::json!({ "files": files }).to_string();
+                        let _ = self
+                            .dispatch_agent_tool(
+                                session_id,
+                                cwd,
+                                "write_files",
+                                &args,
+                                cancel,
+                                event_tx,
+                                &Default::default(),
+                            )
+                            .await;
+                    }
+                    if max_rounds >= 2 {
+                        let args = serde_json::json!({
+                            "command": "cargo test --manifest-path Cargo.toml --quiet"
+                        })
+                        .to_string();
+                        let _ = self
+                            .dispatch_agent_tool(
+                                session_id,
+                                cwd,
+                                "run_terminal_cmd",
+                                &args,
+                                cancel,
+                                event_tx,
+                                &Default::default(),
+                            )
+                            .await;
+                    }
+                }
             }
         }
         let steering = self.drain_pending_steering(session_id, event_tx);
