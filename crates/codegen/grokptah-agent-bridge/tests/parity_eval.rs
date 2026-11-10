@@ -435,3 +435,85 @@ async fn rate_limited_surfaces_user_visible_event() {
         other => panic!("expected RateLimited, got {other:?}"),
     }
 }
+
+fn copy_tree(src: &std::path::Path, dst: &std::path::Path) {
+    fs::create_dir_all(dst).unwrap();
+    for entry in fs::read_dir(src).unwrap() {
+        let entry = entry.unwrap();
+        let name = entry.file_name();
+        if name == "target" || name == ".git" {
+            continue;
+        }
+        let to = dst.join(&name);
+        if entry.path().is_dir() {
+            copy_tree(&entry.path(), &to);
+        } else {
+            fs::copy(entry.path(), to).unwrap();
+        }
+    }
+}
+
+/// Checked-in `rename_keep_display_label` under the offline host, max_turns 3.
+#[tokio::test]
+async fn rename_keep_display_label_passes_offline_within_three_turns() {
+    let _iso = IsolatedHome::install();
+    let evals = grokptah_agent_bridge::eval_oracle::find_evals_root()
+        .expect("evals/ next to the bridge crate");
+    let tasks = grokptah_agent_bridge::eval_oracle::load_tasks_json(&evals.join("tasks.json"))
+        .expect("tasks.json");
+    let task = tasks
+        .iter()
+        .find(|task| task["id"] == "rename_keep_display_label")
+        .expect("checked-in task");
+    assert_eq!(task["max_turns"], 3, "do not raise the turn budget");
+    let prompt = task["prompt"].as_str().expect("prompt").to_string();
+    let spec = grokptah_agent_bridge::eval_oracle::parse_success(&task["success"])
+        .expect("oracle stays structured");
+
+    let work = tempfile::tempdir().unwrap();
+    copy_tree(&evals.join("fixtures/rename_keep_label"), work.path());
+    let before = fs::read_to_string(work.path().join("src/types.rs")).unwrap();
+    assert!(
+        before.contains("struct OldThing"),
+        "fixture must start unsolved"
+    );
+
+    let host = AgentHost::create(HostConfig {
+        always_approve: true,
+        ..HostConfig::default()
+    })
+    .expect("acquire the GrokPtah instance lock");
+    let mut rx = host.take_event_receiver().unwrap();
+    host.start().unwrap();
+    host.set_project_cwd(work.path()).unwrap();
+    let session = host.session_new().unwrap();
+    host.session_prompt_with_max_rounds(session.id, prompt, Some(3))
+        .await
+        .unwrap();
+
+    let mut tools = Vec::new();
+    loop {
+        match timeout(Duration::from_secs(15), rx.recv()).await {
+            Ok(Some(SessionUpdate::ToolCall { title, .. })) => tools.push(title),
+            Ok(Some(SessionUpdate::TurnComplete { .. })) => break,
+            Ok(Some(_)) => {}
+            _ => break,
+        }
+    }
+    assert!(
+        tools.len() <= 3,
+        "offline rename must stay inside the 3-turn budget, tools={tools:?}"
+    );
+    assert!(
+        tools.iter().any(|title| title == "write_files"),
+        "rename must land through write_files, tools={tools:?}"
+    );
+
+    let label = fs::read_to_string(work.path().join("src/display.rs")).unwrap();
+    assert!(
+        label.contains("pub const PRODUCT_LABEL: &str = \"OldThing\";"),
+        "PRODUCT_LABEL must stay exactly OldThing:\n{label}"
+    );
+    let oracle = grokptah_agent_bridge::eval_oracle::evaluate(work.path(), &spec);
+    assert!(oracle.ok, "oracle failed: {}", oracle.detail);
+}
