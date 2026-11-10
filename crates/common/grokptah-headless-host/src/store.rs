@@ -476,9 +476,18 @@ impl Store {
     }
 
     /// Insert a freshly admitted run.
+    ///
+    /// Refuses when that identity is already durable. Replacing the record
+    /// would discard recovery evidence, including an indeterminate dispatch.
     pub fn insert(&mut self, record: RunRecord) -> HostResult<()> {
         let run_id = record.run_id.clone();
         let dir = self.run_dir(&run_id);
+        if self.records.contains_key(&run_id) || dir.join(RECORD_FILE).exists() {
+            return Err(HostError::invalid(
+                "run_exists",
+                "a run with this identity is already durable",
+            ));
+        }
         std::fs::create_dir_all(&dir).map_err(|error| io_error("home_unwritable", &error))?;
         let journal = Journal::open(&dir.join(EVENTS_FILE), self.retention)?;
         self.journals.insert(run_id.clone(), journal);

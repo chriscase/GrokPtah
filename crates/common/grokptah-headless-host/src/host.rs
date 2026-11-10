@@ -377,6 +377,29 @@ impl HeadlessHost {
             return to_value(&json!({ "run": status, "replayed": true }));
         }
 
+        // The run record is durable before the ledger row. A crash in that
+        // window leaves the run and, after restart, its recovery evidence,
+        // with no ledger entry to find. The identity is determined by the
+        // request, so the retry must adopt that record instead of inserting
+        // a new queued one over it.
+        let run_id = opaque_id("run", &[&self.config.session_id, &workspace, request_id]);
+        if self.store.get(&run_id).is_ok() {
+            let existing_fingerprint = self.store.get(&run_id)?.request_fingerprint.clone();
+            if existing_fingerprint != request_fingerprint {
+                return Err(HostError::invalid(
+                    "idempotency_conflict",
+                    "this request id was already used with different content",
+                )
+                .with_request_id(request_id));
+            }
+            if self.store.ledger_lookup(request_id).is_none() {
+                self.store
+                    .ledger_record(request_id, &run_id, &request_fingerprint)?;
+            }
+            let status = self.status(&run_id)?;
+            return to_value(&json!({ "run": status, "replayed": true }));
+        }
+
         if self.engine.is_none() {
             return Err(HostError::unavailable(
                 "engine_disabled",
@@ -403,7 +426,6 @@ impl HeadlessHost {
         }
 
         let now = self.clock.now_rfc3339();
-        let run_id = opaque_id("run", &[&self.config.session_id, &workspace, request_id]);
         let (prompt_preview, _) = self
             .redaction
             .scrub_bounded(prompt, MAX_PROMPT_PREVIEW_BYTES);

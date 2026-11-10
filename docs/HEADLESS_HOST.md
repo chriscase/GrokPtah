@@ -31,7 +31,7 @@ redaction contract, idempotency behavior, and recovery behavior.
 | May | Admit and bound its own runs; hold short-lived control leases; recover its own interrupted runs; publish redacted projections |
 | May never | Write another GrokPtah home; originate work by itself; hold or read credentials; grant Computer Use; resume interrupted work without an explicit operator action; widen a capability it was not configured with |
 | Redaction | Every value is scrubbed at the write boundary, before it is journaled and again before it is projected |
-| Idempotency | A durable ledger keyed by `requestId`; an exact retry replays, a changed payload is refused |
+| Idempotency | A durable ledger keyed by `requestId`. An exact retry replays the existing run even when the ledger row was never written; a changed payload is refused, and the recovered run — including dispatch-indeterminate evidence — is left in place |
 | Recovery | Opening the store marks queued/running runs `interrupted`; they are never auto-resumed |
 
 ### Which ADR-002 trigger this satisfies

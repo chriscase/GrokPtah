@@ -2,11 +2,11 @@
 
 mod common;
 
-use common::{Harness, ok, phase, refused, revision, submit};
-use grokptah_headless_host::control::ControlCommand;
+use common::{Harness, ok, phase, refused, revision, send, submit};
+use grokptah_headless_host::control::{ControlCommand, ControlResult};
 use grokptah_headless_host::lease::ControlClass;
 use grokptah_headless_host::lifecycle::{HostState, ShutdownKind};
-use serde_json::json;
+use serde_json::{Value, json};
 
 #[test]
 fn a_graceful_stop_checkpoints_live_runs_so_the_next_start_can_resume() {
@@ -239,4 +239,123 @@ fn a_torn_journal_tail_is_discarded_and_reported() {
         events["page"]["entries"].as_array().expect("entries").len(),
         intact_lines
     );
+}
+
+/// Admit a run, then leave the on-disk state a crash between the run record
+/// and the idempotency ledger would leave: the record is durable, a dispatch
+/// is in flight, and the ledger row was never written.
+fn open_after_crash_before_ledger(prompt: &str) -> (Harness, String) {
+    let harness = Harness::new();
+    let run_id = {
+        let mut host = harness.open();
+        submit(&mut host, "req-crash", prompt)
+    };
+
+    let path = harness
+        .home
+        .path()
+        .join("runs")
+        .join(&run_id)
+        .join("record.json");
+    let mut record: Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).expect("record")).expect("json");
+    record["phase"] = json!("paused");
+    record["dispatch"] = json!({
+        "ordinal": 1,
+        "round": 1,
+        "startedAt": "2026-01-01T00:00:00Z"
+    });
+    std::fs::write(&path, serde_json::to_vec_pretty(&record).expect("encode")).expect("plant");
+    std::fs::remove_file(harness.home.path().join("idempotency.json")).expect("drop ledger");
+
+    let mut host = harness.open();
+    let report = host.startup_report();
+    assert_eq!(report.recovery.indeterminate_dispatch, vec![run_id.clone()]);
+    assert_eq!(phase(&mut host, &run_id), "interrupted");
+    drop(host);
+    (harness, run_id)
+}
+
+fn durable_record(harness: &Harness, run_id: &str) -> Value {
+    let path = harness
+        .home
+        .path()
+        .join("runs")
+        .join(run_id)
+        .join("record.json");
+    serde_json::from_str(&std::fs::read_to_string(&path).expect("record")).expect("json")
+}
+
+#[test]
+fn retry_after_crash_before_ledger_keeps_recovered_run() {
+    let (harness, run_id) = open_after_crash_before_ledger("say hello");
+    let mut host = harness.open();
+    let before = durable_record(&harness, &run_id);
+    assert_eq!(
+        before["dispatch"]["settled"]["disposition"],
+        "indeterminate"
+    );
+    assert_eq!(before["stopReason"], "dispatch_indeterminate");
+    let events = harness
+        .home
+        .path()
+        .join("runs")
+        .join(&run_id)
+        .join("events.jsonl");
+    let events_before = std::fs::read_to_string(&events).expect("events");
+
+    let replay = ok(
+        &mut host,
+        ControlCommand::Submit {
+            request_id: "req-crash".to_owned(),
+            prompt: "say hello".to_owned(),
+            bounds: None,
+            execution_mode: None,
+            allow_queue: Some(true),
+        },
+    );
+    assert_eq!(replay["replayed"], true);
+    assert_eq!(replay["run"]["durable"]["runId"], run_id);
+    assert_eq!(durable_record(&harness, &run_id), before);
+    assert_eq!(phase(&mut host, &run_id), "interrupted");
+
+    ok(&mut host, ControlCommand::Tick { steps: Some(4) });
+    assert_eq!(durable_record(&harness, &run_id), before);
+    assert_eq!(phase(&mut host, &run_id), "interrupted");
+    assert_eq!(
+        std::fs::read_to_string(&events).expect("events"),
+        events_before
+    );
+}
+
+#[test]
+fn retry_after_crash_before_ledger_conflicts_on_different_content() {
+    let (harness, run_id) = open_after_crash_before_ledger("say hello");
+    let mut host = harness.open();
+    let before = durable_record(&harness, &run_id);
+
+    let reply = send(
+        &mut host,
+        ControlCommand::Submit {
+            request_id: "req-crash".to_owned(),
+            prompt: "say something else".to_owned(),
+            bounds: None,
+            execution_mode: None,
+            allow_queue: Some(true),
+        },
+    );
+    assert_eq!(
+        durable_record(&harness, &run_id),
+        before,
+        "a conflicting retry must not rewrite the recovered run"
+    );
+    match reply.result {
+        ControlResult::Error { error } => {
+            assert_eq!(error.reason_code.as_deref(), Some("idempotency_conflict"));
+        }
+        ControlResult::Ok { payload } => {
+            panic!("conflicting retry was accepted: {payload}");
+        }
+    }
+    assert_eq!(phase(&mut host, &run_id), "interrupted");
 }
