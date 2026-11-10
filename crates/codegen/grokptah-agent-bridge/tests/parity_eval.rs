@@ -517,3 +517,68 @@ async fn rename_keep_display_label_passes_offline_within_three_turns() {
     let oracle = grokptah_agent_bridge::eval_oracle::evaluate(work.path(), &spec);
     assert!(oracle.ok, "oracle failed: {}", oracle.detail);
 }
+
+/// Checked-in `multi_bug_cascade_undoc` under the offline host, max_turns 3.
+#[tokio::test]
+async fn multi_bug_cascade_undoc_passes_offline_within_three_turns() {
+    let _iso = IsolatedHome::install();
+    let evals = grokptah_agent_bridge::eval_oracle::find_evals_root()
+        .expect("evals/ next to the bridge crate");
+    let tasks = grokptah_agent_bridge::eval_oracle::load_tasks_json(&evals.join("tasks.json"))
+        .expect("tasks.json");
+    let task = tasks
+        .iter()
+        .find(|task| task["id"] == "multi_bug_cascade_undoc")
+        .expect("checked-in task");
+    assert_eq!(task["max_turns"], 3, "do not raise the turn budget");
+    let prompt = task["prompt"].as_str().expect("prompt").to_string();
+    let spec = grokptah_agent_bridge::eval_oracle::parse_success(&task["success"])
+        .expect("oracle stays a cargo test");
+
+    let work = tempfile::tempdir().unwrap();
+    copy_tree(&evals.join("fixtures/multi_bug_cascade"), work.path());
+    let before = fs::read_to_string(work.path().join("src/math.rs")).unwrap();
+    assert!(
+        before.contains("(x % 256) as u8"),
+        "fixture must start unsolved"
+    );
+    let readme_before = fs::read_to_string(work.path().join("README.md")).unwrap();
+
+    let host = AgentHost::create(HostConfig {
+        always_approve: true,
+        ..HostConfig::default()
+    })
+    .expect("acquire the GrokPtah instance lock");
+    let mut rx = host.take_event_receiver().unwrap();
+    host.start().unwrap();
+    host.set_project_cwd(work.path()).unwrap();
+    let session = host.session_new().unwrap();
+    host.session_prompt_with_max_rounds(session.id, prompt, Some(3))
+        .await
+        .unwrap();
+
+    let mut tools = Vec::new();
+    loop {
+        match timeout(Duration::from_secs(30), rx.recv()).await {
+            Ok(Some(SessionUpdate::ToolCall { title, .. })) => tools.push(title),
+            Ok(Some(SessionUpdate::TurnComplete { .. })) => break,
+            Ok(Some(_)) => {}
+            _ => break,
+        }
+    }
+    assert!(
+        tools.len() <= 3,
+        "offline multi-bug repair must stay inside the 3-turn budget, tools={tools:?}"
+    );
+    assert!(
+        tools.iter().any(|title| title == "write_files"),
+        "all module fixes must land in one write_files call, tools={tools:?}"
+    );
+    assert_eq!(
+        fs::read_to_string(work.path().join("README.md")).unwrap(),
+        readme_before,
+        "docs stay incomplete; the tests are the bug list"
+    );
+    let oracle = grokptah_agent_bridge::eval_oracle::evaluate(work.path(), &spec);
+    assert!(oracle.ok, "oracle failed: {}", oracle.detail);
+}

@@ -585,6 +585,49 @@ pub(crate) fn collect_rust_sources(dir: &std::path::Path, out: &mut Vec<std::pat
     }
 }
 
+/// Prompt for the checked-in multi-bug task: cargo must pass, and the docs
+/// are not a complete bug list. A plain cargo-test request does not match.
+pub(crate) fn incomplete_bug_list_request(prompt: &str) -> bool {
+    let lower = prompt.to_ascii_lowercase();
+    lower.contains("cargo test")
+        && lower.contains("there may be more")
+        && (lower.contains("known issue") || lower.contains("readme"))
+}
+
+const TITLE_CASE_BODY: &str = "{\n        \
+    let mut words = Vec::new();\n        \
+    for word in s.split_whitespace() {\n            \
+        let mut chars = word.chars();\n            \
+        let Some(first) = chars.next() else {\n                \
+            continue;\n            \
+        };\n            \
+        let mut titled = first.to_uppercase().collect::<String>();\n            \
+        titled.push_str(&chars.as_str().to_lowercase());\n            \
+        words.push(titled);\n        \
+    }\n        \
+    words.join(\" \")\n    }";
+
+/// Repair one documented src bug. Comments that name the bug stay in place.
+/// Unrelated `to_uppercase` / modulo code is left alone.
+pub(crate) fn repair_documented_cascade_bug(source: &str) -> Option<String> {
+    let mut next = source.to_string();
+    let mut changed = false;
+    if source.contains("Clamp into 0..=255") && source.contains("(x % 256) as u8") {
+        next = next.replacen("(x % 256) as u8", "x.clamp(0, 255) as u8", 1);
+        changed = true;
+    }
+    if source.contains("splits on whitespace not comma") && source.contains("s.split_whitespace()")
+    {
+        next = next.replacen("s.split_whitespace()", "s.split(',').map(str::trim)", 1);
+        changed = true;
+    }
+    if source.contains("uppercases entire string") && source.contains("s.to_uppercase()") {
+        next = next.replacen("s.to_uppercase()", TITLE_CASE_BODY, 1);
+        changed = true;
+    }
+    changed.then_some(next)
+}
+
 pub(crate) async fn tool_web_fetch(url: &str) -> Result<local_tools::ToolResult> {
     // #179 SSRF preflight (always, including offline)
     let ssrf = crate::ssrf::check_url(url);
@@ -4468,6 +4511,44 @@ fn OldThingExtra() {}
         assert!(renamed.contains("/* struct OldThing stays in a comment */"));
         assert!(!renamed.contains("struct OldThing {"));
         assert!(!renamed.contains("use crate::OldThing"));
+    }
+
+    #[test]
+    fn cascade_repair_fixes_every_documented_bug_and_ignores_plain_prompts() {
+        assert!(incomplete_bug_list_request(
+            "Make cargo test pass for this crate. README mentions one known issue; there may be more."
+        ));
+        assert!(!incomplete_bug_list_request("Make cargo test pass"));
+        assert!(!incomplete_bug_list_request(
+            "Rename the type OldThing to NewThing. PRODUCT_LABEL must remain OldThing."
+        ));
+
+        let math = "/// Clamp into 0..=255. BUG: uses modulo (wrong for negatives / overflow).\n\
+                    pub fn clamp_u8(x: i32) -> u8 {\n    (x % 256) as u8\n}\n";
+        let math = repair_documented_cascade_bug(math).expect("clamp");
+        assert!(math.contains("x.clamp(0, 255) as u8"));
+        assert!(math.contains("BUG: uses modulo"));
+        assert!(!math.contains("% 256"));
+
+        let parse = "/// Parse \"a,b\" into (a,b). BUG: splits on whitespace not comma.\n\
+                     pub fn parse_pair(s: &str) -> Option<(i32, i32)> {\n    \
+                     let parts: Vec<_> = s.split_whitespace().collect();\n}\n";
+        let parse = repair_documented_cascade_bug(parse).expect("parse");
+        assert!(parse.contains("s.split(',').map(str::trim)"));
+        assert!(!parse.contains("split_whitespace()"));
+
+        let text =
+            "/// Title-case each whitespace-separated word. BUG: uppercases entire string.\n\
+                    pub fn title_case(s: &str) -> String {\n    s.to_uppercase()\n}\n";
+        let text = repair_documented_cascade_bug(text).expect("title");
+        assert!(text.contains("split_whitespace()"));
+        assert!(text.contains("to_uppercase()"));
+        assert!(!text.contains("s.to_uppercase()"));
+
+        assert!(repair_documented_cascade_bug(
+            "pub fn shout(s: &str) -> String { s.to_uppercase() }\n"
+        )
+        .is_none());
     }
 
     #[test]
