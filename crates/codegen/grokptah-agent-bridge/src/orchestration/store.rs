@@ -10636,7 +10636,7 @@ impl OrchStore {
             receipt.status = "failed".into();
             receipt.error = Some(OrchError::new(
                 OrchErrorCode::Internal,
-                "mutation was interrupted before its durable receipt completed; use a new request_id",
+                super::types::INTERRUPTED_CLAIM_DETAIL,
             ));
             atomic_write_json(&self.lease(), &path, &receipt)?;
             changed += 1;
