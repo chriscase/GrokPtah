@@ -265,7 +265,8 @@ Redaction runs at the **write** boundary, so an unredacted value is never
 durable, and again before any projection is returned. It rewrites the host home
 and workspace roots to `<home>` and `<workspace>`, masks credential-shaped runs
 (issuer-prefixed tokens, `NAME=value` secret assignments, `Authorization` and
-`Bearer` values), replaces secret-named object keys whole, strips control
+`Bearer` values), replaces secret-named object keys whole — snake_case and
+camelCase, so `accessToken` is treated like `access_token` — strips control
 characters, and bounds string size, array width, and nesting depth. Dropped
 content is reported (`<omitted:N more>`), never silently discarded.
 

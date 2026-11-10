@@ -166,6 +166,26 @@ pub fn relative_path(path: &str, max_bytes: usize) -> Option<String> {
     Some(trimmed.to_owned())
 }
 
+/// Split camelCase and acronym boundaries, then lowercase, so `accessToken`
+/// and `APIKey` meet the same checks as `access_token` and `api_key`.
+fn normalize_secret_name(name: &str) -> String {
+    let chars: Vec<char> = name.chars().collect();
+    let mut out = String::with_capacity(name.len() + 4);
+    for (index, character) in chars.iter().copied().enumerate() {
+        if character.is_ascii_uppercase() && index > 0 {
+            let previous = chars[index - 1];
+            let next_is_lower = chars
+                .get(index + 1)
+                .is_some_and(|next| next.is_ascii_lowercase());
+            if previous.is_ascii_lowercase() || (previous.is_ascii_uppercase() && next_is_lower) {
+                out.push('_');
+            }
+        }
+        out.push(character.to_ascii_lowercase());
+    }
+    out
+}
+
 fn is_secret_key(key: &str) -> bool {
     const EXACT: [&str; 12] = [
         "authorization",
@@ -181,7 +201,7 @@ fn is_secret_key(key: &str) -> bool {
         "private_key",
         "session_key",
     ];
-    let lowered = key.to_ascii_lowercase();
+    let lowered = normalize_secret_name(key);
     if EXACT.contains(&lowered.as_str()) {
         return true;
     }
@@ -208,10 +228,10 @@ fn ends_with_secret_word(lowered: &str, word: &str) -> bool {
 }
 
 fn is_secret_assignment_name(run: &str) -> bool {
-    let lowered = run.to_ascii_lowercase();
-    if lowered == "bearer" || is_secret_key(&lowered) {
+    if run.eq_ignore_ascii_case("bearer") || is_secret_key(run) {
         return true;
     }
+    let lowered = normalize_secret_name(run);
     ["key", "token", "secret", "password", "credential"]
         .iter()
         .any(|word| ends_with_secret_word(&lowered, word))
@@ -335,6 +355,48 @@ mod tests {
         );
         // A word that merely ends in a secret word is not a secret name.
         assert_eq!(policy().scrub("monkey business"), "monkey business");
+        assert_eq!(policy().scrub("keystone habits"), "keystone habits");
+    }
+
+    #[test]
+    fn camel_case_secret_names_are_redacted() {
+        let value = policy().scrub_value(&json!({
+            "accessToken": "alpha-token-value",
+            "clientSecret": "beta-secret-value",
+            "privateKey": "gamma-key-value",
+            "apiKey": "delta-key-value",
+            "refreshToken": "epsilon-token-value",
+            "tokenCount": 7
+        }));
+        for (key, secret) in [
+            ("accessToken", "alpha-token-value"),
+            ("clientSecret", "beta-secret-value"),
+            ("privateKey", "gamma-key-value"),
+            ("apiKey", "delta-key-value"),
+            ("refreshToken", "epsilon-token-value"),
+        ] {
+            assert_eq!(value[key], REDACTED, "{key}");
+            assert!(
+                !value.to_string().contains(secret),
+                "{key} left {secret} in {value}"
+            );
+        }
+        assert_eq!(value["tokenCount"], 7);
+
+        let assigned = policy().scrub(
+            "accessToken=alpha-token-value clientSecret: beta-secret-value privateKey=gamma-key-value apiKey=delta-key-value refreshToken=epsilon-token-value",
+        );
+        for secret in [
+            "alpha-token-value",
+            "beta-secret-value",
+            "gamma-key-value",
+            "delta-key-value",
+            "epsilon-token-value",
+        ] {
+            assert!(!assigned.contains(secret), "{assigned}");
+        }
+        assert!(assigned.contains(REDACTED));
+        assert_eq!(policy().scrub("monkey=business"), "monkey=business");
         assert_eq!(policy().scrub("keystone habits"), "keystone habits");
     }
 
