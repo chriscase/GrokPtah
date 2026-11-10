@@ -1,8 +1,9 @@
 //! Fan-out event publisher + bounded redacted journal (#196).
 
+use std::cell::Cell;
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{sync_channel, SyncSender, TrySendError};
 use std::sync::{Arc, OnceLock};
 
@@ -73,6 +74,52 @@ pub struct EventBus {
     /// The directory the journal persists into, kept so the authority above can
     /// be re-checked against the home a runtime actually owns.
     persist_root: Arc<Mutex<Option<PathBuf>>>,
+    /// Per-bus gate so a test can fill the writer queue before the thread
+    /// receives. Production leaves it open; the unpaused path is one load.
+    journal_writer_gate: Arc<JournalWriterGate>,
+}
+
+thread_local! {
+    static PAUSE_NEXT_JOURNAL_WRITER: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Holds the journal writer off `recv` until a test releases it.
+///
+/// The gate belongs to one bus. Pausing it cannot stall another home's writer,
+/// and it never takes or drops an instance lock.
+struct JournalWriterGate {
+    paused: AtomicBool,
+    lock: Mutex<()>,
+    cv: Condvar,
+}
+
+impl JournalWriterGate {
+    fn open() -> Self {
+        Self {
+            paused: AtomicBool::new(false),
+            lock: Mutex::new(()),
+            cv: Condvar::new(),
+        }
+    }
+
+    fn pause(&self) {
+        self.paused.store(true, Ordering::Release);
+    }
+
+    fn release(&self) {
+        self.paused.store(false, Ordering::Release);
+        self.cv.notify_all();
+    }
+
+    fn wait_while_paused(&self) {
+        if !self.paused.load(Ordering::Acquire) {
+            return;
+        }
+        let mut guard = self.lock.lock();
+        while self.paused.load(Ordering::Acquire) {
+            self.cv.wait(&mut guard);
+        }
+    }
 }
 
 impl EventBus {
@@ -500,7 +547,23 @@ impl EventBus {
                 "this event bus has no durable home",
             ))),
             persist_root: Arc::new(Mutex::new(None)),
+            journal_writer_gate: Arc::new(JournalWriterGate::open()),
         }
+    }
+
+    /// Test hook. The next [`Self::with_persist_dir`] on this thread starts its
+    /// journal writer paused, before it receives, so a test can fill the
+    /// bounded queue without racing the writer. Production never calls this.
+    #[doc(hidden)]
+    pub fn pause_next_journal_writer_for_test() {
+        PAUSE_NEXT_JOURNAL_WRITER.with(|flag| flag.set(true));
+    }
+
+    /// Let a writer started by [`Self::pause_next_journal_writer_for_test`]
+    /// receive again. Idempotent, and it does not touch the instance lock.
+    #[doc(hidden)]
+    pub fn release_journal_writer_for_test(&self) {
+        self.journal_writer_gate.release();
     }
 
     /// Register secrets that must never appear in the durable journal.
@@ -531,6 +594,10 @@ impl EventBus {
 
     /// Persist journal under `dir/event_journal.jsonl`; reload tail; compact file.
     pub fn with_persist_dir(self, dir: impl AsRef<Path>) -> Self {
+        let start_paused = PAUSE_NEXT_JOURNAL_WRITER.with(|flag| flag.replace(false));
+        if start_paused {
+            self.journal_writer_gate.pause();
+        }
         let path = dir.as_ref().join("event_journal.jsonl");
         let sequence_path = dir.as_ref().join("event_journal.seq");
         let gap_path = dir.as_ref().join("event_journal.gap.json");
@@ -611,6 +678,7 @@ impl EventBus {
                 let (tx, rx) = sync_channel::<JournalEntry>(256);
                 let persistence_error = self.persistence_error.clone();
                 let journal_gap = self.journal_gap.clone();
+                let writer_gate = self.journal_writer_gate.clone();
                 let writer_path = path.clone();
                 let writer_gap_path = gap_path.clone();
                 let capacity = g.capacity;
@@ -627,6 +695,7 @@ impl EventBus {
                                 capacity,
                                 persistence_error,
                                 journal_gap,
+                                gate: writer_gate,
                             },
                             durable_tail,
                             rx,
@@ -938,6 +1007,7 @@ struct JournalWriterContext {
     capacity: usize,
     persistence_error: Arc<Mutex<Option<String>>>,
     journal_gap: Arc<Mutex<Option<(u64, u64)>>>,
+    gate: Arc<JournalWriterGate>,
 }
 
 fn run_journal_writer(
@@ -954,6 +1024,7 @@ fn run_journal_writer(
         capacity,
         persistence_error,
         journal_gap,
+        gate,
     } = context;
     let (path, gap_path, capacity) = (path.as_path(), gap_path.as_path(), *capacity);
     let persistence_error = persistence_error.as_ref();
@@ -965,6 +1036,7 @@ fn run_journal_writer(
         .unwrap_or(0);
     let mut persisted_gap = load_journal_gap(gap_path).ok();
     loop {
+        gate.wait_while_paused();
         let entry = match rx.recv_timeout(std::time::Duration::from_millis(25)) {
             Ok(entry) => Some(entry),
             Err(RecvTimeoutError::Timeout) => None,
