@@ -1,0 +1,160 @@
+//! Versioned capability discovery contracts.
+
+use serde::{Deserialize, Serialize};
+
+use super::CONTRACT_VERSION;
+
+/// Authority tier advertised to a consumer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CapabilityTier {
+    /// Redacted session, capacity, and event observation.
+    Observe,
+    /// Bounded run or queue mutations within an approved scope.
+    Execute,
+    /// Bounded changes, tests, handoff, and review projections.
+    Review,
+    /// Human-gated approval, promotion, or discard of an isolated run.
+    Promote,
+    /// Redacted Computer Use projections and audit events.
+    ComputerObserve,
+    /// Lease- and revision-fenced Computer Use controls.
+    ComputerControl,
+}
+
+/// Whether a host can expose a capability to the negotiated consumer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CapabilityAvailability {
+    /// Available subject to ordinary scope and authentication checks.
+    Available,
+    /// Present but requires an explicit human or lease grant.
+    Gated,
+    /// Known to the contract but unavailable on this host.
+    Unavailable,
+}
+
+/// One stable capability descriptor.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CapabilityDescriptor {
+    /// Stable identifier such as `run.execute`.
+    pub id: String,
+    /// Authority tier for the capability.
+    pub tier: CapabilityTier,
+    /// Whether an operation can change durable or external state.
+    pub mutating: bool,
+    /// Whether a separate grant is required.
+    pub human_gate: bool,
+    /// Host availability after negotiation.
+    pub availability: CapabilityAvailability,
+    /// Share-safe description for a consumer UI.
+    pub description: String,
+}
+
+/// Versioned capability discovery payload.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CapabilitySet {
+    /// Contract identifier. Must equal [`CONTRACT_VERSION`] for this module.
+    pub contract: String,
+    /// Capabilities advertised by the host.
+    pub capabilities: Vec<CapabilityDescriptor>,
+}
+
+impl CapabilitySet {
+    /// Construct an empty set for the current contract version.
+    pub fn empty() -> Self {
+        Self {
+            contract: CONTRACT_VERSION.to_owned(),
+            capabilities: Vec::new(),
+        }
+    }
+
+    /// Find a capability by its stable identifier.
+    pub fn get(&self, id: &str) -> Option<&CapabilityDescriptor> {
+        self.capabilities
+            .iter()
+            .find(|capability| capability.id == id)
+    }
+
+    /// Reject an unknown contract before a consumer enables any operation.
+    pub fn is_current(&self) -> bool {
+        self.contract == CONTRACT_VERSION && self.is_well_formed()
+    }
+
+    /// Validate the stable descriptor invariants before a consumer enables a
+    /// negotiated operation. This keeps malformed/ambiguous capabilities
+    /// fail-closed even when they arrive through a Rust adapter.
+    pub fn is_well_formed(&self) -> bool {
+        let mut ids = std::collections::HashSet::new();
+        self.capabilities.iter().all(|capability| {
+            valid_capability_id(&capability.id)
+                && capability.id.len() <= 128
+                && !capability.description.is_empty()
+                && capability.description.len() <= 512
+                && (capability.availability != CapabilityAvailability::Gated
+                    || capability.human_gate)
+                && ids.insert(capability.id.as_str())
+        })
+    }
+}
+
+fn valid_capability_id(id: &str) -> bool {
+    if !id.contains('.') {
+        return false;
+    }
+    let mut segments = id.split('.');
+    let Some(first) = segments.next() else {
+        return false;
+    };
+    if first.is_empty()
+        || !first.as_bytes()[0].is_ascii_lowercase()
+        || !first
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+    {
+        return false;
+    }
+    segments.all(|segment| {
+        !segment.is_empty()
+            && segment.as_bytes()[0].is_ascii_lowercase()
+            && segment
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_set_is_current_and_round_trippable() {
+        let set = CapabilitySet::empty();
+        assert!(set.is_current());
+        let encoded = serde_json::to_vec(&set).expect("capability set serializes");
+        let decoded: CapabilitySet =
+            serde_json::from_slice(&encoded).expect("capability set parses");
+        assert_eq!(decoded, set);
+    }
+
+    #[test]
+    fn malformed_ids_and_descriptions_fail_closed() {
+        let mut set = CapabilitySet {
+            contract: CONTRACT_VERSION.into(),
+            capabilities: vec![CapabilityDescriptor {
+                id: "run".into(),
+                tier: CapabilityTier::Observe,
+                mutating: false,
+                human_gate: false,
+                availability: CapabilityAvailability::Available,
+                description: "observe".into(),
+            }],
+        };
+        assert!(!set.is_current());
+        set.capabilities[0].id = "run.observe".into();
+        set.capabilities[0].description.clear();
+        assert!(!set.is_current());
+    }
+}
