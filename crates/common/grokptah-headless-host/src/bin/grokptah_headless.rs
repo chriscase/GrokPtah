@@ -248,11 +248,38 @@ fn serve(config: HostConfig, tick_interval: Duration, exit_on_eof: bool) -> Resu
 }
 
 /// One item read from the operator's stream.
+#[derive(Debug)]
 enum Incoming {
     /// A complete, bounded request line.
     Line(String),
     /// A line that exceeded the request bound and was discarded.
     TooLarge,
+}
+
+/// Bytes consumed at a time while skipping the tail of an oversized line.
+const DISCARD_CHUNK: usize = 512;
+
+/// Drop the rest of an oversized line without retaining it.
+///
+/// The tail is consumed in fixed steps through the next newline or EOF, so a
+/// line that never ends still cannot grow a buffer with the input.
+fn discard_through_newline(reader: &mut impl BufRead) -> std::io::Result<()> {
+    loop {
+        let available = reader.fill_buf()?;
+        if available.is_empty() {
+            return Ok(());
+        }
+        let newline = available.iter().position(|byte| *byte == b'\n');
+        let step = match newline {
+            Some(index) => index + 1,
+            None => available.len(),
+        }
+        .min(DISCARD_CHUNK);
+        reader.consume(step);
+        if newline.is_some_and(|index| index + 1 == step) {
+            return Ok(());
+        }
+    }
 }
 
 /// Read bounded NDJSON request lines until the stream ends.
@@ -275,8 +302,7 @@ fn read_requests(mut reader: impl BufRead, sender: &Sender<Incoming>) {
 
         let terminated = line.last() == Some(&b'\n');
         let message = if !terminated && read > MAX_REQUEST_BYTES {
-            let mut discard = Vec::new();
-            if reader.read_until(b'\n', &mut discard).is_err() {
+            if discard_through_newline(&mut reader).is_err() {
                 return;
             }
             Incoming::TooLarge
@@ -297,4 +323,83 @@ fn emit_line(line: &str) {
     let mut stdout = std::io::stdout().lock();
     let _ = writeln!(stdout, "{line}");
     let _ = stdout.flush();
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::{BufRead, Read};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::mpsc::channel;
+
+    use grokptah_headless_host::control::MAX_REQUEST_BYTES;
+
+    use super::{Incoming, read_requests};
+
+    /// `BufRead` that offers the whole remainder at once and records how many
+    /// bytes one `consume` took after the caller's bounded prefix.
+    struct Revealing {
+        data: Vec<u8>,
+        pos: usize,
+        peak: Arc<AtomicUsize>,
+    }
+
+    impl Read for Revealing {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let n = {
+                let available = self.fill_buf()?;
+                let n = available.len().min(buf.len());
+                buf[..n].copy_from_slice(&available[..n]);
+                n
+            };
+            self.consume(n);
+            Ok(n)
+        }
+    }
+
+    impl BufRead for Revealing {
+        fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+            Ok(&self.data[self.pos..])
+        }
+
+        fn consume(&mut self, amt: usize) {
+            if self.pos > MAX_REQUEST_BYTES {
+                self.peak.fetch_max(amt, Ordering::Relaxed);
+            }
+            self.pos += amt;
+        }
+    }
+
+    #[test]
+    fn oversized_line_without_a_newline_is_discarded_in_bounded_steps() {
+        let mut data = vec![b'x'; MAX_REQUEST_BYTES + 1];
+        data.extend(std::iter::repeat_n(b'y', 200_000));
+        data.push(b'\n');
+        data.extend(br#"{"id":"next"}"#);
+        data.push(b'\n');
+
+        let peak = Arc::new(AtomicUsize::new(0));
+        let reader = Revealing {
+            data,
+            pos: 0,
+            peak: Arc::clone(&peak),
+        };
+        let (sender, receiver) = channel();
+        read_requests(reader, &sender);
+        drop(sender);
+
+        let messages: Vec<Incoming> = receiver.try_iter().collect();
+        assert!(
+            matches!(messages.first(), Some(Incoming::TooLarge)),
+            "expected one oversized-line refusal, got {messages:?}"
+        );
+        match messages.get(1) {
+            Some(Incoming::Line(line)) => assert_eq!(line, r#"{"id":"next"}"#),
+            other => panic!("expected the following line, got {other:?}"),
+        }
+        assert_eq!(messages.len(), 2);
+        let peak = peak.load(Ordering::Relaxed);
+        assert!(peak > 0, "the discard path never consumed the tail");
+        assert!(peak <= 512, "discard consumed {peak} bytes in one step");
+    }
 }
