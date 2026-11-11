@@ -4,6 +4,7 @@ use uuid::Uuid;
 
 use crate::completion::CompletionEvidence;
 use crate::orchestration::RunExecutionMode;
+use crate::stationarity::{SessionStationaryStop, SessionWaitWitness};
 
 /// Whether a session's persisted working directory is safe to use.
 ///
@@ -237,6 +238,13 @@ pub struct Session {
     /// Bounded per-turn completion evidence, restored independently of the transcript.
     #[serde(default)]
     pub completion_history: Vec<SessionCompletion>,
+    /// Host-authored stationary stop. Present from the moment the turn loop
+    /// decides, including when no usage tracker is attached (#465).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stationary_stop: Option<SessionStationaryStop>,
+    /// Host-admitted waits. Deadlines do not slide, and model prose is not stored.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub wait_witnesses: Vec<SessionWaitWitness>,
     /// True once `transcript.jsonl` has been read into `transcript`.
     #[serde(skip)]
     pub transcript_loaded: bool,
@@ -287,6 +295,8 @@ impl Session {
             kind,
             execution_mode: RunExecutionMode::Shared,
             completion_history: Vec::new(),
+            stationary_stop: None,
+            wait_witnesses: Vec::new(),
             transcript_loaded: true,
             persisted_len: 0,
             todos: crate::todo_list::TodoList::default(),

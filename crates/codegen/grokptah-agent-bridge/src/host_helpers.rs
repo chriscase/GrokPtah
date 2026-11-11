@@ -2697,6 +2697,9 @@ where
                         None,
                     );
                 }
+                if e.is_uncertain() {
+                    bail!("provider dispatch outcome is uncertain; no automatic retry");
+                }
                 last_err = Some(
                     if target.dialect
                         == crate::gateway_config::ProviderDialect::OpenAiChatCompletions
@@ -2710,8 +2713,10 @@ where
                         format!("request error: {e}")
                     },
                 );
-                if e.is_safe_to_resend()
-                    && allow_transient_retries
+                if crate::stationarity::dispatch_may_retry_automatically(
+                    e.is_uncertain(),
+                    e.is_safe_to_resend(),
+                ) && allow_transient_retries
                     && transient_retries < MAX_TRANSIENT_RETRIES
                 {
                     let delay = 400 * (1 << transient_retries);

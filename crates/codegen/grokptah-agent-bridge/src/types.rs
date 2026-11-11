@@ -174,6 +174,15 @@ pub struct SubagentInfo {
     /// Whether this child is isolated, shared read-only, or shared mutating.
     #[serde(default)]
     pub execution_mode: SubagentExecutionMode,
+    /// Host-owned observation count. Only the host increments it.
+    #[serde(default)]
+    pub witness_generation: u64,
+}
+
+impl SubagentInfo {
+    pub(crate) fn bump_witness(&mut self) {
+        self.witness_generation = self.witness_generation.saturating_add(1);
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -191,4 +200,13 @@ pub struct BackgroundTask {
     /// Last progress line (visible outside the transcript scroll).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
+    /// Host-owned observation count. Only the host increments it.
+    #[serde(default)]
+    pub witness_generation: u64,
+}
+
+impl BackgroundTask {
+    pub(crate) fn bump_witness(&mut self) {
+        self.witness_generation = self.witness_generation.saturating_add(1);
+    }
 }

@@ -23,6 +23,12 @@ mod hooks;
 mod host;
 mod host_helpers;
 mod host_runtime;
+mod stationarity;
+#[doc(hidden)]
+pub use stationarity::{
+    apply_durable_stationarity_stop, dispatch_may_retry_automatically, note_wait_witness,
+    wait_witness_observation, SessionStationaryStop, SessionWaitWitness, HOST_WAIT_DEADLINE_MS,
+};
 mod instance_lock;
 pub mod managed_provider;
 mod verified_change;

@@ -10398,12 +10398,62 @@ impl OrchStore {
         self.inner.last_run_error.lock().clone()
     }
 
+    fn sessions_with_durable_stationary_stop(orchestration_root: &Path) -> HashSet<Uuid> {
+        if orchestration_root
+            .file_name()
+            .and_then(|name| name.to_str())
+            != Some("orchestration")
+        {
+            return HashSet::new();
+        }
+        let Some(sessions) = orchestration_root
+            .parent()
+            .map(|home| home.join("sessions"))
+        else {
+            return HashSet::new();
+        };
+        let Ok(entries) = fs::read_dir(sessions) else {
+            return HashSet::new();
+        };
+        let mut ids = HashSet::new();
+        for entry in entries.flatten() {
+            let Ok(text) = fs::read_to_string(entry.path().join("meta.json")) else {
+                continue;
+            };
+            let Ok(meta) = serde_json::from_str::<serde_json::Value>(&text) else {
+                continue;
+            };
+            if !meta
+                .get("stationary_stop")
+                .is_some_and(|stop| stop.is_object())
+            {
+                continue;
+            }
+            if let Some(id) = meta
+                .get("id")
+                .and_then(|id| id.as_str())
+                .and_then(|id| Uuid::parse_str(id).ok())
+            {
+                ids.insert(id);
+            }
+        }
+        ids
+    }
+
     pub fn mark_unfinished_interrupted(&self) -> anyhow::Result<usize> {
         let mut n = 0;
         let mut interrupted_agents = Vec::new();
+        let stationary_sessions = Self::sessions_with_durable_stationary_stop(&self.inner.root);
         for mut run in self.list_runs()? {
             let unfinished = matches!(run.state, RunState::Queued | RunState::Running);
-            if unfinished {
+            if unfinished && stationary_sessions.contains(&run.session_id) {
+                // A crash after the host decided the loop was stationary must
+                // not come back as a generic interrupt, and must not be queued
+                // again (#465).
+                crate::stationarity::apply_durable_stationarity_stop(&mut run);
+                run.queue_position = None;
+                n += 1;
+            } else if unfinished {
                 run.state = RunState::Interrupted;
                 run.queue_position = None;
                 run.terminal_result = Some("interrupted".into());

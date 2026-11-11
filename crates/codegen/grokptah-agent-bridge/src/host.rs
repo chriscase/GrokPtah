@@ -72,6 +72,10 @@ use crate::session::{
     WorkspaceStatus,
 };
 use crate::session_store::{self, WorkspaceChrome};
+use crate::stationarity::{
+    apply_durable_stationarity_stop, note_wait_witness, wait_witness_observation,
+    SessionStationaryStop,
+};
 use crate::types::{
     AuthState, BackgroundTask, EffortLevel, McpProjectTrust, McpServerInfo, ModelInfo, PluginInfo,
     SkillInfo, SubagentExecutionMode, SubagentInfo, SubagentIsolationPreference,
@@ -1225,6 +1229,7 @@ impl AgentHostHandle {
                 if subagent.status == "running" {
                     subagent.status = "cancelled".into();
                     subagent.summary = Some("host shutdown".into());
+                    subagent.bump_witness();
                 }
             }
             for (_, token) in g.background_cancels.drain() {
@@ -1234,6 +1239,7 @@ impl AgentHostHandle {
                 if task.status == "running" {
                     task.status = "cancelled".into();
                     task.detail = Some("host shutdown".into());
+                    task.bump_witness();
                 }
             }
             for (_, (_, token)) in g.computer_agent_operations.drain() {
@@ -3474,6 +3480,8 @@ impl AgentHostHandle {
         run.updated_at = Utc::now();
         if let Err(error) = store.persist_finalization(&run) {
             eprintln!("[grokptah] desktop run {run_id} finalization failed: {error:#}");
+        } else if outcome == "stationarity" {
+            self.clear_stationary_stop(session_id);
         }
         if let Err(error) = self.persist_agent_checkpoint(&run, outcome, end_seq, event_tx, store) {
             eprintln!("[grokptah] persistent checkpoint for run {run_id} failed: {error:#}");
@@ -3658,6 +3666,7 @@ impl AgentHostHandle {
         // way to fail here is a handle that outlived its runtime (#455).
         self.lifecycle.ensure_open("starting the agent host")?;
         self.inner.lock().running = true;
+        self.recover_durable_stationarity_stops();
         Ok(())
     }
 
@@ -4970,6 +4979,180 @@ impl AgentHostHandle {
         Ok(())
     }
 
+    /// Write the stationary stop onto the session before the turn returns.
+    /// A missing usage tracker no longer leaves the decision only in memory.
+    fn persist_stationary_stop(
+        &self,
+        session_id: Uuid,
+        tool_name: &str,
+        run_len: u32,
+        true_noop: bool,
+    ) {
+        let should_persist = {
+            let mut inner = self.inner.lock();
+            let Some(session) = inner.sessions.get_mut(&session_id) else {
+                return;
+            };
+            let previous = session.stationary_stop.as_ref().map(|stop| stop.revision);
+            session.stationary_stop = Some(SessionStationaryStop::stationarity(
+                previous, tool_name, run_len, true_noop,
+            ));
+            session.updated_at = Utc::now();
+            true
+        };
+        if should_persist {
+            self.persist_session(session_id);
+        }
+    }
+
+    pub(crate) fn clear_stationary_stop(&self, session_id: Uuid) {
+        let had = {
+            let mut inner = self.inner.lock();
+            let Some(session) = inner.sessions.get_mut(&session_id) else {
+                return;
+            };
+            session.stationary_stop.take().is_some()
+        };
+        if had {
+            self.persist_session(session_id);
+        }
+    }
+
+    /// Non-terminal runs that already have a durable stationary stop are
+    /// closed as that stop. This does not start a model turn or a retry.
+    fn recover_durable_stationarity_stops(&self) {
+        let pending: Vec<(Uuid, SessionStationaryStop)> = {
+            let inner = self.inner.lock();
+            inner
+                .sessions
+                .iter()
+                .filter_map(|(id, session)| session.stationary_stop.clone().map(|stop| (*id, stop)))
+                .collect()
+        };
+        if pending.is_empty() {
+            return;
+        }
+        let Ok(store) = self.ensure_orchestration_store() else {
+            return;
+        };
+        let Ok(runs) = store.list_runs() else {
+            return;
+        };
+        for (session_id, _stop) in pending {
+            let session_runs: Vec<_> = runs
+                .iter()
+                .filter(|run| run.session_id == session_id)
+                .collect();
+            let mut failed = false;
+            let mut closed_open_run = false;
+            for run in session_runs.iter().filter(|run| !run.state.is_terminal()) {
+                let updated = store.update_run(&run.run_id, |current| {
+                    if apply_durable_stationarity_stop(current) {
+                        current.updated_at = Utc::now();
+                        current.queue_position = None;
+                    }
+                    Ok(())
+                });
+                if updated.is_ok() {
+                    closed_open_run = true;
+                } else {
+                    failed = true;
+                }
+            }
+            let recorded_on_a_run = session_runs
+                .iter()
+                .any(|run| run.stop_cause == Some(RunStopCause::Stationarity));
+            if !failed && (closed_open_run || recorded_on_a_run) {
+                self.clear_stationary_stop(session_id);
+            }
+        }
+    }
+
+    fn host_witness_generation(&self, task_id: &str) -> Option<u64> {
+        let inner = self.inner.lock();
+        if let Some(task) = inner
+            .background_tasks
+            .iter()
+            .find(|task| task.id == task_id)
+        {
+            return Some(task.witness_generation);
+        }
+        inner
+            .subagents
+            .iter()
+            .find(|subagent| subagent.id == task_id)
+            .map(|subagent| subagent.witness_generation)
+    }
+
+    fn witness_tool_output(
+        &self,
+        session_id: Uuid,
+        task_id: &str,
+        generation: u64,
+        model_prose: &str,
+    ) -> String {
+        let now = Utc::now().timestamp_millis();
+        let productive = {
+            let mut inner = self.inner.lock();
+            let Some(session) = inner.sessions.get_mut(&session_id) else {
+                return wait_witness_observation(task_id, generation, false);
+            };
+            let existing = session
+                .wait_witnesses
+                .iter()
+                .find(|witness| witness.task_id == task_id)
+                .cloned();
+            let (witness, productive) =
+                note_wait_witness(existing, task_id, generation, now, model_prose);
+            if let Some(slot) = session
+                .wait_witnesses
+                .iter_mut()
+                .find(|current| current.task_id == task_id)
+            {
+                *slot = witness;
+            } else {
+                session.wait_witnesses.push(witness);
+            }
+            const MAX_WAIT_WITNESSES: usize = 32;
+            if session.wait_witnesses.len() > MAX_WAIT_WITNESSES {
+                let extra = session.wait_witnesses.len() - MAX_WAIT_WITNESSES;
+                session.wait_witnesses.drain(0..extra);
+            }
+            session.updated_at = Utc::now();
+            productive
+        };
+        self.persist_session(session_id);
+        wait_witness_observation(task_id, generation, productive)
+    }
+
+    fn apply_host_wait_witnesses(
+        &self,
+        session_id: Uuid,
+        calls: &[AgentToolCall],
+        outputs: &mut [String],
+    ) {
+        for (call, output) in calls.iter().zip(outputs.iter_mut()) {
+            if !matches!(call.name.as_str(), "task_output" | "get_task_output") {
+                continue;
+            }
+            let Ok(args) = serde_json::from_str::<serde_json::Value>(&call.arguments) else {
+                continue;
+            };
+            let Some(task_id) = args
+                .get("id")
+                .or_else(|| args.get("task_id"))
+                .and_then(|value| value.as_str())
+                .filter(|id| !id.is_empty())
+            else {
+                continue;
+            };
+            let Some(generation) = self.host_witness_generation(task_id) else {
+                continue;
+            };
+            *output = self.witness_tool_output(session_id, task_id, generation, output);
+        }
+    }
+
     fn take_stationarity_stop(&self, session_id: Uuid) -> bool {
         self.stationarity_stops.lock().remove(&session_id)
     }
@@ -5802,6 +5985,7 @@ impl AgentHostHandle {
         if s.status == "running" {
             s.status = "cancelled".into();
             s.summary = Some("cancelled by user".into());
+            s.bump_witness();
         }
         let session_id = s.session_id.as_ref().and_then(|x| Uuid::parse_str(x).ok());
         let snap = g.subagents.clone();
@@ -5863,6 +6047,7 @@ impl AgentHostHandle {
             .ok_or_else(|| anyhow!("unknown task"))?;
         t.status = "cancelled".into();
         t.detail = Some("cancelled by user".into());
+        t.bump_witness();
         Ok(())
     }
 
@@ -5886,6 +6071,7 @@ impl AgentHostHandle {
             },
             session_id: self.inner.lock().active_session.map(|u| u.to_string()),
             detail: Some("starting…".into()),
+            witness_generation: 0,
         };
         {
             let mut g = self.inner.lock();
@@ -5985,6 +6171,7 @@ impl AgentHostHandle {
                                     {
                                         if task.status != "cancelled" {
                                             task.detail = Some(format!("scanned {n} files…"));
+                                            task.bump_witness();
                                         }
                                     }
                                     let _ = event_tx_p.send(SessionUpdate::BackgroundTask {
@@ -6019,6 +6206,7 @@ impl AgentHostHandle {
                     if task.status != "cancelled" {
                         task.status = final_status.clone();
                         task.detail = Some(final_status.clone());
+                        task.bump_witness();
                     }
                 }
             }
@@ -6036,10 +6224,12 @@ impl AgentHostHandle {
             if let Some(task) = g.background_tasks.iter_mut().find(|task| task.id == id) {
                 task.status = "cancelled".into();
                 task.detail = Some("host shutdown".into());
+                task.bump_witness();
             }
             let mut refused = t.clone();
             refused.status = "cancelled".into();
             refused.detail = Some("host shutdown".into());
+            refused.bump_witness();
             return refused;
         }
         t
@@ -6060,6 +6250,7 @@ impl AgentHostHandle {
             kind: "shell".into(),
             session_id: session_id.map(|u| u.to_string()),
             detail: Some("agent tool shell".into()),
+            witness_generation: 0,
         };
         let event_tx = {
             let mut g = self.inner.lock();
@@ -6083,6 +6274,7 @@ impl AgentHostHandle {
             let title = if let Some(task) = g.background_tasks.iter_mut().find(|t| t.id == id) {
                 task.status = status.into();
                 task.detail = Some(status.into());
+                task.bump_witness();
                 task.title.clone()
             } else {
                 return;
@@ -7637,6 +7829,7 @@ impl AgentHostHandle {
                     if let Some(s) = g.subagents.iter_mut().find(|s| s.id == *cid) {
                         s.status = "cancelled".into();
                         s.summary = Some("parent turn cancelled".into());
+                        s.bump_witness();
                     }
                 }
                 Ok((g.live_shells.clone(), vec![id]))
@@ -7656,6 +7849,7 @@ impl AgentHostHandle {
                     if s.status == "running" {
                         s.status = "cancelled".into();
                         s.summary = Some("parent turn cancelled".into());
+                        s.bump_witness();
                     }
                 }
                 let ids: Vec<Uuid> = g.turn_cancels.keys().copied().collect();
@@ -9561,6 +9755,7 @@ impl AgentHostHandle {
             if steering_count == 0 {
                 if let Some((run_len, tool_name, true_noop)) = identical_tool_calls.stop_info() {
                     let msg = action_stationarity_stop_message(run_len, &tool_name, true_noop);
+                    self.persist_stationary_stop(session_id, &tool_name, run_len, true_noop);
                     self.mark_run_stop(session_id, RunStopCause::Stationarity, "stationarity")?;
                     let _ = event_tx.send(SessionUpdate::AgentProgress {
                         session_id,
@@ -10069,6 +10264,11 @@ impl AgentHostHandle {
                         recovery_grace = true;
                     }
 
+                    self.apply_host_wait_witnesses(
+                        session_id,
+                        &accepted_calls,
+                        &mut raw_tool_outputs,
+                    );
                     observe_accepted_tool_progress(
                         &mut identical_tool_calls,
                         &accepted_calls,
@@ -10823,6 +11023,7 @@ impl AgentHostHandle {
                 last_tool: None,
                 cwd: Some(cwd.display().to_string()),
                 execution_mode: SubagentExecutionMode::SharedReadOnly,
+                witness_generation: 0,
             });
         }
         let _ = event_tx.send(SessionUpdate::SubagentSpawned {
@@ -11020,6 +11221,7 @@ impl AgentHostHandle {
                                     last_tool: None,
                                     cwd: None,
                                     execution_mode: SubagentExecutionMode::IsolationFailed,
+                                    witness_generation: 0,
                                 });
                             }
                             let _ = event_tx.send(SessionUpdate::SubagentSpawned {
@@ -11061,6 +11263,7 @@ impl AgentHostHandle {
                 last_tool: None,
                 cwd: Some(child_cwd.display().to_string()),
                 execution_mode,
+                witness_generation: 0,
             });
             g.subagent_cancels
                 .insert(sub_id.clone(), child_cancel.clone());
@@ -11116,6 +11319,7 @@ impl AgentHostHandle {
             if let Some(entry) = g.subagents.iter_mut().find(|entry| entry.id == sub_id) {
                 entry.status = "cancelled".into();
                 entry.summary = Some("host shutdown".into());
+                entry.bump_witness();
             }
         }
 
@@ -11213,6 +11417,7 @@ impl AgentHostHandle {
                                             g.subagents.iter_mut().find(|s| s.id == sub_id)
                                         {
                                             s.last_tool = Some("write_file".into());
+                                            s.bump_witness();
                                         }
                                     }
                                     self.emit_file_edit(
@@ -11395,6 +11600,7 @@ impl AgentHostHandle {
                             let mut g = self.inner.lock();
                             if let Some(s) = g.subagents.iter_mut().find(|s| s.id == sub_id) {
                                 s.last_tool = Some(tc.name.clone());
+                                s.bump_witness();
                             }
                         }
                         // #161 capability modes: plan is non-mutating (explore is separate path).
@@ -11464,6 +11670,7 @@ impl AgentHostHandle {
                 if let Some(ref d) = detail {
                     s.summary = Some(d.clone());
                 }
+                s.bump_witness();
             }
             g.subagents.clone()
         };

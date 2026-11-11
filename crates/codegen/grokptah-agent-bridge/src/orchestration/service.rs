@@ -10043,9 +10043,13 @@ impl OrchestrationService {
             // durable-recovery path (#455).
             const MAX_FINALIZATION_ATTEMPTS: u32 = 8;
             let mut attempt = 0u32;
+            let mut finalized = false;
             loop {
                 let error = match store.persist_finalization(&candidate) {
-                    Ok(_) => break,
+                    Ok(_) => {
+                        finalized = true;
+                        break;
+                    }
                     Err(error) => error.to_string(),
                 };
                 if !host.can_write_durably() {
@@ -10080,6 +10084,11 @@ impl OrchestrationService {
                 let shift = attempt.min(6);
                 let backoff_ms = 25u64.saturating_mul(1u64 << shift).min(1_000);
                 tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+            }
+            if finalized
+                && candidate.stop_cause == Some(crate::orchestration::RunStopCause::Stationarity)
+            {
+                host.clear_stationary_stop(session_id);
             }
 
             // Service-owned Build Runs use the same durable Agent identity as
