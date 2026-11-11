@@ -123,6 +123,12 @@ pub struct SessionMeta {
     pub execution_mode: RunExecutionMode,
     #[serde(default)]
     pub completion_history: Vec<crate::session::SessionCompletion>,
+    /// Host-authored stationary stop. Absent on sessions written before #465.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stationary_stop: Option<crate::stationarity::SessionStationaryStop>,
+    /// Host-admitted waits. Absent on sessions written before #465.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub wait_witnesses: Vec<crate::stationarity::SessionWaitWitness>,
 }
 
 // ── Paths ───────────────────────────────────────────────────────────────────
@@ -482,6 +488,8 @@ impl SessionMeta {
             kind: s.kind,
             execution_mode: s.execution_mode,
             completion_history: s.completion_history.clone(),
+            stationary_stop: s.stationary_stop.clone(),
+            wait_witnesses: s.wait_witnesses.clone(),
         }
     }
 
@@ -510,6 +518,8 @@ impl SessionMeta {
             kind: self.kind,
             execution_mode: self.execution_mode,
             completion_history: self.completion_history,
+            stationary_stop: self.stationary_stop,
+            wait_witnesses: self.wait_witnesses,
             transcript_loaded: false,
             // Until load_transcript, treat disk as authoritative length.
             persisted_len: self.message_count,
