@@ -5068,20 +5068,28 @@ impl AgentHostHandle {
         }
     }
 
-    fn host_witness_generation(&self, task_id: &str) -> Option<u64> {
+    fn host_witness_generation(&self, caller: Uuid, task_id: &str) -> Option<u64> {
+        let owner = caller.to_string();
         let inner = self.inner.lock();
+        // A foreign id is not a witness. Replacing a denial with a generation
+        // token would prove the id exists and count as the caller's wait.
         if let Some(task) = inner
             .background_tasks
             .iter()
             .find(|task| task.id == task_id)
         {
-            return Some(task.witness_generation);
+            if task.session_id.as_deref() == Some(owner.as_str()) {
+                return Some(task.witness_generation);
+            }
         }
         inner
             .subagents
             .iter()
             .find(|subagent| subagent.id == task_id)
-            .map(|subagent| subagent.witness_generation)
+            .and_then(|subagent| {
+                (subagent.session_id.as_deref() == Some(owner.as_str()))
+                    .then_some(subagent.witness_generation)
+            })
     }
 
     fn witness_tool_output(
@@ -5146,7 +5154,7 @@ impl AgentHostHandle {
             else {
                 continue;
             };
-            let Some(generation) = self.host_witness_generation(task_id) else {
+            let Some(generation) = self.host_witness_generation(session_id, task_id) else {
                 continue;
             };
             *output = self.witness_tool_output(session_id, task_id, generation, output);
@@ -5961,6 +5969,68 @@ impl AgentHostHandle {
         self.inner.lock().computer_agent_operations.len()
     }
 
+    /// Install registry rows without starting work.
+    ///
+    /// Authorization tests use this to plant another session's task. It does
+    /// not read or cancel, and the tool path must still decide ownership.
+    #[doc(hidden)]
+    pub fn plant_owned_work_for_test(
+        &self,
+        task: Option<BackgroundTask>,
+        subagent: Option<SubagentInfo>,
+    ) {
+        let mut inner = self.inner.lock();
+        if let Some(task) = task {
+            inner.background_tasks.push(task);
+        }
+        if let Some(subagent) = subagent {
+            inner.subagents.push(subagent);
+        }
+    }
+
+    /// Run one local tool through [`Self::dispatch_agent_tool`].
+    #[doc(hidden)]
+    pub async fn dispatch_named_tool_for_test(
+        &self,
+        session_id: Uuid,
+        name: &str,
+        arguments_json: &str,
+    ) -> Result<String> {
+        let bus = crate::event_bus::EventBus::new(16);
+        let index = McpToolIndex::new();
+        let cancel = CancellationToken::new();
+        let cwd = std::env::temp_dir();
+        self.dispatch_agent_tool(
+            session_id,
+            &cwd,
+            name,
+            arguments_json,
+            &cancel,
+            &bus,
+            &index,
+        )
+        .await
+    }
+
+    /// Apply the turn loop's wait-witness rewrite to one tool result.
+    #[doc(hidden)]
+    pub fn witnessed_tool_output_for_test(
+        &self,
+        session_id: Uuid,
+        tool_name: &str,
+        arguments_json: &str,
+        output: &str,
+    ) -> String {
+        let call = AgentToolCall {
+            id: "call-1".into(),
+            name: tool_name.to_string(),
+            arguments: arguments_json.to_string(),
+        };
+        let mut outputs = vec![output.to_string()];
+        self.apply_host_wait_witnesses(session_id, &[call], &mut outputs);
+        outputs.pop().unwrap_or_default()
+    }
+
     /// Test helper: register a parent turn cancel token for `session_id`.
     pub fn begin_turn_for_test(&self, session_id: Uuid) {
         let mut g = self.inner.lock();
@@ -6018,6 +6088,115 @@ impl AgentHostHandle {
 
     pub fn background_tasks(&self) -> Vec<BackgroundTask> {
         self.inner.lock().background_tasks.clone()
+    }
+
+    fn session_owns_record(owner: Option<&str>, caller: Uuid) -> bool {
+        owner.is_some_and(|session| session == caller.to_string())
+    }
+
+    fn unknown_task_denial(id: &str) -> String {
+        format!("ERROR: unknown task/subagent id {id}")
+    }
+
+    /// Read background-task and subagent output for one caller.
+    ///
+    /// Ownership is the row's session. A missing id and an id owned by someone
+    /// else return the same denial, and that denial is chosen before any
+    /// detail, cwd, summary, title, or status is copied into the result.
+    fn task_output_for_session(&self, caller: Uuid, id: Option<&str>) -> String {
+        let inner = self.inner.lock();
+        if let Some(id) = id {
+            if let Some(task) = inner.background_tasks.iter().find(|task| task.id == id) {
+                if Self::session_owns_record(task.session_id.as_deref(), caller) {
+                    return format!(
+                        "task {} status={} kind={} detail={}",
+                        task.id,
+                        task.status,
+                        task.kind,
+                        task.detail.clone().unwrap_or_default()
+                    );
+                }
+            }
+            if let Some(subagent) = inner.subagents.iter().find(|subagent| subagent.id == id) {
+                if Self::session_owns_record(subagent.session_id.as_deref(), caller) {
+                    return format!(
+                        "subagent {} kind={} status={} mode={} cwd={} summary={}",
+                        subagent.id,
+                        subagent.kind,
+                        subagent.status,
+                        subagent.execution_mode.as_str(),
+                        subagent.cwd.clone().unwrap_or_default(),
+                        subagent.summary.clone().unwrap_or_default()
+                    );
+                }
+            }
+            return Self::unknown_task_denial(id);
+        }
+        let mut lines = Vec::new();
+        for task in inner
+            .background_tasks
+            .iter()
+            .filter(|task| Self::session_owns_record(task.session_id.as_deref(), caller))
+        {
+            lines.push(format!("task {} [{}] {}", task.id, task.status, task.title));
+        }
+        for subagent in inner
+            .subagents
+            .iter()
+            .filter(|subagent| Self::session_owns_record(subagent.session_id.as_deref(), caller))
+        {
+            lines.push(format!(
+                "subagent {} [{}] {} mode={} cwd={}",
+                subagent.id,
+                subagent.status,
+                subagent.title,
+                subagent.execution_mode.as_str(),
+                subagent.cwd.clone().unwrap_or_default()
+            ));
+        }
+        if lines.is_empty() {
+            "(no background tasks or subagents)".into()
+        } else {
+            lines.join("\n")
+        }
+    }
+
+    /// Cancel one background task or subagent the caller owns.
+    ///
+    /// A foreign or missing id is refused before either cancel mutator runs, so
+    /// the public denial cannot distinguish those cases or change the row.
+    fn cancel_task_for_session(&self, caller: Uuid, id: &str) -> String {
+        let (owned_task, owned_subagent) = {
+            let inner = self.inner.lock();
+            let owned_task = inner.background_tasks.iter().any(|task| {
+                task.id == id && Self::session_owns_record(task.session_id.as_deref(), caller)
+            });
+            let owned_subagent = inner.subagents.iter().any(|subagent| {
+                subagent.id == id
+                    && Self::session_owns_record(subagent.session_id.as_deref(), caller)
+            });
+            (owned_task, owned_subagent)
+        };
+        if !owned_task && !owned_subagent {
+            return Self::unknown_task_denial(id);
+        }
+        let background = if owned_task {
+            self.cancel_background_task(id)
+        } else {
+            Err(anyhow!("not owned"))
+        };
+        let subagent = if owned_subagent {
+            self.cancel_subagent(id)
+        } else {
+            Err(anyhow!("not owned"))
+        };
+        match (background, subagent) {
+            (Ok(()), _) => format!("killed background task {id}"),
+            (_, Ok(())) => format!("cancelled subagent {id}"),
+            (Err(background_error), Err(subagent_error)) => {
+                format!("ERROR: kill_task {id}: bg={background_error}; subagent={subagent_error}")
+            }
+        }
     }
 
     pub fn cancel_background_task(&self, id: &str) -> Result<()> {
@@ -10867,16 +11046,7 @@ impl AgentHostHandle {
                 if id.is_empty() {
                     return Ok("ERROR: kill_task requires id".into());
                 }
-                // Prefer background task cancel; also try subagent cancel (#179).
-                let bg = self.cancel_background_task(&id);
-                let sub = self.cancel_subagent(&id);
-                match (bg, sub) {
-                    (Ok(()), _) => Ok(format!("killed background task {id}")),
-                    (_, Ok(())) => Ok(format!("cancelled subagent {id}")),
-                    (Err(e1), Err(e2)) => {
-                        Ok(format!("ERROR: kill_task {id}: bg={e1}; subagent={e2}"))
-                    }
-                }
+                Ok(self.cancel_task_for_session(session_id, &id))
             }
             "task_output" | "get_task_output" => {
                 let id = args
@@ -10884,50 +11054,7 @@ impl AgentHostHandle {
                     .or_else(|| args.get("task_id"))
                     .and_then(|v| v.as_str())
                     .map(|s| s.to_string());
-                let tasks = self.background_tasks();
-                let subs = self.subagents();
-                if let Some(id) = id {
-                    if let Some(t) = tasks.iter().find(|t| t.id == id) {
-                        return Ok(format!(
-                            "task {} status={} kind={} detail={}",
-                            t.id,
-                            t.status,
-                            t.kind,
-                            t.detail.clone().unwrap_or_default()
-                        ));
-                    }
-                    if let Some(s) = subs.iter().find(|s| s.id == id) {
-                        return Ok(format!(
-                            "subagent {} kind={} status={} mode={} cwd={} summary={}",
-                            s.id,
-                            s.kind,
-                            s.status,
-                            s.execution_mode.as_str(),
-                            s.cwd.clone().unwrap_or_default(),
-                            s.summary.clone().unwrap_or_default()
-                        ));
-                    }
-                    return Ok(format!("ERROR: unknown task/subagent id {id}"));
-                }
-                let mut lines = Vec::new();
-                for t in &tasks {
-                    lines.push(format!("task {} [{}] {}", t.id, t.status, t.title));
-                }
-                for s in &subs {
-                    lines.push(format!(
-                        "subagent {} [{}] {} mode={} cwd={}",
-                        s.id,
-                        s.status,
-                        s.title,
-                        s.execution_mode.as_str(),
-                        s.cwd.clone().unwrap_or_default()
-                    ));
-                }
-                if lines.is_empty() {
-                    Ok("(no background tasks or subagents)".into())
-                } else {
-                    Ok(lines.join("\n"))
-                }
+                Ok(self.task_output_for_session(session_id, id.as_deref()))
             }
             "memory_read" => {
                 let query = args
