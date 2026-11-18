@@ -1,0 +1,24 @@
+{
+  "name": "@grokptah/client",
+  "version": "0.1.0",
+  "description": "Offline public Help and pure UI helpers; no host authority or transport",
+  "type": "module",
+  "sideEffects": false,
+  "exports": {
+    ".": {
+      "types": "./types/public.d.ts",
+      "import": "./public.js"
+    },
+    "./ui-core": {
+      "types": "./types/uiCore.d.ts",
+      "import": "./ui-core.js"
+    }
+  },
+  "files": [
+    "*.js",
+    "types"
+  ],
+  "engines": {
+    "node": ">=20"
+  }
+}
