@@ -9,6 +9,9 @@ test('valid synthetic inventory admitted',()=>assert.doesNotThrow(()=>inspectMem
 for (const [name,edit] of [
   ['restricted payload',m=>m.set('public.js','RESTRICTED_SENTINEL')],
   ['native import',m=>m.set('public.js','export {invoke} from "@tauri-apps/api/core";')],
+  ['unresolved module',m=>m.set('public.js','export * from "./missing.js";')],
+  ['bare dependency',m=>m.set('public.js','export * from "unapproved";')],
+  ['computed import',m=>m.set('public.js','export const load = name => import(name);')],
   ['missing runtime export',m=>m.delete('public.js')],
   ['missing declaration',m=>m.delete('types/public.d.ts')],
   ['unexpected member',m=>m.set('private.json','{}')],

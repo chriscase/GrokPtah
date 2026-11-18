@@ -3,6 +3,7 @@ import { readFileSync, mkdtempSync, rmSync, writeFileSync, mkdirSync, copyFileSy
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { createRequire } from 'node:module';
 import { createHash } from 'node:crypto';
 import { desktop, stage } from './stage-public-package.mjs';
 import { runConsumer } from './run-public-consumer-smoke.mjs';
@@ -51,6 +52,7 @@ export function isolatedEnv(root) {
   return { PATH: process.env.PATH, HOME: join(root,'home'), TMPDIR: root, npm_config_cache: join(root,'cache'), npm_config_userconfig: join(root,'empty.npmrc'), npm_config_globalconfig: join(root,'empty-global.npmrc'), npm_config_offline: 'true', npm_config_ignore_scripts: 'true', npm_config_audit: 'false', npm_config_fund: 'false' };
 }
 export function inspectMembers(members, restricted) {
+  const ts = createRequire(import.meta.url)('typescript');
   const names = [...members.keys()];
   if (new Set(names).size !== names.length) throw new Error('duplicate member');
   for (const name of requiredMembers) if (!members.has(name)) throw new Error(`missing member ${name}`);
@@ -67,8 +69,20 @@ export function inspectMembers(members, restricted) {
   // bare dependencies, network imports, native execution or undeclared files.
   for (const [name, bytes] of members) {
     if (!/\.(?:js|ts)$/.test(name)) continue;
-    for (const [, specifier] of bytes.matchAll(/(?:from\s*|import\s*\(|import\s*)["']([^"']+)["']/g)) {
-      if (!specifier.startsWith('.')) throw new Error(`external import in ${name}: ${specifier}`);
+    const source = ts.createSourceFile(name,bytes,ts.ScriptTarget.Latest,true);
+    const specifiers=[];
+    function visit(node) {
+      if ((ts.isImportDeclaration(node) || ts.isExportDeclaration(node)) && node.moduleSpecifier) specifiers.push(node.moduleSpecifier.text);
+      if (ts.isImportTypeNode(node) && ts.isLiteralTypeNode(node.argument)) specifiers.push(node.argument.literal.text);
+      if (ts.isCallExpression(node) && node.expression.kind === ts.SyntaxKind.ImportKeyword) {
+        if (node.arguments.length !== 1 || !ts.isStringLiteral(node.arguments[0])) throw new Error(`dynamic import in ${name}`);
+        specifiers.push(node.arguments[0].text);
+      }
+      ts.forEachChild(node,visit);
+    }
+    visit(source);
+    for (const specifier of specifiers) {
+      if (typeof specifier !== 'string' || !specifier.startsWith('.')) throw new Error(`external import in ${name}: ${specifier}`);
       const target = new URL(specifier, `https://artifact.invalid/${name}`).pathname.slice(1);
       const declaration = target.replace(/\.js$/, '.d.ts');
       if (!members.has(target) && !(name.endsWith('.d.ts') && members.has(declaration))) throw new Error(`unresolved import ${name}: ${specifier}`);
