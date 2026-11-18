@@ -14,5 +14,9 @@ for (const [name,edit] of [
   ['unexpected member',m=>m.set('private.json','{}')],
   ['manifest drift',m=>m.set('package.json','{}')],
 ]) test(name+' rejected through verifier',()=>{const m=fixture();edit(m);assert.throws(()=>inspectMembers(m,['RESTRICTED_SENTINEL']));});
-test('failed consumer process is a failed gate',()=>assert.throws(()=>run(process.execPath,['-e','process.exit(9)'])));
-test('hung child is bounded',()=>assert.throws(()=>run(process.execPath,['-e','setInterval(()=>{},1000)'],{timeout:100})));
+test('failed consumer process is a failed gate',async()=>assert.rejects(()=>run(process.execPath,['-e','process.exit(9)'])));
+test('hung child is bounded',async()=>assert.rejects(()=>run(process.execPath,['-e','setInterval(()=>{},1000)'],{timeout:100})));
+
+test('TERM-resistant owned child is killed and reaped',async()=>{const start=Date.now();await assert.rejects(()=>run(process.execPath,['-e',"process.on('SIGTERM',()=>{});setInterval(()=>{},1000)"],{timeout:200}));assert.ok(Date.now()-start<3000);});
+
+test('TERM-resistant descendant holding pipes is killed with its group',async()=>{const start=Date.now();const code="const {spawn}=require('node:child_process');spawn(process.execPath,['-e',\"process.on('SIGTERM',()=>{});setInterval(()=>{},1000)\"],{stdio:'inherit'});process.on('SIGTERM',()=>{});setInterval(()=>{},1000)";await assert.rejects(()=>run(process.execPath,['-e',code],{timeout:200}));assert.ok(Date.now()-start<3000);});

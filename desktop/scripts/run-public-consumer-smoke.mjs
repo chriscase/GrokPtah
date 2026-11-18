@@ -2,11 +2,11 @@ import { mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { desktop } from './stage-public-package.mjs';
 import { run } from './verify-public.mjs';
-export function runConsumer(tar, root, env) {
+export async function runConsumer(tar, root, env) {
   const cwd = join(root,'consumer');
   mkdirSync(cwd);
   writeFileSync(join(cwd,'package.json'),JSON.stringify({private:true,type:'module'}));
-  run('npm',['install',tar,'--offline','--ignore-scripts','--no-audit','--no-fund','--package-lock=false'],{cwd,env});
+  await run('npm',['install',tar,'--offline','--ignore-scripts','--no-audit','--no-fund','--package-lock=false'],{cwd,env});
   writeFileSync(join(cwd,'consumer.ts'), `
 import * as client from '@grokptah/client';
 import * as ui from '@grokptah/client/ui-core';
@@ -28,6 +28,6 @@ check(ui.unclosedFenceStart('hello') === -1, 'markdown helper');
 for (const api of [client,ui]) for (const name of ['helpAsk','helpFollow','helpCancel','createHelpAuthority','invoke']) check(!(name in api), 'unsafe export '+name);
 console.log('Packed consumer imports, declarations, retrieval, citation rejection and UI helpers passed.');
 `);
-  run(process.execPath,[join(desktop,'node_modules/typescript/bin/tsc'),'consumer.ts','--module','NodeNext','--moduleResolution','NodeNext','--target','ES2022','--strict','--outDir','out'],{cwd,env});
-  run(process.execPath,['out/consumer.js'],{cwd,env});
+  await run(process.execPath,[join(desktop,'node_modules/typescript/bin/tsc'),'consumer.ts','--module','NodeNext','--moduleResolution','NodeNext','--target','ES2022','--strict','--outDir','out'],{cwd,env});
+  await run(process.execPath,['out/consumer.js'],{cwd,env});
 }
