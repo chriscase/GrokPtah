@@ -17,7 +17,9 @@ export async function run(command, args, options = {}) {
   const timeout = Math.min(options.timeout ?? 60000, remaining);
   return await new Promise((resolveRun,reject) => {
     const child = spawn(command,args,{...options,detached:true,stdio:['ignore','pipe','pipe']});
-    let stdout = '', stderr = '', failure = null, killTimer;
+    const limit = 4 * 1024 * 1024;
+    const stdoutChunks = [], stderrChunks = [];
+    let received = 0, failure = null, killTimer;
     const stop = reason => {
       if (failure) return;
       failure = reason;
@@ -25,10 +27,11 @@ export async function run(command, args, options = {}) {
       killTimer = setTimeout(()=>{try { process.kill(-child.pid,'SIGKILL'); } catch(error) { if(error.code !== 'ESRCH') failure += '; KILL: '+error; }},200);
     };
     const timer = setTimeout(()=>stop('timeout'),timeout);
-    for (const [stream,key] of [[child.stdout,'stdout'],[child.stderr,'stderr']]) stream.on('data', data=>{
-      if(key === 'stdout') stdout += data.toString(); else stderr += data.toString();
-      if(Buffer.byteLength(stdout)+Buffer.byteLength(stderr)>4*1024*1024) stop('output limit');
-      stdout=stdout.slice(0,2*1024*1024);stderr=stderr.slice(0,2*1024*1024);
+    for (const [stream,chunks] of [[child.stdout,stdoutChunks],[child.stderr,stderrChunks]]) stream.on('data', data=>{
+      const room = Math.max(0, limit - received);
+      received += data.length;
+      if (room) chunks.push(data.subarray(0, room));
+      if (received > limit) stop('output limit');
     });
     child.on('error',error=>{failure=String(error);});
     child.on('close',(status,signal)=>{
@@ -39,6 +42,11 @@ export async function run(command, args, options = {}) {
       // On timeout retain the kill sweep even if the direct process exits first:
       // descendants belong to the isolated group, never to another task.
       const finish=()=>{
+        const out = Buffer.concat(stdoutChunks);
+        const stdout = out.toString('utf8'), stderr = Buffer.concat(stderrChunks).toString('utf8');
+        // stdout is consumed as text (including extracted tar members). Never
+        // admit a lossy decode, even if the command itself exited successfully.
+        if (!failure && !out.equals(Buffer.from(stdout, 'utf8'))) failure = 'invalid UTF-8 stdout';
         const entry={command,args,status,signal,stdout,stderr,failure}; commands.push(entry);
         if(failure || status !== 0 || signal) reject(new Error(JSON.stringify(entry)));
         else resolveRun(stdout);
