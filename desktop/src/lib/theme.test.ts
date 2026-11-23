@@ -64,3 +64,23 @@ describe("resume / continue (#38)", () => {
     expect(app).toMatch(/archived \? api\.sessionInspect\(id\) : api\.sessionLoad\(id\)/);
   });
 });
+
+describe("Help accessibility appearance", () => {
+  const css = readFileSync(join(root, "..", "styles", "app.css"), "utf8");
+
+  it("keeps Help headings ordered while inheriting the application text scale", () => {
+    const scale = (selector: string) =>
+      Number(css.match(new RegExp(`\\.${selector} \\{[^}]*font-size:\\s*([\\d.]+)em;`))?.[1]);
+    const sectionHeading = scale("help-header h2");
+    const articleHeading = scale("help-article h3");
+    expect(sectionHeading).toBeGreaterThan(articleHeading);
+    expect(articleHeading).toBeGreaterThan(1);
+  });
+
+  it("distinguishes hovered, selected and keyboard-active Help options in forced colors", () => {
+    const forced = css.slice(css.indexOf("@media (forced-colors: active)"));
+    expect(forced).toMatch(/\.help-list-item:hover \{[^}]*outline:\s*1px dotted Highlight;/);
+    expect(forced).toMatch(/\.help-list-item\.is-selected > strong \{[^}]*text-decoration:\s*underline;/);
+    expect(forced).toMatch(/\.help-list-item\.is-active \{[^}]*outline:\s*2px solid Highlight;/);
+  });
+});
