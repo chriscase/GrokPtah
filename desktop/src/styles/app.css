@@ -7093,7 +7093,7 @@ html[data-accent="violet"] {
 
 .help-header h2 {
   margin: 0.15rem 0;
-  font-size: 18px;
+  font-size: 1.3333em;
 }
 
 .help-eyebrow {
@@ -7267,7 +7267,7 @@ html[data-accent="violet"] {
 
 .help-article h3 {
   margin: 0.2rem 0 0.35rem;
-  font-size: 17px;
+  font-size: 1.26em;
 }
 
 .help-article-summary {
@@ -7533,12 +7533,25 @@ html[data-accent="violet"] {
     border-left-color: CanvasText;
   }
 
-  .help-list-item.is-selected,
-  .help-list-item.is-active,
-  .help-list-item:hover {
+  /* The selected article and the combobox's active descendant can differ.
+     Keep both distinct from pointer hover when the platform overrides colors. */
+  .help-center .help-list-item.is-selected {
     border-color: Highlight;
-    background: Canvas;
-    color: CanvasText;
+    outline: none;
+  }
+
+  .help-list-item.is-selected > strong {
+    text-decoration: underline;
+  }
+
+  .help-center .help-list-item:hover {
+    outline: 1px dotted Highlight;
+    outline-offset: -3px;
+  }
+
+  .help-center .help-list-item.is-active {
+    outline: 2px solid Highlight;
+    outline-offset: -3px;
   }
 
   .help-search input:focus-visible,
