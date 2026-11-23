@@ -16,7 +16,10 @@
     "verify:help-public": "npm run build && node scripts/verify-help-public.mjs",
     "build:help-evidence": "vite build --config evidence/vite.config.ts",
     "test:help-evidence-contract": "node --test scripts/help-evidence-contract.test.mjs",
-    "verify:help-evidence-manifest": "node scripts/help-evidence-manifest.mjs"
+    "verify:help-evidence-manifest": "node scripts/help-evidence-manifest.mjs",
+    "build:public": "vite build --config vite.library.config.ts && tsc -p tsconfig.lib.json && node scripts/stage-public-package.mjs",
+    "verify:public": "node scripts/verify-public.mjs",
+    "test:public-verifier": "node --test scripts/public-package-verification.test.mjs"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.2.0",

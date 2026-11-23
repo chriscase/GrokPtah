@@ -1,0 +1,16 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": false,
+    "declaration": true,
+    "emitDeclarationOnly": true,
+    "removeComments": true,
+    "declarationDir": "dist/public/types",
+    "outDir": "dist/public/types",
+    "rootDir": "src/lib"
+  },
+  "include": [
+    "src/lib/public.ts",
+    "src/lib/uiCore.ts"
+  ]
+}
