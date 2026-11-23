@@ -1,0 +1,306 @@
+/* Component-local Native Coding Readiness Center. Uses Settings tokens only. */
+
+.provider-readiness {
+  display: flex;
+  flex-direction: column;
+  gap: 0.7rem;
+  min-width: 0;
+  max-width: 100%;
+  margin: 0 0 1rem;
+  padding: 0.75rem 0.8rem 0.85rem;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--overlay-faint);
+}
+
+.provider-readiness-header {
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+  min-width: 0;
+}
+
+.provider-readiness-kicker {
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.provider-readiness-subject {
+  min-width: 0;
+  color: var(--muted);
+  font-size: 11.5px;
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+.provider-readiness-subject code {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text);
+}
+
+.provider-readiness-banner {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  gap: 0.55rem 0.75rem;
+  min-width: 0;
+  padding: 0.55rem 0.65rem;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--bg-elevated);
+}
+
+.provider-readiness-banner.is-ok {
+  border-color: var(--ok);
+  background: var(--overlay-soft);
+}
+
+.provider-readiness-banner.is-attention {
+  border-color: color-mix(in srgb, var(--accent) 40%, var(--border));
+  background: var(--accent-bg);
+}
+
+.provider-readiness-banner.is-danger {
+  border-color: var(--danger);
+  background: var(--overlay-soft);
+}
+
+.provider-readiness-banner.is-neutral {
+  background: var(--overlay-soft);
+}
+
+.provider-readiness-verdict {
+  min-width: 0;
+  margin: 0;
+  font-size: 15px;
+  font-weight: 650;
+  line-height: 1.3;
+  overflow-wrap: anywhere;
+}
+
+.provider-readiness-banner.is-ok .provider-readiness-verdict {
+  color: var(--ok);
+}
+
+.provider-readiness-banner.is-attention .provider-readiness-verdict {
+  color: var(--accent);
+}
+
+.provider-readiness-banner.is-danger .provider-readiness-verdict {
+  color: var(--danger);
+}
+
+.provider-readiness-summary {
+  flex: 1 1 12rem;
+  min-width: 0;
+  margin: 0;
+  color: var(--text);
+  font-size: 12.5px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
+.provider-readiness-busy,
+.provider-readiness-error {
+  min-width: 0;
+  margin: 0;
+  font-size: 12.5px;
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+}
+
+.provider-readiness-error {
+  color: var(--danger);
+}
+
+.provider-readiness-reasons,
+.provider-readiness-checks {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+  min-width: 0;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.provider-readiness-reasons-label,
+.provider-readiness-computer-label,
+.provider-readiness-action-label {
+  margin: 0;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.provider-readiness-reason,
+.provider-readiness-check {
+  display: grid;
+  grid-template-columns: minmax(0, 9.5rem) minmax(0, 1fr);
+  gap: 0.25rem 0.65rem;
+  min-width: 0;
+  padding: 0.35rem 0.45rem;
+  border-radius: 6px;
+  background: var(--overlay-soft);
+}
+
+.provider-readiness-reason-label,
+.provider-readiness-check-label {
+  min-width: 0;
+  color: var(--muted);
+  font-size: 11.5px;
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+
+.provider-readiness-reason-text,
+.provider-readiness-check-text {
+  min-width: 0;
+  color: var(--text);
+  font-size: 12px;
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+.provider-readiness-computer {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  min-width: 0;
+  padding: 0.5rem 0.55rem;
+  border-radius: 8px;
+  border: 1px dashed var(--border);
+  background: var(--bg-input);
+}
+
+.provider-readiness-computer-tier {
+  min-width: 0;
+  margin: 0;
+  font-size: 13px;
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+
+.provider-readiness-computer-copy {
+  min-width: 0;
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+}
+
+.provider-readiness-note {
+  min-width: 0;
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+}
+
+.provider-readiness-env {
+  min-width: 0;
+  margin: 0;
+  color: var(--text);
+  font-size: 12px;
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+}
+
+.provider-readiness-action {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.45rem 0.65rem;
+  min-width: 0;
+}
+
+.provider-readiness-action button {
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 100%;
+  overflow-wrap: anywhere;
+}
+
+.provider-readiness-action-copy {
+  flex: 1 1 12rem;
+  min-width: 0;
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+}
+
+.provider-readiness-details {
+  min-width: 0;
+}
+
+.provider-readiness-details summary {
+  cursor: pointer;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+.provider-readiness-details summary:hover {
+  color: var(--text);
+}
+
+.provider-readiness-evidence {
+  display: flex;
+  flex-direction: column;
+  gap: 0.55rem;
+  min-width: 0;
+  margin-top: 0.55rem;
+}
+
+.provider-readiness-dl {
+  display: grid;
+  grid-template-columns: minmax(0, 9.5rem) minmax(0, 1fr);
+  gap: 0.25rem 0.65rem;
+  min-width: 0;
+  margin: 0;
+}
+
+.provider-readiness-dl dt {
+  min-width: 0;
+  color: var(--muted);
+  font-size: 11.5px;
+  overflow-wrap: anywhere;
+}
+
+.provider-readiness-dl dd {
+  min-width: 0;
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+.provider-readiness-dl code {
+  font-family: var(--font-mono);
+  font-size: 11px;
+}
+
+@media (max-width: 640px) {
+  .provider-readiness {
+    padding: 0.65rem 0.6rem 0.75rem;
+  }
+
+  .provider-readiness-reason,
+  .provider-readiness-check,
+  .provider-readiness-dl {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
