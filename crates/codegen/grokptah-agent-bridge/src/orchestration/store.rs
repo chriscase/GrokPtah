@@ -39,8 +39,8 @@ use super::types::{
 use super::worker::{WorkerHostKind, WorkerPresence, WorkerProjection};
 use super::workload::{
     lease_duration, AssignmentStatus, AttemptState, BlockProvenance, WorkApproval, WorkAttempt,
-    WorkAttemptView, WorkClaim, WorkDecision, WorkDecisionAction, WorkItem, WorkProgress,
-    WorkResult, WorkState, WorkloadReconciliationReport, WORKLOAD_SCHEMA_VERSION,
+    WorkAttemptView, WorkClaim, WorkDecision, WorkDecisionAction, WorkItem, WorkPolicy,
+    WorkProgress, WorkResult, WorkState, WorkloadReconciliationReport, WORKLOAD_SCHEMA_VERSION,
 };
 use super::{assemble_continuation_context, ContinuationContext, ContinuationInputSnapshot};
 use crate::completion::{evidence_authorizes_success, CompletionEvidence};
@@ -197,20 +197,876 @@ struct RoutineDedupeRecord {
     created_at: chrono::DateTime<Utc>,
 }
 
+// Schema 1 is the original unbound envelope. Schema 2 admits new records
+// with absent priors and seals the original authenticated caller when present.
+fn legacy_related_creation_schema() -> u32 {
+    1
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct RelatedCreationRequest {
+    pub binding: WorkRequestBinding,
+    pub payload: serde_json::Value,
+    payload_digest: String,
+    pub actor: String,
+}
+
+impl RelatedCreationRequest {
+    pub(crate) fn new(
+        binding: WorkRequestBinding,
+        payload: serde_json::Value,
+        actor: String,
+    ) -> Self {
+        let payload_digest = super::types::hash_payload(&payload);
+        Self {
+            binding,
+            payload,
+            payload_digest,
+            actor,
+        }
+    }
+    fn validate(
+        &self,
+        tool: &str,
+        shape: &str,
+        session: Uuid,
+        workspace: &str,
+    ) -> Result<(), OrchError> {
+        let binding = &self.binding;
+        let input_workspace = self.payload["workspace"]
+            .as_str()
+            .ok_or_else(|| related_creation_conflict("creation input workspace is missing"))?;
+        if binding.tool != tool
+            || binding.shape != shape
+            || binding.target_work_id.is_some()
+            || binding.target_attempt_id.is_some()
+            || binding.expected_revision.is_some()
+            || binding.session_id != session
+            || binding.workspace_display != workspace
+            || self.payload["sessionId"] != serde_json::json!(session)
+            || !bound_request_workspace_matches(binding, workspace)
+            || !workspaces_match(input_workspace, workspace)
+            || IdempotencyScope::new(&binding.owner_id, session, Path::new(workspace))?
+                .workspace_digest
+                != binding.workspace_digest
+            || super::types::hash_payload(&self.payload) != self.payload_digest
+            || (tool == "ptah_create_manager_plan" && self.payload_digest != binding.payload_hash)
+            || self.actor.is_empty()
+        {
+            return Err(related_creation_conflict(
+                "related creation request identity is invalid",
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn related_creation_conflict(message: &str) -> OrchError {
+    OrchError::new(OrchErrorCode::Conflict, message)
+}
+/// A new authenticated claim has no subject or outcome yet. An injected
+/// result/error/subject is conflicting evidence, even when status is pending.
+fn creation_receipt_is_pending(receipt: &IdempotencyReceipt) -> bool {
+    receipt.status == "pending"
+        && receipt.response.is_null()
+        && receipt.error.is_none()
+        && receipt.run_id.is_none()
+}
+
+fn related_snapshot_digest(value: &impl serde::Serialize) -> Result<String, OrchError> {
+    serde_json::to_value(value)
+        .map(|value| super::types::hash_payload(&value))
+        .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct RoutineFireIntent {
+    #[serde(default = "legacy_related_creation_schema")]
+    schema_version: u32,
     routine: RoutineRecord,
     activation: ActivationRecord,
     work: Option<WorkItem>,
     dedupe: Option<RoutineDedupeRecord>,
+    #[serde(default)]
+    prior_routine: Option<RoutineRecord>,
+    #[serde(default)]
+    prior_activation: Option<ActivationRecord>,
+    #[serde(default)]
+    prior_work: Option<WorkItem>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    snapshot_digest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    request: Option<RelatedCreationRequest>,
+}
+
+impl RoutineFireIntent {
+    fn digest(&self) -> Result<String, OrchError> {
+        related_snapshot_digest(&(
+            &self.prior_routine,
+            &self.routine,
+            &self.activation,
+            &self.work,
+            &self.dedupe,
+        ))
+    }
+    fn response(&self) -> serde_json::Value {
+        serde_json::json!({"activation":self.activation,"routineId":self.routine.routine_id,"sessionId":self.routine.session_id,"workspace":self.routine.workspace})
+    }
+    fn validate(&self) -> Result<(), OrchError> {
+        self.routine.validate()?;
+        self.activation.validate()?;
+        if self.activation.routine_id != self.routine.routine_id
+            || self.activation.routine_revision != self.routine.revision
+        {
+            return Err(related_creation_conflict(
+                "routine activation identity does not match its routine",
+            ));
+        }
+        if let Some(work) = &self.work {
+            work.validate()?;
+            if self.activation.disposition != ActivationDisposition::CreatedWork
+                || self.activation.work_id.as_deref() != Some(work.work_id.as_str())
+                || work.source_activation_id.as_deref()
+                    != Some(self.activation.activation_id.as_str())
+                || work.source_routine_id.as_deref() != Some(self.routine.routine_id.as_str())
+                || work.session_id != self.routine.session_id
+                || work.workspace != self.routine.workspace
+                || work.state != WorkState::Queued
+                || work.revision != 1
+                || work.attempt_count != 0
+                || work.assignment_status != AssignmentStatus::Accepted
+                || work.assigned_agent_id.as_deref() != Some(self.routine.agent_id.as_str())
+                || work.result.is_some()
+                || work.progress.is_some()
+                || work.approval.is_some()
+                || work.is_container
+                || work.last_decision_id.is_some()
+                || work.created_at != self.activation.fired_at
+                || work.updated_at != work.created_at
+                || work.kind != self.routine.work_template.kind
+                || work.objective != self.routine.work_template.objective
+                || work.priority != self.routine.work_template.priority
+                || work.policy != self.activation.captured_policy.work_policy
+                || work.created_by != format!("routine:{}", self.routine.routine_id)
+                || work.parent_work_id.is_some()
+                || !work.dependencies.is_empty()
+                || work.deadline.is_some()
+                || work.blocked_reason.is_some()
+                || work.block_provenance.is_some()
+                || work.source_manager_plan_id.is_some()
+                || work.source_manager_step_id.is_some()
+            {
+                return Err(related_creation_conflict(
+                    "routine creation snapshot is inconsistent",
+                ));
+            }
+        } else if self.activation.work_id.is_some()
+            || self.activation.disposition == ActivationDisposition::CreatedWork
+        {
+            return Err(related_creation_conflict(
+                "routine intent has a missing Work snapshot",
+            ));
+        }
+        if let Some(dedupe) = &self.dedupe {
+            if dedupe.activation_id != self.activation.activation_id
+                || dedupe.dedupe_key != self.activation.dedupe_key
+                || dedupe.work_id != self.activation.work_id
+                || dedupe.disposition != Some(self.activation.disposition)
+                || dedupe.created_at != self.activation.fired_at
+            {
+                return Err(related_creation_conflict(
+                    "routine dedupe snapshot is inconsistent",
+                ));
+            }
+        }
+        match self.schema_version {
+            1 if self.request.is_none()
+                && self.snapshot_digest.is_none()
+                && self.prior_routine.is_none()
+                && self.prior_activation.is_none()
+                && self.prior_work.is_none() => {}
+            2 if self.prior_activation.is_none()
+                && self.prior_work.is_none()
+                && self.snapshot_digest.as_deref() == Some(self.digest()?.as_str()) =>
+            {
+                let prior = self.prior_routine.as_ref().ok_or_else(|| {
+                    related_creation_conflict("routine intent is missing its prior routine")
+                })?;
+                prior.validate()?;
+                if prior.routine_id != self.routine.routine_id
+                    || prior.session_id != self.routine.session_id
+                    || prior.workspace != self.routine.workspace
+                    || prior.revision != self.routine.revision
+                {
+                    return Err(related_creation_conflict(
+                        "routine prior identity is invalid",
+                    ));
+                }
+                if self.dedupe.is_none() {
+                    return Err(related_creation_conflict(
+                        "routine creation requires its dedupe snapshot",
+                    ));
+                }
+                if related_snapshot_digest(prior)? != related_snapshot_digest(&self.routine)? {
+                    let mut expected = prior.clone();
+                    expected.consecutive_failures = expected.consecutive_failures.saturating_add(1);
+                    if expected.consecutive_failures >= expected.retry.circuit_failures {
+                        expected.circuit_open = true;
+                        expected.lifecycle = RoutineLifecycle::Paused;
+                        expected.next_fire_at = None;
+                    } else {
+                        expected.next_fire_at = Some(
+                            self.activation.fired_at
+                                + expected.retry.delay_after(expected.consecutive_failures),
+                        );
+                    }
+                    expected.updated_at = self.activation.fired_at;
+                    let disposition = if expected.circuit_open {
+                        ActivationDisposition::CircuitOpen
+                    } else {
+                        ActivationDisposition::Backoff
+                    };
+                    if self.activation.disposition != disposition
+                        || self.activation.error.is_none()
+                        || related_snapshot_digest(&expected)?
+                            != related_snapshot_digest(&self.routine)?
+                    {
+                        return Err(related_creation_conflict(
+                            "routine successor does not match its failure transition",
+                        ));
+                    }
+                }
+                if let Some(request) = &self.request {
+                    request.validate(
+                        "ptah_fire_routine",
+                        "routine_activation",
+                        self.routine.session_id,
+                        &self.routine.workspace,
+                    )?;
+                    let expected = serde_json::json!({"sessionId":self.routine.session_id,"workspace":request.payload["workspace"],"routineId":self.routine.routine_id,"payload":self.activation.payload});
+                    if self.activation.trigger_kind != "manual"
+                        || self.activation.created_by != request.actor
+                        || self.activation.dedupe_key
+                            != super::routine::manual_dedupe_key(
+                                &self.routine.routine_id,
+                                &request.binding.request_id,
+                            )
+                        || request.payload != expected
+                    {
+                        return Err(related_creation_conflict(
+                            "routine request does not match the activation",
+                        ));
+                    }
+                }
+            }
+            _ => {
+                return Err(related_creation_conflict(
+                    "unsupported or invalid routine creation intent",
+                ))
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ManagerCreationIntent {
+    #[serde(default = "legacy_related_creation_schema")]
+    schema_version: u32,
     plan: ManagerPlan,
     root_work: WorkItem,
+    #[serde(default)]
+    prior_plan: Option<ManagerPlan>,
+    #[serde(default)]
+    prior_root_work: Option<WorkItem>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    snapshot_digest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    request: Option<RelatedCreationRequest>,
+}
+
+impl ManagerCreationIntent {
+    fn digest(&self) -> Result<String, OrchError> {
+        related_snapshot_digest(&(&self.plan, &self.root_work))
+    }
+    fn response(&self) -> serde_json::Value {
+        serde_json::json!({"plan":self.plan,"rootWork":self.root_work})
+    }
+    fn validate(&self) -> Result<(), OrchError> {
+        self.plan.validate()?;
+        self.root_work.validate()?;
+        if !self.root_work.is_container
+            || self.root_work.work_id != self.plan.root_work_id
+            || self.root_work.session_id != self.plan.session_id
+            || self.root_work.workspace != self.plan.workspace
+        {
+            return Err(related_creation_conflict(
+                "manager root Work does not match its plan",
+            ));
+        }
+        match self.schema_version {
+            1 if self.request.is_none()
+                && self.snapshot_digest.is_none()
+                && self.prior_plan.is_none()
+                && self.prior_root_work.is_none() => {}
+            2 if self.prior_plan.is_none()
+                && self.prior_root_work.is_none()
+                && self.snapshot_digest.as_deref() == Some(self.digest()?.as_str()) =>
+            {
+                if self.plan.revision != 1
+                    || self.plan.replan_count != 0
+                    || self.plan.state != super::manager::ManagerPlanState::Active
+                    || self.root_work.state != WorkState::Blocked
+                    || self.root_work.revision != 2
+                    || self.root_work.attempt_count != 0
+                    || self.root_work.assignment_status != AssignmentStatus::Unassigned
+                    || self.root_work.assigned_agent_id.is_some()
+                    || self.root_work.result.is_some()
+                    || self.root_work.progress.is_some()
+                    || self.root_work.approval.is_some()
+                    || self.root_work.last_decision_id.is_some()
+                    || self.root_work.kind != "manager-plan"
+                    || self.root_work.priority != 0
+                    || self.root_work.parent_work_id.is_some()
+                    || !self.root_work.dependencies.is_empty()
+                    || self.root_work.deadline.is_some()
+                    || self.root_work.block_provenance.is_some()
+                    || self.root_work.source_manager_plan_id.is_some()
+                    || self.root_work.source_manager_step_id.is_some()
+                    || self.root_work.source_routine_id.is_some()
+                    || self.root_work.source_activation_id.is_some()
+                    || self.root_work.policy != WorkPolicy::default()
+                    || self.root_work.blocked_reason.as_deref()
+                        != Some("manager plan container; execute its child Work items")
+                    || self.plan.steps.iter().any(|step| {
+                        step.state != super::manager::ManagerStepState::Pending
+                            || step.work_id.is_some()
+                    })
+                {
+                    return Err(related_creation_conflict(
+                        "manager creation snapshot is not initial state",
+                    ));
+                }
+                if let Some(request) = &self.request {
+                    request.validate(
+                        "ptah_create_manager_plan",
+                        "manager_plan",
+                        self.plan.session_id,
+                        &self.plan.workspace,
+                    )?;
+                    let expected = serde_json::json!({"sessionId":self.plan.session_id,"workspace":request.payload["workspace"],"managerAgentId":self.plan.manager_agent_id,"objective":self.plan.objective,"steps":self.plan.steps.iter().map(|step|step.as_spec()).collect::<Vec<_>>(),"maxInFlight":self.plan.max_in_flight,"maxReplans":self.plan.max_replans,"autonomous":self.plan.coordination.autonomous()});
+                    if request.payload != expected
+                        || self.root_work.created_by != request.actor
+                        || self.root_work.objective != self.plan.objective
+                    {
+                        return Err(related_creation_conflict(
+                            "manager request does not match its plan",
+                        ));
+                    }
+                }
+            }
+            _ => {
+                return Err(related_creation_conflict(
+                    "unsupported or invalid manager creation intent",
+                ))
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ManagerWorkWrite {
+    // Absent only for a newly materialized child. Existing host writes carry
+    // their real predecessor, never a fabricated initial Work record.
+    prior: Option<WorkItem>,
+    item: WorkItem,
+}
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ManagerMessageWrite {
+    prior: Option<WorkMessage>,
+    message: WorkMessage,
+}
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ManagerSequenceWrite {
+    prior: Option<u64>,
+    next: u64,
+}
+
+/// Work observations and clocks used by the production coordinator. They
+/// allow recovery to verify derivation instead of trusting a changed checksum.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ManagerMutationObservation {
+    pub work_items: Vec<WorkItem>,
+    pub advanced_at: Option<chrono::DateTime<Utc>>,
+    pub notified_at: Option<chrono::DateTime<Utc>>,
+    pub actor: String,
+}
+
+/// Version 3 extends the existing manager journal for plan changes. Older
+/// creation-only readers cannot deserialize it as a root creation.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ManagerMutationIntent {
+    schema_version: u32,
+    intent_id: String,
+    operation: String,
+    prior_plan: ManagerPlan,
+    plan: ManagerPlan,
+    work_writes: Vec<ManagerWorkWrite>,
+    message_writes: Vec<ManagerMessageWrite>,
+    sequence: Option<ManagerSequenceWrite>,
+    observation: Option<ManagerMutationObservation>,
+    native_executor: Option<super::managed::NativeExecutorStatus>,
+    snapshot_digest: String,
+    request: Option<RelatedCreationRequest>,
+}
+impl ManagerMutationIntent {
+    fn digest(&self) -> Result<String, OrchError> {
+        related_snapshot_digest(&(
+            &self.operation,
+            &self.prior_plan,
+            &self.plan,
+            &self.work_writes,
+            &self.message_writes,
+            &self.sequence,
+            &self.native_executor,
+            &self.observation,
+        ))
+    }
+    fn response(&self) -> serde_json::Value {
+        if self.request.is_none() {
+            return serde_json::Value::Null;
+        }
+        let mut result = serde_json::json!({"plan":self.plan});
+        if self.operation != "replan" {
+            result["createdWork"] = serde_json::json!(self
+                .work_writes
+                .iter()
+                .map(|write| &write.item)
+                .collect::<Vec<_>>());
+        }
+        if self.operation == "tick" {
+            result["messages"] = serde_json::json!(self
+                .message_writes
+                .iter()
+                .map(|write| &write.message)
+                .collect::<Vec<_>>());
+            result["nativeExecutor"] = serde_json::json!(self.native_executor);
+        }
+        result
+    }
+    fn validate_observation(
+        &self,
+        observation: &ManagerMutationObservation,
+    ) -> Result<(), OrchError> {
+        if observation.work_items.len() > super::manager::MAX_MANAGER_STEPS
+            || observation.actor.is_empty()
+        {
+            return Err(related_creation_conflict(
+                "manager observation exceeds its bound",
+            ));
+        }
+        let mut ids = HashSet::new();
+        for item in &observation.work_items {
+            item.validate()?;
+            if item.session_id != self.plan.session_id
+                || item.workspace != self.plan.workspace
+                || !ids.insert(&item.work_id)
+            {
+                return Err(related_creation_conflict(
+                    "manager observation identity is invalid",
+                ));
+            }
+        }
+        if let Some(request) = &self.request {
+            if self.operation == "replan"
+                || observation.actor != request.actor
+                || (self.operation == "advance"
+                    && (observation.advanced_at.is_none() || observation.notified_at.is_some()))
+                || (self.operation == "tick" && observation.notified_at.is_none())
+            {
+                return Err(related_creation_conflict(
+                    "manager observation does not match its caller",
+                ));
+            }
+        } else if observation.actor != "manager-supervisor" {
+            return Err(related_creation_conflict(
+                "background manager observation has an unknown actor",
+            ));
+        }
+        if self.operation != "advance"
+            && observation.advanced_at.is_some()
+                != (self.prior_plan.state == super::manager::ManagerPlanState::Active)
+        {
+            return Err(related_creation_conflict(
+                "manager observation omitted its required advancement",
+            ));
+        }
+        let mut checked = self.prior_plan.clone();
+        let mut created = if let Some(now) = observation.advanced_at {
+            checked.advance(&observation.work_items, &observation.actor, now)?
+        } else {
+            Vec::new()
+        };
+        if created.len() != self.work_writes.len() {
+            return Err(related_creation_conflict(
+                "manager child batch differs from its observation",
+            ));
+        }
+        for (generated, write) in created.iter_mut().zip(&self.work_writes) {
+            if write.item.source_manager_step_id != generated.source_manager_step_id {
+                return Err(related_creation_conflict(
+                    "manager child order differs from its original derivation",
+                ));
+            }
+            let old_id = generated.work_id.clone();
+            generated.work_id = write.item.work_id.clone();
+            for step in &mut checked.steps {
+                if step.work_id.as_deref() == Some(old_id.as_str()) {
+                    step.work_id = Some(generated.work_id.clone());
+                }
+            }
+            if write.prior.is_some()
+                || related_snapshot_digest(generated)? != related_snapshot_digest(&write.item)?
+            {
+                return Err(related_creation_conflict(
+                    "manager child differs from its original derivation",
+                ));
+            }
+        }
+        let notifications = if observation.notified_at.is_some() {
+            checked.pending_notifications(&observation.work_items)
+        } else {
+            Vec::new()
+        };
+        if (self.request.is_some() && notifications.len() != self.message_writes.len())
+            || self.message_writes.len() > notifications.len()
+        {
+            return Err(related_creation_conflict(
+                "manager notifications differ from the observation",
+            ));
+        }
+        let mut delivered = Vec::new();
+        for (notification, write) in notifications.iter().zip(&self.message_writes) {
+            let message = &write.message;
+            let stable_id = format!(
+                "manager-message-{}",
+                &super::types::hash_payload(
+                    &serde_json::json!({"planId":checked.plan_id,"stepId":notification.step_id,"workRevision":notification.work_revision,"kind":notification.kind})
+                )[..32]
+            );
+            let mut expected = WorkMessage::new(
+                notification.kind,
+                &observation.actor,
+                None,
+                Some(checked.manager_agent_id.clone()),
+                checked.session_id,
+                checked.workspace.clone(),
+                Some(notification.work_id.clone()),
+                notification.body.clone(),
+                Some(notification.payload.clone()),
+                message.created_at,
+            )?;
+            expected.message_id = stable_id;
+            expected.seq = message.seq;
+            if let Some(prior) = &write.prior {
+                expected.acked_at = prior.acked_at;
+                expected.acked_by = prior.acked_by.clone();
+            }
+            if expected != *message {
+                return Err(related_creation_conflict(
+                    "manager notification differs from its original derivation",
+                ));
+            }
+            delivered.push((
+                notification.step_id.clone(),
+                notification.work_revision,
+                message.message_id.clone(),
+            ));
+        }
+        if let Some(now) = observation.notified_at {
+            checked.mark_notifications_sent(&delivered, now)?;
+        }
+        if related_snapshot_digest(&checked)? != related_snapshot_digest(&self.plan)? {
+            return Err(related_creation_conflict(
+                "manager plan differs from its original observation",
+            ));
+        }
+        Ok(())
+    }
+    fn validate(&self) -> Result<(), OrchError> {
+        self.prior_plan.validate()?;
+        self.plan.validate()?;
+        safe_id_filename(&self.intent_id)?;
+        let prior = &self.prior_plan;
+        let next = &self.plan;
+        if self.schema_version != 3
+            || !["advance", "tick", "replan", "background"].contains(&self.operation.as_str())
+            || self.snapshot_digest != self.digest()?
+            || prior.plan_id != next.plan_id
+            || prior.session_id != next.session_id
+            || prior.workspace != next.workspace
+            || prior.root_work_id != next.root_work_id
+            || prior.manager_agent_id != next.manager_agent_id
+            || prior.objective != next.objective
+            || prior.created_at != next.created_at
+            || prior.max_in_flight != next.max_in_flight
+            || prior.max_replans != next.max_replans
+            || prior.coordination != next.coordination
+            || next.revision < prior.revision
+            || self.work_writes.len() > super::manager::MAX_MANAGER_STEPS
+            || self.message_writes.len() > super::manager::MAX_MANAGER_STEPS
+        {
+            return Err(related_creation_conflict("invalid sealed manager mutation"));
+        }
+        let mut ids = HashSet::new();
+        for write in &self.work_writes {
+            let item = &write.item;
+            item.validate()?;
+            if !ids.insert(item.work_id.as_str())
+                || item.session_id != next.session_id
+                || item.workspace != next.workspace
+            {
+                return Err(related_creation_conflict(
+                    "manager Work batch identity is invalid",
+                ));
+            }
+            if let Some(prior) = &write.prior {
+                prior.validate()?;
+                if prior.work_id != item.work_id
+                    || prior.session_id != item.session_id
+                    || prior.workspace != item.workspace
+                {
+                    return Err(related_creation_conflict(
+                        "manager Work predecessor identity changed",
+                    ));
+                }
+            }
+        }
+        let mut message_ids = HashSet::new();
+        let mut seqs = HashSet::new();
+        for write in &self.message_writes {
+            let message = &write.message;
+            message.validate()?;
+            if !message_ids.insert(message.message_id.as_str())
+                || !seqs.insert(message.seq)
+                || message.seq == 0
+                || message.session_id != next.session_id
+                || message.workspace != next.workspace
+            {
+                return Err(related_creation_conflict(
+                    "manager message batch identity is invalid",
+                ));
+            }
+            if let Some(prior) = &write.prior {
+                prior.validate()?;
+                if prior != message {
+                    return Err(related_creation_conflict(
+                        "existing notification snapshot changed",
+                    ));
+                }
+            }
+        }
+        if self.message_writes.is_empty() != self.sequence.is_none() {
+            return Err(related_creation_conflict(
+                "manager message sequence evidence is missing",
+            ));
+        }
+        if let Some(sequence) = &self.sequence {
+            if sequence.next < sequence.prior.unwrap_or(0)
+                || self
+                    .message_writes
+                    .iter()
+                    .any(|write| write.message.seq > sequence.next)
+            {
+                return Err(related_creation_conflict(
+                    "manager message sequence evidence is invalid",
+                ));
+            }
+        }
+        if let Some(observation) = &self.observation {
+            self.validate_observation(observation)?;
+        } else if self.request.is_some() && self.operation != "replan" {
+            return Err(related_creation_conflict(
+                "manager mutation is missing original Work observations",
+            ));
+        }
+        if let Some(request) = &self.request {
+            let tool = match self.operation.as_str() {
+                "advance" => "ptah_advance_manager_plan",
+                "tick" => "ptah_tick_manager_plan",
+                "replan" => "ptah_replan_manager_plan",
+                _ => {
+                    return Err(related_creation_conflict(
+                        "background manager write acquired a foreground request",
+                    ))
+                }
+            };
+            request.validate(tool, "manager_mutation", prior.session_id, &prior.workspace)?;
+            if request.payload_digest != request.binding.payload_hash
+                || request.payload["planId"] != prior.plan_id
+            {
+                return Err(related_creation_conflict(
+                    "manager mutation input does not match its request",
+                ));
+            }
+            let revision = &request.payload["expectedRevision"];
+            if !revision.is_null() && revision.as_u64() != Some(prior.revision) {
+                return Err(related_creation_conflict(
+                    "manager request expected a different prior revision",
+                ));
+            }
+            let mut expected = serde_json::json!({"sessionId":prior.session_id,"workspace":request.payload["workspace"],"planId":prior.plan_id,"expectedRevision":revision});
+            if self.operation == "replan" {
+                expected["reason"] = request.payload["reason"].clone();
+                expected["steps"] = request.payload["steps"].clone();
+                let steps: Vec<super::manager::ManagerStepSpec> =
+                    serde_json::from_value(expected["steps"].clone()).map_err(|_| {
+                        related_creation_conflict("manager replan inputs are invalid")
+                    })?;
+                let reason = expected["reason"]
+                    .as_str()
+                    .ok_or_else(|| related_creation_conflict("manager replan reason is invalid"))?;
+                let mut checked = prior.clone();
+                checked.append_replan(reason.into(), steps, next.updated_at)?;
+                if related_snapshot_digest(&checked)? != related_snapshot_digest(next)?
+                    || !self.work_writes.is_empty()
+                    || !self.message_writes.is_empty()
+                {
+                    return Err(related_creation_conflict(
+                        "sealed replan does not match its original inputs",
+                    ));
+                }
+            } else if prior.replan_count != next.replan_count
+                || prior.steps.len() != next.steps.len()
+                || prior
+                    .steps
+                    .iter()
+                    .zip(&next.steps)
+                    .any(|(left, right)| left.as_spec() != right.as_spec())
+            {
+                return Err(related_creation_conflict(
+                    "manager observation changed its step definitions",
+                ));
+            }
+            if request.payload != expected
+                || (self.operation == "tick") != self.native_executor.is_some()
+                || (self.operation != "tick" && !self.message_writes.is_empty())
+            {
+                return Err(related_creation_conflict(
+                    "manager response shape or inputs are invalid",
+                ));
+            }
+            for write in &self.work_writes {
+                let item = &write.item;
+                let step = next
+                    .steps
+                    .iter()
+                    .find(|step| step.work_id.as_deref() == Some(item.work_id.as_str()))
+                    .ok_or_else(|| {
+                        related_creation_conflict("manager child is not in the sealed plan")
+                    })?;
+                let dependencies = step
+                    .dependencies
+                    .iter()
+                    .map(|id| {
+                        next.steps
+                            .iter()
+                            .find(|candidate| &candidate.step_id == id)
+                            .and_then(|candidate| candidate.work_id.as_ref())
+                            .map(|work_id| super::workload::WorkDependency {
+                                work_id: work_id.clone(),
+                                required_state: WorkState::Succeeded,
+                            })
+                            .ok_or_else(|| {
+                                related_creation_conflict("manager child dependency is missing")
+                            })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                if write.prior.is_some()
+                    || item.parent_work_id.as_deref() != Some(next.root_work_id.as_str())
+                    || item.source_manager_plan_id.as_deref() != Some(next.plan_id.as_str())
+                    || item.source_manager_step_id.as_deref() != Some(step.step_id.as_str())
+                    || item.created_by != request.actor
+                    || item.kind != step.kind
+                    || item.objective != step.objective
+                    || item.priority != step.priority
+                    || item.policy != step.policy
+                    || item.assigned_agent_id != step.assigned_agent_id
+                    || item.dependencies != dependencies
+                    || item.state != WorkState::Queued
+                    || item.revision != 1
+                    || item.attempt_count != 0
+                    || item.created_at != item.updated_at
+                    || item.result.is_some()
+                    || item.progress.is_some()
+                    || item.approval.is_some()
+                    || item.last_decision_id.is_some()
+                    || item.is_container
+                    || item.assignment_status
+                        != if item.assigned_agent_id.is_some() {
+                            AssignmentStatus::Accepted
+                        } else {
+                            AssignmentStatus::Unassigned
+                        }
+                {
+                    return Err(related_creation_conflict(
+                        "manager child is not its original initial snapshot",
+                    ));
+                }
+            }
+            for write in &self.message_writes {
+                let message = &write.message;
+                if message.from_actor != request.actor
+                    || message.to_agent_id.as_deref() != Some(next.manager_agent_id.as_str())
+                    || !next.steps.iter().any(|step| {
+                        step.last_notification_message_id.as_deref()
+                            == Some(message.message_id.as_str())
+                            && step.work_id == message.work_id
+                    })
+                {
+                    return Err(related_creation_conflict(
+                        "manager notification is not stamped onto its plan",
+                    ));
+                }
+            }
+        } else if self.operation != "background" || self.native_executor.is_some() {
+            return Err(related_creation_conflict(
+                "foreground manager mutation is missing its original request",
+            ));
+        }
+        Ok(())
+    }
+}
+
+enum ManagerIntent {
+    Creation(Box<ManagerCreationIntent>),
+    Mutation(Box<ManagerMutationIntent>),
+}
+impl ManagerIntent {
+    fn decode(bytes: &[u8]) -> Result<Self, OrchError> {
+        let value: serde_json::Value = serde_json::from_slice(bytes)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        if value["schemaVersion"] == 3 {
+            let intent: ManagerMutationIntent = serde_json::from_value(value)
+                .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+            intent.validate()?;
+            Ok(Self::Mutation(Box::new(intent)))
+        } else {
+            let intent: ManagerCreationIntent = serde_json::from_value(value)
+                .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+            intent.validate()?;
+            Ok(Self::Creation(Box::new(intent)))
+        }
+    }
 }
 
 /// Service receipt identity stored inside an existing work intent.
@@ -307,8 +1163,12 @@ struct WorkLifecycleIntent {
     intent_id: String,
     operation: String,
     work_id: String,
-    prior_item: WorkItem,
+    // Version 1 always has a prior item. Version 2 is an authenticated create
+    // with an explicitly absent prior; it cannot masquerade as an update.
+    prior_item: Option<WorkItem>,
     item: WorkItem,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    creation_item_digest: Option<String>,
     prior_attempts: Vec<WorkAttempt>,
     attempts: Vec<WorkAttempt>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -316,6 +1176,7 @@ struct WorkLifecycleIntent {
 }
 
 const WORK_LIFECYCLE_INTENT_SCHEMA_VERSION: u32 = 1;
+const WORK_CREATION_INTENT_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug, serde::Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -626,8 +1487,9 @@ impl WorkLifecycleIntent {
             intent_id,
             operation: operation.to_string(),
             work_id: item.work_id.clone(),
-            prior_item,
+            prior_item: Some(prior_item),
             item,
+            creation_item_digest: None,
             prior_attempts,
             attempts,
             request: None,
@@ -637,23 +1499,77 @@ impl WorkLifecycleIntent {
     }
 
     fn validate(&self) -> Result<(), OrchError> {
-        if self.schema_version != WORK_LIFECYCLE_INTENT_SCHEMA_VERSION
-            || self.intent_id.is_empty()
+        if self.intent_id.is_empty()
             || self.operation.trim().is_empty()
             || self.work_id.is_empty()
-            || self.prior_item.work_id != self.work_id
             || self.item.work_id != self.work_id
-            || self.prior_item.session_id != self.item.session_id
-            || self.prior_item.workspace != self.item.workspace
-            || self.prior_item.created_by != self.item.created_by
         {
             return Err(OrchError::new(
                 OrchErrorCode::InvalidRequest,
                 "work lifecycle intent schema or lane identity is invalid",
             ));
         }
-        self.prior_item.validate()?;
         self.item.validate()?;
+        if let Some(prior) = &self.prior_item {
+            if self.schema_version != WORK_LIFECYCLE_INTENT_SCHEMA_VERSION
+                || self.operation == "create"
+                || self.creation_item_digest.is_some()
+                || prior.work_id != self.work_id
+                || prior.session_id != self.item.session_id
+                || prior.workspace != self.item.workspace
+                || prior.created_by != self.item.created_by
+            {
+                return Err(OrchError::new(
+                    OrchErrorCode::InvalidRequest,
+                    "work lifecycle intent schema or lane identity is invalid",
+                ));
+            }
+            prior.validate()?;
+        } else {
+            let request = self.request.as_ref().ok_or_else(|| {
+                OrchError::new(
+                    OrchErrorCode::InvalidRequest,
+                    "work creation requires its original request",
+                )
+            })?;
+            if self.schema_version != WORK_CREATION_INTENT_SCHEMA_VERSION
+                || self.operation != "create"
+                || self.creation_item_digest.as_deref()
+                    != Some(OrchStore::work_digest(&self.item)?.as_str())
+                || request.tool != "ptah_create_work"
+                || request.shape != "work_attempts"
+                || request.target_work_id.is_some()
+                || request.target_attempt_id.is_some()
+                || request.expected_revision.is_some()
+                || request.session_id != self.item.session_id
+                || !bound_request_workspace_matches(request, &self.item.workspace)
+                || IdempotencyScope::new(
+                    &request.owner_id,
+                    request.session_id,
+                    Path::new(&self.item.workspace),
+                )?
+                .workspace_digest
+                    != request.workspace_digest
+                || self.item.state != WorkState::Queued
+                || self.item.revision != 1
+                || self.item.attempt_count != 0
+                || self.item.assignment_status != AssignmentStatus::Unassigned
+                || self.item.assigned_agent_id.is_some()
+                || self.item.is_container
+                || self.item.result.is_some()
+                || self.item.progress.is_some()
+                || self.item.approval.is_some()
+                || self.item.last_decision_id.is_some()
+                || self.item.created_at != self.item.updated_at
+                || !self.prior_attempts.is_empty()
+                || !self.attempts.is_empty()
+            {
+                return Err(OrchError::new(
+                    OrchErrorCode::InvalidRequest,
+                    "invalid sealed work creation",
+                ));
+            }
+        }
         validate_work_attempt_set(&self.work_id, &self.prior_attempts)?;
         validate_work_attempt_set(&self.work_id, &self.attempts)?;
         Ok(())
@@ -1030,8 +1946,11 @@ impl OrchStore {
         store.recover_finalization_intents()?;
         store.recover_routine_intents()?;
         store.recover_manager_creation_intents()?;
+        // An absent-prior creation must exist before a dependent update is
+        // recovered, and before pending receipts are classified as orphaned.
+        store.recover_work_lifecycle_intents(true)?;
         store.recover_work_mutation_intents()?;
-        store.recover_work_lifecycle_intents()?;
+        store.recover_work_lifecycle_intents(false)?;
         store.recover_apply_admissions()?;
         store.recover_apply_source_intents()?;
         store.recover_managed_finalization_intents()?;
@@ -1902,6 +2821,62 @@ impl OrchStore {
         self.save_work_item_unlocked(item)
     }
 
+    /// Admit an authenticated creation through the lifecycle transaction.
+    /// The intent owns both the original ID and its request outcome before
+    /// the first Work write. Ordinary fixture/import saves remain unbound.
+    pub fn create_work_item(&self, item: &WorkItem) -> Result<serde_json::Value, OrchError> {
+        let request = self.adopt_operation_request().ok_or_else(|| {
+            OrchError::new(
+                OrchErrorCode::Conflict,
+                "work creation request binding is missing",
+            )
+        })?;
+        let _guard = self.inner.lock.lock();
+        self.refuse_closed_admission()?;
+        if self
+            .load_work_item_unlocked(&item.work_id)
+            .map_err(Self::orch_error_from_anyhow)?
+            .is_some()
+        {
+            return Err(OrchError::new(
+                OrchErrorCode::Conflict,
+                "work creation ID already exists",
+            ));
+        }
+        self.validate_work_item_for_save_unlocked(item)
+            .map_err(Self::orch_error_from_anyhow)?;
+        self.validate_bound_request_unlocked(&request, item, &[], &[])?;
+        let intent = WorkLifecycleIntent {
+            schema_version: WORK_CREATION_INTENT_SCHEMA_VERSION,
+            intent_id: Uuid::new_v4().to_string(),
+            operation: "create".into(),
+            work_id: item.work_id.clone(),
+            prior_item: None,
+            item: item.clone(),
+            creation_item_digest: Some(Self::work_digest(item)?),
+            prior_attempts: Vec::new(),
+            attempts: Vec::new(),
+            request: Some(request),
+        };
+        intent.validate()?;
+        let response = lifecycle_response_value(&intent)?;
+        let path = self.work_lifecycle_intent_path(&intent.intent_id)?;
+        crash_process_if_stage("create_before_intent");
+        if let Err(error) = self.persist_work_lifecycle_intent_unlocked(&intent) {
+            // An fsync can fail after rename. Only proven absence permits an
+            // ordinary pre-admission refusal; uncertainty requires recovery.
+            return Err(if path.try_exists().unwrap_or(true) {
+                self.note_work_recovery_required(error)
+            } else {
+                error
+            });
+        }
+        crash_process_if_stage("lifecycle_after_intent");
+        self.commit_work_lifecycle_intent_unlocked(&intent)
+            .map_err(|error| self.note_work_recovery_required(error))?;
+        Ok(response)
+    }
+
     /// Import a pre-existing record for migration/fixture setup without
     /// re-validating edges against the rest of the ledger. Runtime mutation
     /// paths must use [`Self::save_work_item`].
@@ -2065,46 +3040,630 @@ impl OrchStore {
         plan: &ManagerPlan,
         root_work: &WorkItem,
     ) -> Result<(), OrchError> {
+        self.save_manager_creation_with_request(plan, root_work, None)
+    }
+
+    pub(crate) fn save_manager_creation_with_request(
+        &self,
+        plan: &ManagerPlan,
+        root_work: &WorkItem,
+        request: Option<RelatedCreationRequest>,
+    ) -> Result<(), OrchError> {
         let _guard = self.inner.lock.lock();
-        plan.validate()?;
-        root_work
-            .validate()
-            .map_err(|error| OrchError::new(OrchErrorCode::InvalidRequest, error.message))?;
-        if !root_work.is_container
-            || root_work.work_id != plan.root_work_id
-            || root_work.session_id != plan.session_id
-            || root_work.workspace != plan.workspace
-        {
-            return Err(OrchError::new(
-                OrchErrorCode::InvalidRequest,
-                "manager root Work does not match its plan",
-            ));
-        }
-        let intent = ManagerCreationIntent {
+        self.refuse_closed_admission()?;
+        let mut intent = ManagerCreationIntent {
+            schema_version: 2,
             plan: plan.clone(),
             root_work: root_work.clone(),
+            prior_plan: None,
+            prior_root_work: None,
+            snapshot_digest: None,
+            request,
         };
-        let intent_path = self.manager_creation_intent_path(&plan.plan_id)?;
-        atomic_write_json(&self.lease(), &intent_path, &intent)
+        intent.snapshot_digest = Some(intent.digest()?);
+        intent.validate()?;
+        if self
+            .manager_plan_path(&plan.plan_id)?
+            .try_exists()
+            .map_err(|e| OrchError::new(OrchErrorCode::Internal, e.to_string()))?
+            || self
+                .work_item_path(&root_work.work_id)?
+                .try_exists()
+                .map_err(|e| OrchError::new(OrchErrorCode::Internal, e.to_string()))?
+        {
+            return Err(related_creation_conflict(
+                "manager creation requires absent prior records",
+            ));
+        }
+        self.preflight_manager_creation_unlocked(&intent)?;
+        let path = self.manager_creation_intent_path(&plan.plan_id)?;
+        crash_process_if_stage("manager_create_before_intent");
+        self.persist_related_intent_unlocked(&path, &intent)?;
+        crash_process_if_stage("manager_create_after_intent");
+        self.commit_manager_creation_intent_unlocked(&intent)
+            .map_err(|error| self.note_work_recovery_required(error))?;
+        self.clear_related_intent_unlocked(&path)
+            .map_err(|error| self.note_work_recovery_required(error))?;
+        crash_process_if_stage("manager_create_after_commit");
+        Ok(())
+    }
+
+    /// Preflight every dependent record before the first write. A schema-2
+    /// create has no predecessor; exact successors permit idempotent recovery.
+    fn related_record_matches_unlocked<T: serde::de::DeserializeOwned + serde::Serialize>(
+        &self,
+        path: &Path,
+        expected: &T,
+    ) -> Result<bool, OrchError> {
+        let metadata = match fs::symlink_metadata(path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(OrchError::new(OrchErrorCode::Internal, error.to_string())),
+        };
+        if !metadata.file_type().is_file() {
+            return Err(related_creation_conflict(
+                "creation found non-regular record evidence",
+            ));
+        }
+        let actual: T = serde_json::from_slice(
+            &fs::read(path)
+                .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?,
+        )
+        .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        if related_snapshot_digest(&actual)? != related_snapshot_digest(expected)? {
+            return Err(related_creation_conflict(
+                "creation found a conflicting successor record",
+            ));
+        }
+        Ok(true)
+    }
+
+    fn preflight_related_work_unlocked(&self, item: &WorkItem) -> Result<bool, OrchError> {
+        let present =
+            self.related_record_matches_unlocked(&self.work_item_path(&item.work_id)?, item)?;
+        if !self
+            .list_work_attempts_unlocked(Some(&item.work_id))
+            .map_err(Self::orch_error_from_anyhow)?
+            .is_empty()
+            || !self.list_work_decisions_unlocked(&item.work_id)?.is_empty()
+        {
+            return Err(related_creation_conflict(
+                "new Work has unexpected attempts or decisions",
+            ));
+        }
+        self.validate_work_item_for_save_unlocked(item)
+            .map_err(Self::orch_error_from_anyhow)?;
+        Ok(present)
+    }
+
+    /// Admitted bound mutations own a canonical claim. Inspection cannot
+    /// follow links or adopt legacy evidence before proving the outcome.
+    /// The ordinary claim/read migration authority remains unchanged.
+    fn inspect_canonical_request_receipt_unlocked(
+        &self,
+        request: &WorkRequestBinding,
+    ) -> Result<IdempotencyReceipt, OrchError> {
+        let binding = request;
+        let scope = IdempotencyScope {
+            owner_id: binding.owner_id.clone(),
+            session_id: binding.session_id,
+            workspace_digest: binding.workspace_digest.clone(),
+        };
+        let path = self.idemp_path(&scope, &binding.request_id)?;
+        let metadata = fs::symlink_metadata(&path)
             .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
-        self.commit_manager_creation_intent_unlocked(&intent)?;
-        remove_file_durable(&self.lease(), &intent_path)
-            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))
+        if !metadata.file_type().is_file() {
+            return Err(related_creation_conflict(
+                "creation receipt is non-regular evidence",
+            ));
+        }
+        let receipt: IdempotencyReceipt = serde_json::from_slice(
+            &fs::read(path)
+                .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?,
+        )
+        .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        if !receipt.is_in_scope(&scope)
+            || receipt.tool != binding.tool
+            || receipt.request_id != binding.request_id
+            || receipt.payload_hash != binding.payload_hash
+        {
+            return Err(related_creation_conflict(
+                "creation receipt does not match the authenticated request",
+            ));
+        }
+        Ok(receipt)
+    }
+
+    /// Ordinary bound updates predate creation's subject metadata. Their
+    /// completed v1 receipts may have no subject; exact original bodies still
+    /// replay, without rewriting old evidence or using a newer Work snapshot.
+    fn preflight_bound_work_outcome_unlocked(
+        &self,
+        request: Option<&WorkRequestBinding>,
+        response: &serde_json::Value,
+        work_id: &str,
+        effects_present: bool,
+    ) -> Result<(), OrchError> {
+        let Some(request) = request else {
+            return Ok(());
+        };
+        let receipt = self.inspect_canonical_request_receipt_unlocked(request)?;
+        let complete = receipt.status == "complete"
+            && receipt.error.is_none()
+            && receipt.response == *response
+            && receipt
+                .run_id
+                .as_deref()
+                .is_none_or(|subject| subject == work_id)
+            && effects_present;
+        if !creation_receipt_is_pending(&receipt) && !complete {
+            return Err(OrchError::new(
+                OrchErrorCode::Conflict,
+                "work request receipt conflicts with its sealed outcome",
+            ));
+        }
+        Ok(())
+    }
+
+    fn preflight_related_receipt_unlocked(
+        &self,
+        request: Option<&RelatedCreationRequest>,
+        response: &serde_json::Value,
+        subject_id: &str,
+        effects_present: bool,
+    ) -> Result<(), OrchError> {
+        let Some(request) = request else {
+            return Ok(());
+        };
+        let receipt = self.inspect_canonical_request_receipt_unlocked(&request.binding)?;
+        let complete = receipt.status == "complete"
+            && receipt.error.is_none()
+            && receipt.response == *response
+            && receipt.run_id.as_deref() == Some(subject_id)
+            && effects_present;
+        if !creation_receipt_is_pending(&receipt) && !complete {
+            return Err(related_creation_conflict(
+                "related creation receipt conflicts with its sealed outcome",
+            ));
+        }
+        Ok(())
+    }
+
+    fn preflight_manager_creation_unlocked(
+        &self,
+        intent: &ManagerCreationIntent,
+    ) -> Result<(), OrchError> {
+        intent.validate()?;
+        let work_present = self.preflight_related_work_unlocked(&intent.root_work)?;
+        let plan_present = self.related_record_matches_unlocked(
+            &self.manager_plan_path(&intent.plan.plan_id)?,
+            &intent.plan,
+        )?;
+        self.preflight_related_receipt_unlocked(
+            intent.request.as_ref(),
+            &intent.response(),
+            &intent.plan.plan_id,
+            work_present && plan_present,
+        )
     }
 
     fn commit_manager_creation_intent_unlocked(
         &self,
         intent: &ManagerCreationIntent,
     ) -> Result<(), OrchError> {
-        self.save_work_item_unlocked(&intent.root_work)
+        self.preflight_manager_creation_unlocked(intent)?;
+        self.write_work_item_unlocked(&intent.root_work)
+            .map_err(Self::orch_error_from_anyhow)?;
+        crash_process_if_stage("manager_create_after_work");
+        self.save_manager_plan_unlocked(&intent.plan)?;
+        crash_process_if_stage("manager_create_after_plan");
+        self.complete_bound_request_unlocked(
+            intent.request.as_ref().map(|request| &request.binding),
+            &intent.response(),
+        )?;
+        crash_process_if_stage("manager_create_after_receipt");
+        Ok(())
+    }
+
+    fn persist_related_intent_unlocked(
+        &self,
+        path: &Path,
+        intent: &impl serde::Serialize,
+    ) -> Result<(), OrchError> {
+        self.refuse_closed_admission()?;
+        atomic_write_json(&self.lease(), path, intent).map_err(|error| {
+            let error = OrchError::new(OrchErrorCode::Internal, error.to_string());
+            if path.try_exists().unwrap_or(true) {
+                self.note_work_recovery_required(error)
+            } else {
+                error
+            }
+        })
+    }
+
+    fn clear_related_intent_unlocked(&self, path: &Path) -> Result<(), OrchError> {
+        crate::verified_change::fail_durable_write_if_armed(path)
             .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
-        self.save_manager_plan_unlocked(&intent.plan)
+        remove_file_durable(&self.lease(), path)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))
+    }
+
+    /// Commit plan materialization and its original caller outcome through the
+    /// existing manager journal. Notifications are prepared, never published,
+    /// before the revision fence and graph/capacity checks succeed.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn commit_manager_mutation(
+        &self,
+        prior: &ManagerPlan,
+        plan: &ManagerPlan,
+        work_items: &[WorkItem],
+        messages: &[WorkMessage],
+        observation: Option<ManagerMutationObservation>,
+        operation: &str,
+        request: Option<RelatedCreationRequest>,
+        native_executor: Option<super::managed::NativeExecutorStatus>,
+    ) -> Result<serde_json::Value, OrchError> {
+        let _guard = self.inner.lock.lock();
+        self.refuse_closed_admission()?;
+        self.admit_manager_mutation_unlocked(
+            prior,
+            plan,
+            work_items,
+            messages,
+            observation,
+            operation,
+            request,
+            native_executor,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn admit_manager_mutation_unlocked(
+        &self,
+        prior: &ManagerPlan,
+        plan: &ManagerPlan,
+        work_items: &[WorkItem],
+        messages: &[WorkMessage],
+        observation: Option<ManagerMutationObservation>,
+        operation: &str,
+        request: Option<RelatedCreationRequest>,
+        native_executor: Option<super::managed::NativeExecutorStatus>,
+    ) -> Result<serde_json::Value, OrchError> {
+        let current = self
+            .read_manager_record_unlocked::<ManagerPlan>(&self.manager_plan_path(&plan.plan_id)?)?
+            .ok_or_else(|| OrchError::new(OrchErrorCode::InvalidRequest, "unknown plan_id"))?;
+        if related_snapshot_digest(&current)? != related_snapshot_digest(prior)? {
+            return Err(OrchError::new(
+                OrchErrorCode::StaleVersion,
+                "manager plan changed before admission",
+            ));
+        }
+        self.validate_work_items_for_save_unlocked(work_items)
+            .map_err(Self::orch_error_from_anyhow)?;
+        let work_writes = work_items
+            .iter()
+            .map(|item| {
+                Ok(ManagerWorkWrite {
+                    prior: self
+                        .read_manager_record_unlocked(&self.work_item_path(&item.work_id)?)?,
+                    item: item.clone(),
+                })
+            })
+            .collect::<Result<Vec<_>, OrchError>>()?;
+        let sequence_prior = if messages.is_empty() {
+            None
+        } else {
+            self.read_manager_sequence_unlocked()?
+        };
+        let mut highwater = sequence_prior.unwrap_or(0);
+        if !messages.is_empty() {
+            for message in self.list_messages_unlocked()? {
+                highwater = highwater.max(message.seq);
+            }
+        }
+        let mut message_writes = Vec::with_capacity(messages.len());
+        for message in messages {
+            message.validate()?;
+            self.require_optional_agent_in_scope_unlocked(
+                message.from_agent_id.as_deref(),
+                message.session_id,
+                &message.workspace,
+            )?;
+            self.require_optional_agent_in_scope_unlocked(
+                message.to_agent_id.as_deref(),
+                message.session_id,
+                &message.workspace,
+            )?;
+            let prior: Option<WorkMessage> =
+                self.read_manager_record_unlocked(&self.message_path(&message.message_id)?)?;
+            let mut next = message.clone();
+            if let Some(existing) = &prior {
+                // Clock-derived TTL belongs to the first observation. Compare
+                // every immutable field while preserving sequence and ack.
+                next.seq = existing.seq;
+                next.created_at = existing.created_at;
+                next.acked_at = existing.acked_at;
+                next.acked_by = existing.acked_by.clone();
+                next.expires_at = next
+                    .kind
+                    .default_ttl_ms()
+                    .map(|ms| existing.created_at + chrono::Duration::milliseconds(ms));
+                if &next != existing {
+                    return Err(related_creation_conflict(
+                        "stable manager message has conflicting content",
+                    ));
+                }
+            } else {
+                highwater = highwater
+                    .checked_add(1)
+                    .ok_or_else(|| related_creation_conflict("message sequence exhausted"))?;
+                next.seq = highwater;
+            }
+            message_writes.push(ManagerMessageWrite {
+                prior,
+                message: next,
+            });
+        }
+        let sequence = (!messages.is_empty()).then_some(ManagerSequenceWrite {
+            prior: sequence_prior,
+            next: highwater,
+        });
+        let mut intent = ManagerMutationIntent {
+            schema_version: 3,
+            intent_id: Uuid::new_v4().to_string(),
+            operation: operation.into(),
+            prior_plan: prior.clone(),
+            plan: plan.clone(),
+            work_writes,
+            message_writes,
+            sequence,
+            observation,
+            native_executor,
+            snapshot_digest: String::new(),
+            request,
+        };
+        intent.snapshot_digest = intent.digest()?;
+        self.preflight_manager_mutation_unlocked(&intent)?;
+        let path = self.manager_creation_intent_path(&intent.intent_id)?;
+        crash_process_if_stage("manager_mutation_before_intent");
+        self.persist_related_intent_unlocked(&path, &intent)?;
+        crash_process_if_stage("manager_mutation_after_intent");
+        self.commit_manager_mutation_unlocked(&intent)
+            .map_err(|error| self.note_work_recovery_required(error))?;
+        self.clear_related_intent_unlocked(&path)
+            .map_err(|error| self.note_work_recovery_required(error))?;
+        crash_process_if_stage("manager_mutation_after_commit");
+        self.prune_messages_unlocked()
+            .map_err(|error| self.note_work_recovery_required(error))?;
+        Ok(intent.response())
+    }
+
+    fn read_manager_record_unlocked<T: serde::de::DeserializeOwned>(
+        &self,
+        path: &Path,
+    ) -> Result<Option<T>, OrchError> {
+        let metadata = match fs::symlink_metadata(path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(OrchError::new(OrchErrorCode::Internal, error.to_string())),
+        };
+        if !metadata.file_type().is_file() {
+            return Err(related_creation_conflict(
+                "manager mutation found non-regular evidence",
+            ));
+        }
+        let bytes = fs::read(path)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        serde_json::from_slice(&bytes)
+            .map(Some)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))
+    }
+
+    fn manager_record_transition_unlocked<T: serde::de::DeserializeOwned + serde::Serialize>(
+        &self,
+        path: &Path,
+        prior: Option<&T>,
+        next: &T,
+    ) -> Result<bool, OrchError> {
+        let current: Option<T> = self.read_manager_record_unlocked(path)?;
+        match current {
+            Some(current)
+                if related_snapshot_digest(&current)? == related_snapshot_digest(next)? =>
+            {
+                Ok(true)
+            }
+            Some(current)
+                if prior.is_some_and(|prior| {
+                    related_snapshot_digest(&current).ok() == related_snapshot_digest(prior).ok()
+                }) =>
+            {
+                Ok(false)
+            }
+            None if prior.is_none() => Ok(false),
+            _ => Err(related_creation_conflict(
+                "manager mutation found conflicting prior or successor evidence",
+            )),
+        }
+    }
+
+    fn read_manager_sequence_unlocked(&self) -> Result<Option<u64>, OrchError> {
+        let path = self.inner.root.join("messages/seq");
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(OrchError::new(OrchErrorCode::Internal, error.to_string())),
+        };
+        if !metadata.file_type().is_file() {
+            return Err(related_creation_conflict(
+                "manager message sequence is non-regular evidence",
+            ));
+        }
+        let text = fs::read_to_string(path)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        text.trim()
+            .parse()
+            .map(Some)
+            .map_err(|_| related_creation_conflict("manager message sequence is malformed"))
+    }
+
+    fn preflight_manager_mutation_unlocked(
+        &self,
+        intent: &ManagerMutationIntent,
+    ) -> Result<(), OrchError> {
+        intent.validate()?;
+        if let Some(observation) = &intent.observation {
+            for item in &observation.work_items {
+                if !self
+                    .related_record_matches_unlocked(&self.work_item_path(&item.work_id)?, item)?
+                {
+                    return Err(related_creation_conflict(
+                        "manager observation Work disappeared",
+                    ));
+                }
+            }
+            // An unobserved adopted child is a conflicting writer, not a
+            // reason to materialize another child for that logical step.
+            for item in self
+                .list_work_items_unlocked()
+                .map_err(Self::orch_error_from_anyhow)?
+            {
+                if item.session_id == intent.plan.session_id
+                    && item.workspace == intent.plan.workspace
+                    && item.kind != "manager-decision"
+                    && intent.plan.steps.iter().any(|step| {
+                        item.source_manager_step_id.as_deref() == Some(step.step_id.as_str())
+                    })
+                    && item.source_manager_plan_id.as_deref() == Some(intent.plan.plan_id.as_str())
+                    && !observation
+                        .work_items
+                        .iter()
+                        .any(|known| known.work_id == item.work_id)
+                    && !intent
+                        .work_writes
+                        .iter()
+                        .any(|write| write.item.work_id == item.work_id)
+                {
+                    return Err(related_creation_conflict(
+                        "manager found an unobserved child",
+                    ));
+                }
+            }
+        }
+
+        let mut present = self.manager_record_transition_unlocked(
+            &self.manager_plan_path(&intent.plan.plan_id)?,
+            Some(&intent.prior_plan),
+            &intent.plan,
+        )?;
+        for write in &intent.work_writes {
+            present &= self.manager_record_transition_unlocked(
+                &self.work_item_path(&write.item.work_id)?,
+                write.prior.as_ref(),
+                &write.item,
+            )?;
+            if write.prior.is_none()
+                && (!self
+                    .list_work_attempts_unlocked(Some(&write.item.work_id))
+                    .map_err(Self::orch_error_from_anyhow)?
+                    .is_empty()
+                    || !self
+                        .list_work_decisions_unlocked(&write.item.work_id)?
+                        .is_empty())
+            {
+                return Err(related_creation_conflict(
+                    "new manager Work has unexpected attempts or decisions",
+                ));
+            }
+        }
+        let items = intent
+            .work_writes
+            .iter()
+            .map(|write| write.item.clone())
+            .collect::<Vec<_>>();
+        self.validate_work_items_for_save_unlocked(&items)
+            .map_err(Self::orch_error_from_anyhow)?;
+        for write in &intent.message_writes {
+            present &= self.manager_record_transition_unlocked(
+                &self.message_path(&write.message.message_id)?,
+                write.prior.as_ref(),
+                &write.message,
+            )?;
+            self.require_optional_agent_in_scope_unlocked(
+                write.message.from_agent_id.as_deref(),
+                write.message.session_id,
+                &write.message.workspace,
+            )?;
+            self.require_optional_agent_in_scope_unlocked(
+                write.message.to_agent_id.as_deref(),
+                write.message.session_id,
+                &write.message.workspace,
+            )?;
+        }
+        if let Some(sequence) = &intent.sequence {
+            let current = self.read_manager_sequence_unlocked()?;
+            if current != sequence.prior && current != Some(sequence.next) {
+                return Err(related_creation_conflict(
+                    "manager message sequence has conflicting evidence",
+                ));
+            }
+            present &= current == Some(sequence.next);
+        }
+        self.preflight_related_receipt_unlocked(
+            intent.request.as_ref(),
+            &intent.response(),
+            &intent.plan.plan_id,
+            present,
+        )
+    }
+
+    fn commit_manager_mutation_unlocked(
+        &self,
+        intent: &ManagerMutationIntent,
+    ) -> Result<(), OrchError> {
+        self.preflight_manager_mutation_unlocked(intent)?;
+        for (index, write) in intent.work_writes.iter().enumerate() {
+            self.write_work_item_unlocked(&write.item)
+                .map_err(Self::orch_error_from_anyhow)?;
+            if index == 0 {
+                crash_process_if_stage("manager_mutation_after_first_work");
+            }
+        }
+        crash_process_if_stage("manager_mutation_after_work");
+        if let Some(sequence) = &intent.sequence {
+            atomic_write_bytes(
+                &self.lease(),
+                &self.inner.root.join("messages/seq"),
+                sequence.next.to_string().as_bytes(),
+            )
+            .map_err(Self::orch_error_from_anyhow)?;
+            crash_process_if_stage("manager_mutation_after_sequence");
+        }
+        for (index, write) in intent.message_writes.iter().enumerate() {
+            atomic_write_json(
+                &self.lease(),
+                &self.message_path(&write.message.message_id)?,
+                &write.message,
+            )
+            .map_err(Self::orch_error_from_anyhow)?;
+            if index == 0 {
+                crash_process_if_stage("manager_mutation_after_first_message");
+            }
+        }
+        crash_process_if_stage("manager_mutation_after_messages");
+        self.save_manager_plan_unlocked(&intent.plan)?;
+        crash_process_if_stage("manager_mutation_after_plan");
+        self.complete_bound_request_unlocked(
+            intent.request.as_ref().map(|request| &request.binding),
+            &intent.response(),
+        )?;
+        crash_process_if_stage("manager_mutation_after_receipt");
+        Ok(())
     }
 
     fn recover_manager_creation_intents(&self) -> Result<(), OrchError> {
         let _guard = self.inner.lock.lock();
-        let dir = self.inner.root.join("manager-intents");
-        for entry in fs::read_dir(&dir)
+        let mut intents = Vec::new();
+        for entry in fs::read_dir(self.inner.root.join("manager-intents"))
             .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
         {
             let path = entry
@@ -2113,17 +3672,43 @@ impl OrchStore {
             if path.extension().and_then(|value| value.to_str()) != Some("json") {
                 continue;
             }
-            let intent: ManagerCreationIntent = serde_json::from_str(
-                &fs::read_to_string(&path)
-                    .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?,
-            )
-            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
-            intent.plan.validate()?;
-            intent.root_work.validate()?;
-            self.commit_manager_creation_intent_unlocked(&intent)?;
-            remove_file_durable(&self.lease(), &path)
-                .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+            if !fs::symlink_metadata(&path)
+                .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
+                .file_type()
+                .is_file()
+            {
+                return Err(related_creation_conflict(
+                    "manager intent is non-regular evidence",
+                ));
+            }
+            let intent =
+                ManagerIntent::decode(&fs::read(&path).map_err(|error| {
+                    OrchError::new(OrchErrorCode::Internal, error.to_string())
+                })?)?;
+            let (id, revision) = match &intent {
+                ManagerIntent::Creation(intent) => (&intent.plan.plan_id, 0),
+                ManagerIntent::Mutation(intent) => (&intent.intent_id, intent.prior_plan.revision),
+            };
+            if path != self.manager_creation_intent_path(id)? {
+                return Err(related_creation_conflict(
+                    "manager intent filename does not match its identity",
+                ));
+            }
+            intents.push((revision, path, intent));
         }
+        intents.sort_by(|left, right| left.0.cmp(&right.0).then(left.1.cmp(&right.1)));
+        for (_, path, intent) in intents {
+            match intent {
+                ManagerIntent::Creation(intent) => {
+                    self.commit_manager_creation_intent_unlocked(&intent)?
+                }
+                ManagerIntent::Mutation(intent) => {
+                    self.commit_manager_mutation_unlocked(&intent)?
+                }
+            }
+            self.clear_related_intent_unlocked(&path)?;
+        }
+        self.prune_messages_unlocked()?;
         Ok(())
     }
 
@@ -2131,14 +3716,23 @@ impl OrchStore {
         &self,
         intent: &WorkMutationIntent,
     ) -> Result<(), OrchError> {
+        self.refuse_closed_admission()?;
         intent.validate()?;
         let path = self.work_mutation_intent_path(&intent.intent_id)?;
-        atomic_write_json(&self.lease(), &path, intent)
-            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))
+        atomic_write_json(&self.lease(), &path, intent).map_err(|error| {
+            let error = OrchError::new(OrchErrorCode::Internal, error.to_string());
+            if path.try_exists().unwrap_or(true) {
+                self.note_work_recovery_required(error)
+            } else {
+                error
+            }
+        })
     }
 
     fn clear_work_mutation_intent_unlocked(&self, intent_id: &str) -> Result<(), OrchError> {
         let path = self.work_mutation_intent_path(intent_id)?;
+        crate::verified_change::fail_durable_write_if_armed(&path)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
         remove_file_durable(&self.lease(), &path)
             .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))
     }
@@ -2193,20 +3787,28 @@ impl OrchStore {
                 "work mutation recovery found an unexpected expected_revision",
             ));
         }
-        if let Some(decision) =
-            self.load_work_decision_unlocked(&intent.work_id, &intent.decision.decision_id)?
-        {
+        let current_decision =
+            self.load_work_decision_unlocked(&intent.work_id, &intent.decision.decision_id)?;
+        if let Some(decision) = &current_decision {
             let digest = super::hash_payload(
-                &serde_json::to_value(&decision)
+                &serde_json::to_value(decision)
                     .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?,
             );
-            if digest != intent.decision_digest || decision != intent.decision {
+            if digest != intent.decision_digest || decision != &intent.decision {
                 return Err(OrchError::new(
                     OrchErrorCode::Conflict,
                     "work mutation recovery found a conflicting decision receipt",
                 ));
             }
-        } else {
+        }
+        self.preflight_bound_work_outcome_unlocked(
+            intent.request.as_ref(),
+            &mutation_response_value(intent),
+            &intent.work_id,
+            current_digest.as_deref() == Some(intent.next_item_digest.as_str())
+                && current_decision.is_some(),
+        )?;
+        if current_decision.is_none() {
             self.save_work_decision_unlocked(&intent.decision)
                 .map_err(|error| self.note_partial_commit(error))?;
         }
@@ -2226,7 +3828,8 @@ impl OrchStore {
             &mutation_response_value(intent),
         )?;
         crash_process_if_stage("mutation_after_receipt");
-        self.clear_work_mutation_intent_unlocked(&intent.intent_id)?;
+        self.clear_work_mutation_intent_unlocked(&intent.intent_id)
+            .map_err(|error| self.note_work_recovery_required(error))?;
         crash_process_if_stage("mutation_after_commit");
         Ok(())
     }
@@ -2257,14 +3860,23 @@ impl OrchStore {
         &self,
         intent: &WorkLifecycleIntent,
     ) -> Result<(), OrchError> {
+        self.refuse_closed_admission()?;
         intent.validate()?;
         let path = self.work_lifecycle_intent_path(&intent.intent_id)?;
-        atomic_write_json(&self.lease(), &path, intent)
-            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))
+        atomic_write_json(&self.lease(), &path, intent).map_err(|error| {
+            let error = OrchError::new(OrchErrorCode::Internal, error.to_string());
+            if path.try_exists().unwrap_or(true) {
+                self.note_work_recovery_required(error)
+            } else {
+                error
+            }
+        })
     }
 
     fn clear_work_lifecycle_intent_unlocked(&self, intent_id: &str) -> Result<(), OrchError> {
         let path = self.work_lifecycle_intent_path(intent_id)?;
+        crate::verified_change::fail_durable_write_if_armed(&path)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
         remove_file_durable(&self.lease(), &path)
             .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))
     }
@@ -2293,6 +3905,9 @@ impl OrchStore {
         self.write_work_lifecycle_item_update_unlocked(intent, &current_item_digest)
             .map_err(|error| self.note_partial_commit(error))?;
         crash_process_if_stage("lifecycle_after_item");
+        if intent.prior_item.is_none() {
+            crash_process_if_stage("create_after_item");
+        }
         if intent.operation == "managed_finalization" {
             self.settle_managed_finalization_unlocked(intent, Utc::now())
                 .map_err(|error| self.note_partial_commit(error))?;
@@ -2309,12 +3924,13 @@ impl OrchStore {
             )?;
         }
         crash_process_if_stage("lifecycle_after_receipt");
-        self.clear_work_lifecycle_intent_unlocked(&intent.intent_id)?;
+        self.clear_work_lifecycle_intent_unlocked(&intent.intent_id)
+            .map_err(|error| self.note_work_recovery_required(error))?;
         crash_process_if_stage("lifecycle_after_commit");
         Ok(())
     }
 
-    fn recover_work_lifecycle_intents(&self) -> Result<(), OrchError> {
+    fn recover_work_lifecycle_intents(&self, creations_only: bool) -> Result<(), OrchError> {
         let _guard = self.inner.lock.lock();
         let dir = self.inner.root.join("work-lifecycle-intents");
         let mut intents = Vec::new();
@@ -2332,7 +3948,16 @@ impl OrchStore {
                     .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?,
             )
             .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
-            intents.push(intent);
+            intent.validate()?;
+            if path != self.work_lifecycle_intent_path(&intent.intent_id)? {
+                return Err(OrchError::new(
+                    OrchErrorCode::Conflict,
+                    "work lifecycle intent filename does not match its identity",
+                ));
+            }
+            if intent.prior_item.is_none() == creations_only {
+                intents.push(intent);
+            }
         }
         // read_dir order is filesystem-dependent; managed-finalization envelopes
         // must converge only after every other queued lifecycle intent for the
@@ -2345,8 +3970,9 @@ impl OrchStore {
             let left_managed = left.operation == "managed_finalization";
             let right_managed = right.operation == "managed_finalization";
             left.prior_item
-                .revision
-                .cmp(&right.prior_item.revision)
+                .as_ref()
+                .map(|item| item.revision)
+                .cmp(&right.prior_item.as_ref().map(|item| item.revision))
                 .then_with(|| left_managed.cmp(&right_managed))
                 .then_with(|| left.intent_id.cmp(&right.intent_id))
         });
@@ -2388,35 +4014,48 @@ impl OrchStore {
         if let Some(request) = request {
             self.validate_bound_request_unlocked(
                 &request,
-                &intent.prior_item,
+                intent
+                    .prior_item
+                    .as_ref()
+                    .expect("update constructor seals a prior item"),
                 &intent.prior_attempts,
                 &intent.attempts,
             )?;
             intent.request = Some(request);
         }
+        if Self::lifecycle_settles_service_receipt(&intent) {
+            self.preflight_bound_work_outcome_unlocked(
+                intent.request.as_ref(),
+                &lifecycle_response_value(&intent)?,
+                &intent.work_id,
+                false,
+            )?;
+        }
+        crash_process_if_stage("lifecycle_before_intent");
         self.persist_work_lifecycle_intent_unlocked(&intent)?;
         crash_process_if_stage("lifecycle_after_intent");
         self.commit_work_lifecycle_intent_unlocked(&intent)
+            .map_err(|error| self.note_work_recovery_required(error))
     }
 
     fn preflight_work_lifecycle_intent_unlocked(
         &self,
         intent: &WorkLifecycleIntent,
-    ) -> Result<(String, Vec<WorkAttempt>), OrchError> {
+    ) -> Result<(Option<String>, Vec<WorkAttempt>), OrchError> {
         intent.validate()?;
         let current_item = self
             .load_work_item_unlocked(&intent.work_id)
-            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
-            .ok_or_else(|| {
-                OrchError::new(
-                    OrchErrorCode::Conflict,
-                    "work item disappeared during lifecycle recovery",
-                )
-            })?;
-        let prior_item_digest = Self::work_digest(&intent.prior_item)?;
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        let prior_item_digest = intent
+            .prior_item
+            .as_ref()
+            .map(Self::work_digest)
+            .transpose()?;
         let next_item_digest = Self::work_digest(&intent.item)?;
-        let current_item_digest = Self::work_digest(&current_item)?;
-        if current_item_digest != prior_item_digest && current_item_digest != next_item_digest {
+        let current_item_digest = current_item.as_ref().map(Self::work_digest).transpose()?;
+        if current_item_digest != prior_item_digest
+            && current_item_digest.as_deref() != Some(next_item_digest.as_str())
+        {
             return Err(OrchError::new(
                 OrchErrorCode::Conflict,
                 format!(
@@ -2434,6 +4073,35 @@ impl OrchStore {
         let current_attempts = self
             .list_work_attempts_unlocked(Some(&intent.work_id))
             .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        if intent.prior_item.is_none() {
+            let request = intent.request.as_ref().expect("validated creation request");
+            let receipt = self.inspect_canonical_request_receipt_unlocked(request)?;
+            let response = lifecycle_response_value(intent)?;
+            let settled = receipt.status == "complete"
+                && receipt.response == response
+                && receipt.error.is_none()
+                && receipt.run_id.as_deref() == Some(intent.work_id.as_str())
+                && current_item_digest.as_deref() == Some(next_item_digest.as_str());
+            if !creation_receipt_is_pending(&receipt) && !settled {
+                return Err(OrchError::new(
+                    OrchErrorCode::Conflict,
+                    "creation receipt conflicts with its sealed outcome",
+                ));
+            }
+            if !self
+                .list_work_decisions_unlocked(&intent.work_id)?
+                .is_empty()
+            {
+                return Err(OrchError::new(
+                    OrchErrorCode::Conflict,
+                    "creation has an unexpected decision",
+                ));
+            }
+            // Reuse the same graph and lane-capacity authority on recovery;
+            // a matching already-written successor is not counted twice.
+            self.validate_work_item_for_save_unlocked(&intent.item)
+                .map_err(Self::orch_error_from_anyhow)?;
+        }
         let mut current_by_id = current_attempts
             .iter()
             .map(|attempt| (attempt.attempt_id.as_str(), attempt))
@@ -2469,6 +4137,23 @@ impl OrchStore {
                 OrchErrorCode::Conflict,
                 "work lifecycle recovery found an unexpected attempt",
             ));
+        }
+        if intent.prior_item.is_some() && Self::lifecycle_settles_service_receipt(intent) {
+            let mut attempts_present = current_attempts.len() == intent.attempts.len();
+            for next in &intent.attempts {
+                let current = current_attempts
+                    .iter()
+                    .find(|current| current.attempt_id == next.attempt_id);
+                attempts_present &= current.map(Self::attempt_digest).transpose()?.as_deref()
+                    == Some(Self::attempt_digest(next)?.as_str());
+            }
+            self.preflight_bound_work_outcome_unlocked(
+                intent.request.as_ref(),
+                &lifecycle_response_value(intent)?,
+                &intent.work_id,
+                current_item_digest.as_deref() == Some(next_item_digest.as_str())
+                    && attempts_present,
+            )?;
         }
         Ok((current_item_digest, current_attempts))
     }
@@ -2521,10 +4206,10 @@ impl OrchStore {
     fn write_work_lifecycle_item_update_unlocked(
         &self,
         intent: &WorkLifecycleIntent,
-        current_item_digest: &str,
+        current_item_digest: &Option<String>,
     ) -> Result<(), OrchError> {
         let next_item_digest = Self::work_digest(&intent.item)?;
-        if current_item_digest != next_item_digest {
+        if current_item_digest.as_deref() != Some(next_item_digest.as_str()) {
             self.save_work_item_unlocked(&intent.item)
                 .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
         }
@@ -2554,6 +4239,7 @@ impl OrchStore {
 
     pub fn save_manager_plan(&self, plan: &ManagerPlan) -> Result<(), OrchError> {
         let _guard = self.inner.lock.lock();
+        self.refuse_closed_admission()?;
         self.save_manager_plan_unlocked(plan)
     }
 
@@ -2563,13 +4249,17 @@ impl OrchStore {
         work_items: &[WorkItem],
     ) -> Result<(), OrchError> {
         let _guard = self.inner.lock.lock();
+        self.refuse_closed_admission()?;
         self.validate_work_items_for_save_unlocked(work_items)
             .map_err(Self::orch_error_from_anyhow)?;
         for item in work_items {
             self.write_work_item_unlocked(item)
                 .map_err(Self::orch_error_from_anyhow)?;
         }
-        self.save_manager_plan_unlocked(plan)
+        crash_process_if_stage("manager_mutation_after_work");
+        self.save_manager_plan_unlocked(plan)?;
+        crash_process_if_stage("manager_mutation_after_plan");
+        Ok(())
     }
 
     /// Compare-and-swap a plan revision and its newly materialized Work under
@@ -2583,6 +4273,7 @@ impl OrchStore {
         work_items: &[WorkItem],
     ) -> Result<(), OrchError> {
         let _guard = self.inner.lock.lock();
+        self.refuse_closed_admission()?;
         let current = self
             .load_manager_plan_unlocked(&plan.plan_id)?
             .ok_or_else(|| OrchError::new(OrchErrorCode::InvalidRequest, "unknown plan_id"))?;
@@ -2592,15 +4283,17 @@ impl OrchStore {
                 "manager plan changed before the mutation could be committed",
             ));
         }
-        // Validate the full materialization batch before the first durable
-        // write so a refused graph cannot leave a partial manager adoption.
-        self.validate_work_items_for_save_unlocked(work_items)
-            .map_err(Self::orch_error_from_anyhow)?;
-        for item in work_items {
-            self.write_work_item_unlocked(item)
-                .map_err(Self::orch_error_from_anyhow)?;
-        }
-        self.save_manager_plan_unlocked(plan)
+        self.admit_manager_mutation_unlocked(
+            &current,
+            plan,
+            work_items,
+            &[],
+            None,
+            "background",
+            None,
+            None,
+        )?;
+        Ok(())
     }
 
     pub fn save_manager_plan_cas(
@@ -2678,6 +4371,7 @@ impl OrchStore {
         work: &WorkItem,
     ) -> Result<(), OrchError> {
         let _guard = self.inner.lock.lock();
+        self.refuse_closed_admission()?;
         decision.validate()?;
         if let Some(existing) = self
             .load_work_item_unlocked(&work.work_id)
@@ -2700,6 +4394,7 @@ impl OrchStore {
 
     pub fn save_manager_decision(&self, decision: &ManagerDecisionRecord) -> Result<(), OrchError> {
         let _guard = self.inner.lock.lock();
+        self.refuse_closed_admission()?;
         self.save_manager_decision_unlocked(decision)
     }
 
@@ -2856,7 +4551,27 @@ impl OrchStore {
         now: chrono::DateTime<Utc>,
     ) -> Result<ActivationRecord, OrchError> {
         let _guard = self.inner.lock.lock();
-        self.activate_routine_unlocked(routine_id, request, server_ceiling, now)
+        self.refuse_closed_admission()?;
+        self.activate_routine_unlocked(routine_id, request, server_ceiling, now, None)
+    }
+
+    pub(crate) fn activate_routine_with_request(
+        &self,
+        routine_id: &str,
+        request: ActivationRequest,
+        server_ceiling: &RunBounds,
+        now: chrono::DateTime<Utc>,
+        original_request: RelatedCreationRequest,
+    ) -> Result<ActivationRecord, OrchError> {
+        let _guard = self.inner.lock.lock();
+        self.refuse_closed_admission()?;
+        self.activate_routine_unlocked(
+            routine_id,
+            request,
+            server_ceiling,
+            now,
+            Some(original_request),
+        )
     }
 
     pub fn fire_due_routines_at(
@@ -2864,6 +4579,7 @@ impl OrchStore {
         now: chrono::DateTime<Utc>,
     ) -> Result<RoutineFireReport, OrchError> {
         let _guard = self.inner.lock.lock();
+        self.refuse_closed_admission()?;
         let routines = self.list_routines_unlocked()?;
         let ceiling = RunBounds::default();
         let mut report = RoutineFireReport {
@@ -2891,6 +4607,7 @@ impl OrchStore {
                 continue;
             }
             for scheduled_at in &due {
+                self.refuse_closed_admission()?;
                 let request = ActivationRequest {
                     cause: ActivationCause::Scheduled,
                     dedupe_key: occurrence_dedupe_key(&routine.routine_id, *scheduled_at),
@@ -2899,7 +4616,13 @@ impl OrchStore {
                     payload: None,
                     created_by: format!("routine:{}", routine.routine_id),
                 };
-                match self.activate_routine_unlocked(&routine.routine_id, request, &ceiling, now) {
+                match self.activate_routine_unlocked(
+                    &routine.routine_id,
+                    request,
+                    &ceiling,
+                    now,
+                    None,
+                ) {
                     Ok(activation) => match activation.disposition {
                         ActivationDisposition::CreatedWork => report.created_work += 1,
                         ActivationDisposition::Deduplicated => report.deduplicated += 1,
@@ -2911,6 +4634,7 @@ impl OrchStore {
                     Err(_) => report.rejected += 1,
                 }
             }
+            self.refuse_closed_admission()?;
             if let Ok(Some(mut current)) = self.load_routine_unlocked(&routine.routine_id) {
                 if current.lifecycle.allows_scheduled_fire() && !current.circuit_open {
                     current.next_fire_at =
@@ -2935,10 +4659,19 @@ impl OrchStore {
             if path.extension().and_then(|value| value.to_str()) != Some("json") {
                 continue;
             }
+            if !fs::symlink_metadata(&path)?.file_type().is_file() {
+                return Err(anyhow::anyhow!("routine intent is non-regular evidence"));
+            }
             let intent: RoutineFireIntent = serde_json::from_str(&fs::read_to_string(&path)?)?;
+            intent.validate()?;
+            if path != self.routine_intent_path(&intent.activation.activation_id)? {
+                return Err(anyhow::anyhow!(
+                    "routine intent filename does not match its identity"
+                ));
+            }
             self.commit_routine_intent_unlocked(&intent)
                 .map_err(|error| anyhow::anyhow!(error.to_string()))?;
-            remove_file_durable(&self.lease(), &path)?;
+            self.clear_related_intent_unlocked(&path)?;
         }
         Ok(())
     }
@@ -3126,6 +4859,7 @@ impl OrchStore {
         request: ActivationRequest,
         server_ceiling: &RunBounds,
         now: chrono::DateTime<Utc>,
+        original_request: Option<RelatedCreationRequest>,
     ) -> Result<ActivationRecord, OrchError> {
         let mut routine = self
             .load_routine_unlocked(routine_id)?
@@ -3151,6 +4885,8 @@ impl OrchStore {
                         Some("activation expired before it could create work"),
                         server_ceiling,
                         now,
+                        original_request,
+                        None,
                     );
                 }
             }
@@ -3170,6 +4906,8 @@ impl OrchStore {
                 None,
                 server_ceiling,
                 now,
+                original_request,
+                None,
             );
         }
         let inflight = in_flight_count(
@@ -3187,6 +4925,8 @@ impl OrchStore {
                 Some("routine already has the maximum in-flight Work items"),
                 server_ceiling,
                 now,
+                original_request,
+                None,
             );
         }
         let agent = self
@@ -3202,6 +4942,7 @@ impl OrchStore {
                     "owning agent is unknown",
                     server_ceiling,
                     now,
+                    original_request,
                 );
             }
         };
@@ -3214,6 +4955,7 @@ impl OrchStore {
                     "agent source workspace does not match the routine workspace",
                     server_ceiling,
                     now,
+                    original_request,
                 );
             }
         }
@@ -3233,6 +4975,7 @@ impl OrchStore {
                     &error.message,
                     server_ceiling,
                     now,
+                    original_request,
                 );
             }
         };
@@ -3254,6 +4997,7 @@ impl OrchStore {
                     &error.message,
                     server_ceiling,
                     now,
+                    original_request,
                 );
             }
         };
@@ -3283,7 +5027,13 @@ impl OrchStore {
             created_by: request.created_by.clone(),
         };
         activation.validate()?;
-        let intent = RoutineFireIntent {
+        let mut intent = RoutineFireIntent {
+            schema_version: 2,
+            prior_activation: None,
+            prior_work: None,
+            snapshot_digest: None,
+            request: original_request,
+            prior_routine: Some(routine.clone()),
             routine: routine.clone(),
             activation: activation.clone(),
             work: Some(work.clone()),
@@ -3295,9 +5045,16 @@ impl OrchStore {
                 created_at: now,
             }),
         };
+        intent.snapshot_digest = Some(intent.digest()?);
+        self.preflight_routine_intent_unlocked(&intent)?;
+        crash_process_if_stage("routine_fire_before_intent");
         self.persist_routine_intent_unlocked(&intent)?;
-        self.commit_routine_intent_unlocked(&intent)?;
-        self.clear_routine_intent_unlocked(&activation_id)?;
+        crash_process_if_stage("routine_fire_after_intent");
+        self.commit_routine_intent_unlocked(&intent)
+            .map_err(|error| self.note_work_recovery_required(error))?;
+        self.clear_routine_intent_unlocked(&activation_id)
+            .map_err(|error| self.note_work_recovery_required(error))?;
+        crash_process_if_stage("routine_fire_after_commit");
         self.prune_activations_unlocked(routine_id)?;
         Ok(activation)
     }
@@ -3312,6 +5069,8 @@ impl OrchStore {
         error: Option<&str>,
         server_ceiling: &RunBounds,
         now: chrono::DateTime<Utc>,
+        original_request: Option<RelatedCreationRequest>,
+        prior_routine: Option<RoutineRecord>,
     ) -> Result<ActivationRecord, OrchError> {
         let captured = CapturedActivationPolicy::capture(
             routine.revision,
@@ -3348,7 +5107,13 @@ impl OrchStore {
             created_by: request.created_by.clone(),
         };
         activation.validate()?;
-        let intent = RoutineFireIntent {
+        let mut intent = RoutineFireIntent {
+            schema_version: 2,
+            prior_activation: None,
+            prior_work: None,
+            snapshot_digest: None,
+            request: original_request,
+            prior_routine: Some(prior_routine.unwrap_or_else(|| routine.clone())),
             routine: routine.clone(),
             activation: activation.clone(),
             work: None,
@@ -3360,9 +5125,16 @@ impl OrchStore {
                 created_at: now,
             }),
         };
+        intent.snapshot_digest = Some(intent.digest()?);
+        self.preflight_routine_intent_unlocked(&intent)?;
+        crash_process_if_stage("routine_fire_before_intent");
         self.persist_routine_intent_unlocked(&intent)?;
-        self.commit_routine_intent_unlocked(&intent)?;
-        self.clear_routine_intent_unlocked(&activation.activation_id)?;
+        crash_process_if_stage("routine_fire_after_intent");
+        self.commit_routine_intent_unlocked(&intent)
+            .map_err(|error| self.note_work_recovery_required(error))?;
+        self.clear_routine_intent_unlocked(&activation.activation_id)
+            .map_err(|error| self.note_work_recovery_required(error))?;
+        crash_process_if_stage("routine_fire_after_commit");
         self.prune_activations_unlocked(&routine.routine_id)?;
         Ok(activation)
     }
@@ -3376,7 +5148,9 @@ impl OrchStore {
         message: &str,
         server_ceiling: &RunBounds,
         now: chrono::DateTime<Utc>,
+        original_request: Option<RelatedCreationRequest>,
     ) -> Result<ActivationRecord, OrchError> {
+        let prior_routine = routine.clone();
         routine.consecutive_failures = routine.consecutive_failures.saturating_add(1);
         if routine.consecutive_failures >= routine.retry.circuit_failures {
             routine.circuit_open = true;
@@ -3387,7 +5161,6 @@ impl OrchStore {
                 Some(now + routine.retry.delay_after(routine.consecutive_failures));
         }
         routine.updated_at = now;
-        self.save_routine_unlocked(routine)?;
         self.record_non_work_activation(
             routine,
             request,
@@ -3400,39 +5173,112 @@ impl OrchStore {
             Some(message),
             server_ceiling,
             now,
+            original_request,
+            Some(prior_routine),
+        )
+    }
+
+    fn preflight_routine_intent_unlocked(
+        &self,
+        intent: &RoutineFireIntent,
+    ) -> Result<(), OrchError> {
+        intent.validate()?;
+        if !fs::symlink_metadata(self.routine_path(&intent.routine.routine_id)?)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
+            .file_type()
+            .is_file()
+        {
+            return Err(related_creation_conflict(
+                "routine predecessor is non-regular evidence",
+            ));
+        }
+        let current = self
+            .load_routine_unlocked(&intent.routine.routine_id)?
+            .ok_or_else(|| related_creation_conflict("routine creation is missing its routine"))?;
+        let current_digest = related_snapshot_digest(&current)?;
+        let next_digest = related_snapshot_digest(&intent.routine)?;
+        let prior_digest = intent
+            .prior_routine
+            .as_ref()
+            .map(related_snapshot_digest)
+            .transpose()?;
+        if current_digest != next_digest && prior_digest.as_deref() != Some(current_digest.as_str())
+        {
+            return Err(related_creation_conflict(
+                "routine recovery found a conflicting routine snapshot",
+            ));
+        }
+        let work_present = match &intent.work {
+            Some(work) => self.preflight_related_work_unlocked(work)?,
+            None => true,
+        };
+        let activation_present = self.related_record_matches_unlocked(
+            &self.routine_activation_path(
+                &intent.activation.routine_id,
+                &intent.activation.activation_id,
+            )?,
+            &intent.activation,
+        )?;
+        let dedupe_present = match &intent.dedupe {
+            Some(dedupe) => self.related_record_matches_unlocked(
+                &self.routine_dedupe_path(&intent.routine.routine_id, &dedupe.dedupe_key)?,
+                dedupe,
+            )?,
+            None => true,
+        };
+        self.preflight_related_receipt_unlocked(
+            intent.request.as_ref(),
+            &intent.response(),
+            &intent.routine.routine_id,
+            work_present && activation_present && dedupe_present && current_digest == next_digest,
         )
     }
 
     fn persist_routine_intent_unlocked(&self, intent: &RoutineFireIntent) -> Result<(), OrchError> {
-        let path = self.routine_intent_path(&intent.activation.activation_id)?;
-        atomic_write_json(&self.lease(), &path, intent)
-            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))
+        intent.validate()?;
+        self.persist_related_intent_unlocked(
+            &self.routine_intent_path(&intent.activation.activation_id)?,
+            intent,
+        )
     }
 
     fn commit_routine_intent_unlocked(&self, intent: &RoutineFireIntent) -> Result<(), OrchError> {
+        self.preflight_routine_intent_unlocked(intent)?;
         if let Some(work) = &intent.work {
-            self.save_work_item_unlocked(work)
-                .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+            self.write_work_item_unlocked(work)
+                .map_err(Self::orch_error_from_anyhow)?;
+            crash_process_if_stage("routine_fire_after_work");
         }
+        if let Some(prior) = &intent.prior_routine {
+            if related_snapshot_digest(prior)? != related_snapshot_digest(&intent.routine)? {
+                self.save_routine_unlocked(&intent.routine)?;
+            }
+        }
+        crash_process_if_stage("routine_fire_after_routine");
         let path = self.routine_activation_path(
             &intent.activation.routine_id,
             &intent.activation.activation_id,
         )?;
         atomic_write_json(&self.lease(), &path, &intent.activation)
             .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        crash_process_if_stage("routine_fire_after_activation");
         if let Some(dedupe) = &intent.dedupe {
-            let dedupe_path =
+            let path =
                 self.routine_dedupe_path(&intent.activation.routine_id, &dedupe.dedupe_key)?;
-            atomic_write_json(&self.lease(), &dedupe_path, dedupe)
+            atomic_write_json(&self.lease(), &path, dedupe)
                 .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
         }
+        crash_process_if_stage("routine_fire_after_dedupe");
+        self.complete_bound_request_unlocked(
+            intent.request.as_ref().map(|request| &request.binding),
+            &intent.response(),
+        )?;
+        crash_process_if_stage("routine_fire_after_receipt");
         Ok(())
     }
 
     fn clear_routine_intent_unlocked(&self, activation_id: &str) -> Result<(), OrchError> {
-        let path = self.routine_intent_path(activation_id)?;
-        remove_file_durable(&self.lease(), &path)
-            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))
+        self.clear_related_intent_unlocked(&self.routine_intent_path(activation_id)?)
     }
 
     fn prune_activations_unlocked(&self, routine_id: &str) -> Result<(), OrchError> {
@@ -4392,9 +6238,17 @@ impl OrchStore {
             )?;
             intent.request = Some(request);
         }
+        self.preflight_bound_work_outcome_unlocked(
+            intent.request.as_ref(),
+            &mutation_response_value(&intent),
+            &intent.work_id,
+            false,
+        )?;
+        crash_process_if_stage("mutation_before_intent");
         self.persist_work_mutation_intent_unlocked(&intent)?;
         crash_process_if_stage("mutation_after_intent");
-        self.commit_work_mutation_intent_unlocked(&intent)?;
+        self.commit_work_mutation_intent_unlocked(&intent)
+            .map_err(|error| self.note_work_recovery_required(error))?;
         Ok((item, decision))
     }
 
@@ -4774,6 +6628,7 @@ impl OrchStore {
 
     pub fn send_message(&self, mut message: WorkMessage) -> Result<WorkMessage, OrchError> {
         let _guard = self.inner.lock.lock();
+        self.refuse_closed_admission()?;
         self.send_message_unlocked(&mut message)
     }
 
@@ -4782,6 +6637,7 @@ impl OrchStore {
     /// durable observation.
     pub fn send_message_once(&self, mut message: WorkMessage) -> Result<WorkMessage, OrchError> {
         let _guard = self.inner.lock.lock();
+        self.refuse_closed_admission()?;
         if let Some(existing) = self.load_message_unlocked(&message.message_id)? {
             if existing.kind != message.kind
                 || existing.from_actor != message.from_actor
@@ -4848,6 +6704,7 @@ impl OrchStore {
         now: chrono::DateTime<Utc>,
     ) -> Result<WorkMessage, OrchError> {
         let _guard = self.inner.lock.lock();
+        self.refuse_closed_admission()?;
         self.ack_message_unlocked(message_id, actor_id, now, None)
     }
 
@@ -4862,6 +6719,7 @@ impl OrchStore {
         workspace: &str,
     ) -> Result<WorkMessage, OrchError> {
         let _guard = self.inner.lock.lock();
+        self.refuse_closed_admission()?;
         self.ack_message_unlocked(message_id, actor_id, now, Some((session_id, workspace)))
     }
 
@@ -5904,7 +7762,12 @@ impl OrchStore {
             if let Some(request) = request {
                 self.validate_bound_request_unlocked(
                     &request,
-                    &intent.prior_item,
+                    intent.prior_item.as_ref().ok_or_else(|| {
+                        OrchError::new(
+                            OrchErrorCode::Conflict,
+                            "managed finalization requires an existing work item",
+                        )
+                    })?,
                     &intent.prior_attempts,
                     &intent.attempts,
                 )?;
@@ -6051,6 +7914,20 @@ impl OrchStore {
                 ));
             }
         }
+        let receipt = self.load_bound_request_receipt_unlocked(request)?;
+        if receipt.status != "pending" {
+            return Err(OrchError::new(
+                OrchErrorCode::Conflict,
+                format!("idempotency claim is already {}", receipt.status),
+            ));
+        }
+        Ok(())
+    }
+
+    fn load_bound_request_receipt_unlocked(
+        &self,
+        request: &WorkRequestBinding,
+    ) -> Result<IdempotencyReceipt, OrchError> {
         let scope = IdempotencyScope {
             owner_id: request.owner_id.clone(),
             session_id: request.session_id,
@@ -6074,25 +7951,104 @@ impl OrchStore {
                 "work request binding does not match its idempotency receipt",
             ));
         }
-        if receipt.status != "pending" {
-            return Err(OrchError::new(
-                OrchErrorCode::Conflict,
-                format!("idempotency claim is already {}", receipt.status),
-            ));
-        }
-        Ok(())
+        Ok(receipt)
     }
 
     pub fn ledger_admission_closed(&self) -> Option<String> {
         self.inner.ledger_admission_closed.lock().clone()
     }
 
+    /// Protect only this request's sealed Work outcome. Closing admission for
+    /// another request must not turn an ordinary unrelated refusal into a
+    /// recoverable mutation. Unreadable evidence is conservative: keep the
+    /// claim rather than destroy an outcome which reopening must inspect.
+    pub(crate) fn work_request_recovery_is_pending(
+        &self,
+        scope: &IdempotencyScope,
+        tool: &str,
+        request_id: &str,
+        payload_hash: &str,
+    ) -> bool {
+        if self.ledger_admission_closed().is_none() {
+            return false;
+        }
+        let _guard = self.inner.lock.lock();
+        for directory in [
+            "work-intents",
+            "work-lifecycle-intents",
+            "manager-intents",
+            "routine-intents",
+        ] {
+            let Ok(entries) = fs::read_dir(self.inner.root.join(directory)) else {
+                return true;
+            };
+            for entry in entries {
+                let Ok(entry) = entry else {
+                    return true;
+                };
+                let path = entry.path();
+                if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
+                    continue;
+                }
+                let Ok(bytes) = fs::read(path) else {
+                    return true;
+                };
+                let request = match directory {
+                    "work-intents" => match serde_json::from_slice::<WorkMutationIntent>(&bytes) {
+                        Ok(intent) if intent.validate().is_ok() => intent.request,
+                        _ => return true,
+                    },
+                    "work-lifecycle-intents" => {
+                        match serde_json::from_slice::<WorkLifecycleIntent>(&bytes) {
+                            Ok(intent) if intent.validate().is_ok() => intent.request,
+                            _ => return true,
+                        }
+                    }
+                    "manager-intents" => match ManagerIntent::decode(&bytes) {
+                        Ok(ManagerIntent::Creation(intent)) => {
+                            intent.request.map(|request| request.binding)
+                        }
+                        Ok(ManagerIntent::Mutation(intent)) => {
+                            intent.request.map(|request| request.binding)
+                        }
+                        _ => return true,
+                    },
+                    "routine-intents" => {
+                        match serde_json::from_slice::<RoutineFireIntent>(&bytes) {
+                            Ok(intent) if intent.validate().is_ok() => {
+                                intent.request.map(|request| request.binding)
+                            }
+                            _ => return true,
+                        }
+                    }
+                    _ => unreachable!("fixed intent directory list"),
+                };
+                if request.is_some_and(|request| {
+                    request.owner_id == scope.owner_id
+                        && request.session_id == scope.session_id
+                        && request.workspace_digest == scope.workspace_digest
+                        && request.tool == tool
+                        && request.request_id == request_id
+                        && request.payload_hash == payload_hash
+                }) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     fn note_partial_commit(&self, error: OrchError) -> OrchError {
         if error.code == OrchErrorCode::Internal {
-            let message = "ledger admission is closed until the store is reopened".to_string();
-            *self.inner.ledger_admission_closed.lock() = Some(message.clone());
-            *self.inner.last_run_error.lock() = Some(message);
+            return self.note_work_recovery_required(error);
         }
+        error
+    }
+
+    fn note_work_recovery_required(&self, error: OrchError) -> OrchError {
+        let message = "ledger admission is closed until the store is reopened".to_string();
+        *self.inner.ledger_admission_closed.lock() = Some(message.clone());
+        *self.inner.last_run_error.lock() = Some(message);
         error
     }
 
@@ -6211,7 +8167,42 @@ impl OrchStore {
             &request.tool,
             &request.request_id,
             &request.payload_hash,
-            None,
+            match request.tool.as_str() {
+                "ptah_create_work" => response["work"]["workId"].as_str().map(str::to_string),
+                "ptah_create_manager_plan"
+                | "ptah_advance_manager_plan"
+                | "ptah_tick_manager_plan"
+                | "ptah_replan_manager_plan" => {
+                    response["plan"]["planId"].as_str().map(str::to_string)
+                }
+                "ptah_fire_routine" => response["routineId"].as_str().map(str::to_string),
+                "ptah_assign_work"
+                | "ptah_offer_work"
+                | "ptah_accept_work"
+                | "ptah_decline_work"
+                | "ptah_reassign_work"
+                | "ptah_reprioritize_work"
+                | "ptah_block_work"
+                | "ptah_unblock_work"
+                | "ptah_request_review"
+                | "ptah_authorize_work_execution"
+                | "ptah_claim_work"
+                | "ptah_renew_work"
+                | "ptah_link_work_run"
+                | "ptah_report_work_progress"
+                | "ptah_release_work"
+                | "ptah_complete_work"
+                | "ptah_fail_work"
+                | "ptah_cancel_work"
+                | "ptah_retry_work"
+                | "ptah_approve_work" => request.target_work_id.clone().or_else(|| {
+                    response["work"]["workId"]
+                        .as_str()
+                        .or_else(|| response["workId"].as_str())
+                        .map(str::to_string)
+                }),
+                _ => None,
+            },
             response.clone(),
             None,
             "complete",
@@ -9865,6 +11856,63 @@ impl OrchStore {
         self.load_idempotency_unlocked(scope, request_id)
     }
 
+    /// Inspect the original timestamp before choosing a legacy request hash.
+    /// This must not adopt a legacy file: claim_idempotency performs migration
+    /// only after it proves the supplied tool and payload identity.
+    pub(crate) fn inspect_idempotency_for_replay_hash(
+        &self,
+        scope: &IdempotencyScope,
+        request_id: &str,
+    ) -> Result<Option<IdempotencyReceipt>, OrchError> {
+        let _guard = self.inner.lock.lock();
+        for (path, legacy) in [
+            (self.idemp_path(scope, request_id)?, false),
+            (self.legacy_owner_v2_path(scope, request_id)?, true),
+        ] {
+            match fs::metadata(&path) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    return Err(OrchError::new(OrchErrorCode::Internal, error.to_string()))
+                }
+                Ok(metadata) if !metadata.is_file() => {
+                    return Err(OrchError::new(
+                        OrchErrorCode::Conflict,
+                        "idempotency evidence is not a regular file",
+                    ))
+                }
+                Ok(_) => {}
+            }
+            let bytes = fs::read(&path)
+                .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+            let receipt: IdempotencyReceipt = serde_json::from_slice(&bytes).map_err(|_| {
+                OrchError::new(
+                    OrchErrorCode::Conflict,
+                    "idempotency receipt cannot be reused",
+                )
+            })?;
+            if receipt.schema_version != IDEMPOTENCY_RECEIPT_SCHEMA_VERSION
+                || receipt.owner_id != scope.owner_id
+                || receipt.request_id != request_id
+            {
+                return Err(OrchError::new(
+                    OrchErrorCode::Conflict,
+                    "idempotency receipt cannot be reused",
+                ));
+            }
+            if !receipt.is_in_scope(scope) {
+                if legacy {
+                    return Ok(None);
+                }
+                return Err(OrchError::new(
+                    OrchErrorCode::Conflict,
+                    "idempotency receipt scope does not match its durable path",
+                ));
+            }
+            return Ok(Some(receipt));
+        }
+        Ok(None)
+    }
+
     fn load_idempotency_unlocked(
         &self,
         scope: &IdempotencyScope,
@@ -10778,6 +12826,21 @@ fn remove_file_durable(lease: &crate::host_runtime::WriteLease, path: &Path) -> 
     let _write = lease.begin("removing a durable orchestration record")?;
     if path.is_file() {
         fs::remove_file(path)?;
+        if let Some(parent) = path.parent() {
+            if parent.ends_with("work-intents") {
+                crash_process_if_stage("mutation_after_intent_remove");
+            }
+            if parent.ends_with("work-lifecycle-intents") {
+                crash_process_if_stage("lifecycle_after_intent_remove");
+            }
+            if parent.ends_with("manager-intents") {
+                crash_process_if_stage("manager_create_after_intent_remove");
+                crash_process_if_stage("manager_mutation_after_intent_remove");
+            }
+            if parent.ends_with("routine-intents") {
+                crash_process_if_stage("routine_fire_after_intent_remove");
+            }
+        }
     }
     #[cfg(unix)]
     if let Some(parent) = path.parent() {

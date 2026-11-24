@@ -433,7 +433,7 @@ impl ManagerStep {
         }
     }
 
-    fn as_spec(&self) -> ManagerStepSpec {
+    pub(crate) fn as_spec(&self) -> ManagerStepSpec {
         ManagerStepSpec {
             step_id: self.step_id.clone(),
             kind: self.kind.clone(),
